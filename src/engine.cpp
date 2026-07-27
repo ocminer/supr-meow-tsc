@@ -105,7 +105,7 @@ bool InferenceEngine::load(const EngineConfig& cfg, std::string& error,
 }
 
 int InferenceEngine::generate_window(int device_slot, const std::string& prompt,
-                                     const std::function<void(int, const float*, int)>& on_token,
+                                     const TokenChooser& chooser,
                                      std::string& error) {
     if (device_slot < 0 || device_slot >= static_cast<int>(instances_.size())) {
         error = "invalid device slot";
@@ -132,21 +132,31 @@ int InferenceEngine::generate_window(int device_slot, const std::string& prompt,
     llama_batch batch = llama_batch_get_one(toks.data(), static_cast<int32_t>(toks.size()));
     if (llama_decode(in.ctx, batch) != 0) { error = "prompt decode failed"; return -1; }
 
+    // The window's tokens so far. The PoI sampler folds this into every
+    // sampling value, so it must be the real sequence, prompt included.
+    std::vector<int64_t> context;
+    context.reserve(toks.size() + cfg_.window_tokens);
+    for (llama_token t : toks) context.push_back(static_cast<int64_t>(t));
+
     int produced = 0;
     llama_token cur = 0;
     for (int i = 0; i < cfg_.window_tokens; ++i) {
         const float* logits = llama_get_logits_ith(in.ctx, -1);
         if (!logits) { error = "no logits returned"; return -1; }
 
-        // The PoI sampler replaces this in #9; for now pick the argmax so the
-        // engine is exercised end to end. EOS is IGNORED on purpose — a window
-        // must always reach its full length or the proof never closes.
-        int best = 0;
-        float bestv = logits[0];
-        for (int t = 1; t < n_vocab; ++t) if (logits[t] > bestv) { bestv = logits[t]; best = t; }
-        cur = best;
-
-        if (on_token) on_token(cur, logits, n_vocab);
+        // EOS is IGNORED on purpose — a window must always reach its full
+        // length or the proof never closes.
+        if (chooser) {
+            const int chosen = chooser(logits, n_vocab, context);
+            if (chosen < 0) { error = "sampler aborted the window"; return -1; }
+            cur = static_cast<llama_token>(chosen);
+        } else {
+            int best = 0;
+            float bestv = logits[0];
+            for (int t = 1; t < n_vocab; ++t) if (logits[t] > bestv) { bestv = logits[t]; best = t; }
+            cur = best;
+        }
+        context.push_back(static_cast<int64_t>(cur));
         ++produced;
 
         llama_batch nb = llama_batch_get_one(&cur, 1);

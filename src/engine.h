@@ -58,13 +58,21 @@ public:
     bool load(const EngineConfig& cfg, std::string& error,
               const std::function<void(const std::string&)>& progress = nullptr);
 
+    // Chooses the next token from the logits. The proof-of-inference sampler
+    // installs itself here: it must RETURN the token it selected, because the
+    // transcript and the model's own state have to advance together — feeding
+    // back a different token than the one recorded makes the proof meaningless.
+    // `context` is the window's tokens so far, which the sampler needs.
+    // Return < 0 to abort the window.
+    using TokenChooser = std::function<int(const float* logits, int n_vocab,
+                                           const std::vector<int64_t>& context)>;
+
     // Generate `window_tokens` on one device, forcing generation to the full
-    // window (no early EOS) so a proof window always closes. `on_token` is the
-    // hook the proof-of-inference sampler will attach to in #9.
+    // window (no early EOS) so a proof window always closes.
+    // `chooser` may be null, in which case argmax is used (benchmark path).
     // Returns tokens generated, or -1 on error.
     int generate_window(int device_slot, const std::string& prompt,
-                        const std::function<void(int token_id, const float* logits, int n_vocab)>& on_token,
-                        std::string& error);
+                        const TokenChooser& chooser, std::string& error);
 
     // Throughput measurement across every loaded device, used by --benchmark.
     std::vector<DeviceEngineStats> benchmark(int windows_per_device, std::string& error);

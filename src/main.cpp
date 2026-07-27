@@ -12,6 +12,8 @@
 #include "stratum.h"
 #include "engine.h"
 #include "vdf.h"
+#include "poi.h"
+#include <mutex>
 
 #include <atomic>
 #include <chrono>
@@ -283,9 +285,18 @@ int main(int argc, char** argv) {
 
         meow::StratumClient client;
         std::atomic<int> jobs{0};
+        // Job state must exist BEFORE the client starts: the pool sends the
+        // first job during the handshake, and a callback installed afterwards
+        // would miss it — leaving the miner idle until the next block.
+        std::mutex jm;
+        meow::PoolJob   cur_job;
+        meow::PoolModel cur_model;
+        std::atomic<bool> job_dirty{false};
+
         meow::StratumCallbacks cb;
         cb.on_log = [](const std::string& m) { std::printf("  [pool] %s\n", m.c_str()); std::fflush(stdout); };
-        cb.on_model = [](const meow::PoolModel& m) {
+        cb.on_model = [&](const meow::PoolModel& m) {
+            { std::lock_guard<std::mutex> lk(jm); cur_model = m; }
             std::printf("  [pool] model %s@%.12s  difficulty %llu  precision %s\n",
                         m.name.c_str(), m.commit.c_str(),
                         (unsigned long long)m.difficulty, m.precision.c_str());
@@ -294,7 +305,8 @@ int main(int argc, char** argv) {
         cb.on_target = [](const std::string& t) {
             std::printf("  [pool] share target %.16s…\n", t.c_str()); std::fflush(stdout);
         };
-        cb.on_job = [&jobs](const meow::PoolJob& j) {
+        cb.on_job = [&](const meow::PoolJob& j) {
+            { std::lock_guard<std::mutex> lk(jm); cur_job = j; job_dirty = true; }
             std::printf("  [pool] job %s  height %llu  %s\n",
                         j.job_id.c_str(), (unsigned long long)j.height,
                         j.clean ? "(clean — parent changed)" : "(continue)");
@@ -323,15 +335,93 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        // Mining itself is not in this build. Say so plainly rather than
-        // printing a hashrate that is not being produced.
+        // ---- real mining -------------------------------------------------
+        meow::EngineConfig ec;
+        ec.model_path       = o.model_path;
+        ec.slots_per_device = o.slots;
+        for (const auto& d : dm.devices()) ec.devices.push_back(d.index);
+
+        meow::InferenceEngine engine;
+        std::string eerr;
+        if (!engine.load(ec, eerr, [](const std::string& m){ std::printf("  %s\n", m.c_str()); std::fflush(stdout); })) {
+            std::fprintf(stderr, "error: %s\n", eerr.c_str());
+            client.stop();
+            return 1;
+        }
+
+        meow::PoiMiner poi;
+        if (!poi.init(256, eerr)) {
+            std::fprintf(stderr, "error: %s\n", eerr.c_str());
+            client.stop();
+            return 1;
+        }
+        std::printf("  proof-of-inference ready (VDF %s…)\n\n", poi.vdf_hex().substr(0, 12).c_str());
+
+
+        uint64_t windows = 0, shares = 0;
+        const auto t_start = std::chrono::steady_clock::now();
+
+        while (!g_stop) {
+            meow::PoolJob   j;
+            meow::PoolModel m;
+            { std::lock_guard<std::mutex> lk(jm); j = cur_job; m = cur_model; }
+            if (!j.valid || !m.valid || j.share_target.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                continue;
+            }
+            if (job_dirty.exchange(false)) {
+                meow::PoiJobParams p;
+                p.header_prefix    = j.header_prefix;
+                p.block_target     = j.block_target;
+                p.share_target     = j.share_target;
+                p.model_identifier = m.name + "@" + m.commit;
+                p.model_difficulty = m.difficulty;
+                p.normalizer       = m.normalizer;
+                p.job_id           = j.job_id;
+                p.valid            = true;
+                std::string perr;
+                if (!poi.set_job(p, perr)) {
+                    std::fprintf(stderr, "  job rejected: %s\n", perr.c_str());
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    continue;
+                }
+            }
+
+            // One window. The sampler chooses every token and records the
+            // transcript; the engine advances on the sampler's choice.
+            std::string gerr;
+            const int n = engine.generate_window(0, "Explain distributed consensus in detail.",
+                [&](const float* logits, int n_vocab, const std::vector<int64_t>& ctx) -> int {
+                    return poi.on_logits(0, logits, n_vocab, ctx, 1.0f, 50, 1.0f);
+                }, gerr);
+            if (n < 0) {
+                std::fprintf(stderr, "  window failed: %s\n", gerr.c_str());
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+            ++windows;
+
+            if (auto sh = poi.take_share()) {
+                client.submit(sh->job_id, sh->nonce, sh->proof_b64, sh->achieved_hex, sh->vdf_tick);
+                ++shares;
+            }
+
+            if (windows % 5 == 0) {
+                const double secs = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_start).count();
+                const auto st = client.stats();
+                std::printf("  %llu windows, %llu submitted | %.2f PoI/s | pool: %llu acc %llu rej %llu stale\n",
+                            (unsigned long long)windows, (unsigned long long)shares,
+                            secs > 0 ? double(windows) / secs : 0.0,
+                            (unsigned long long)st.accepted, (unsigned long long)st.rejected,
+                            (unsigned long long)st.stale);
+                std::fflush(stdout);
+            }
+        }
+
         client.stop();
-        std::fprintf(stderr,
-            "\nerror: this build connects to the pool but does not mine yet.\n"
-            "       Device setup, tuning, telemetry and the TSC Stratum client are done;\n"
-            "       the inference + proof-of-inference pipeline is next (see README.md).\n"
-            "       Try --protocol-test to verify pool connectivity.\n\n");
-        return 3;
+        dm.restore_all();
+        return 0;
     }
 
     std::printf("dry run — telemetry every %ds, Ctrl-C to stop\n\n", o.log_interval);

@@ -75,6 +75,10 @@ private:
     std::string vdf_hex_;
     uint64_t    vdf_tick_ = 0;
     std::string parent_hash_hex_;   // to detect a parent change
+    const char* stage_ = "";       // which coordinator call is in flight
+    size_t      last_ctx_ = 0;
+    size_t      prompt_len_ = 0;    // context size at the window's first token
+    int         window_tokens_ = 256;      // to detect the start of a new window
 };
 
 }  // namespace meow

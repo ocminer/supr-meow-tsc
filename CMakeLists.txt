@@ -132,6 +132,11 @@ add_library(meow_poi STATIC ${MEOW_POI_STAGED})
 target_include_directories(meow_poi PUBLIC
   ${MEOW_POI_STAGE} ${ARGON2_INCLUDE_DIR} ${FLATBUFFERS_INCLUDE_DIR} ${ZMQ_INCLUDE_DIR})
 target_link_libraries(meow_poi PUBLIC ${ARGON2_LIBRARY} ${ZMQ_LIBRARY} OpenSSL::Crypto)
+# Linking libargon2 is NOT enough: the v3 admission code is behind this macro,
+# and without it the sampler refuses to start on a v3 chain (its own guard —
+# "a v3 miner without Argon2 would silently forfeit every admission-band
+# window"). Define it wherever argon2 is linked.
+target_compile_definitions(meow_poi PUBLIC POW_V3_HAVE_ARGON2)
 set_target_properties(meow_poi PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
