@@ -1,3 +1,6 @@
 [submodule "vendor/llama.cpp"]
 	path = vendor/llama.cpp
 	url = https://github.com/tensorcash/llama.cpp
+[submodule "vendor/tensorcash"]
+	path = vendor/tensorcash
+	url = https://github.com/tensorcash/tensorcash

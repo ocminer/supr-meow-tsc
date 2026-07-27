@@ -34,6 +34,106 @@ set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL           OFF CACHE BOOL "" FORCE)
 add_subdirectory(${MEOW_LLAMA_DIR} ${CMAKE_BINARY_DIR}/llama EXCLUDE_FROM_ALL)
 
+# ---------------------------------------------------------------------------
+# Proof-of-inference sources.
+#
+# These live in the UMBRELLA repo (vendor/tensorcash/shared-utils/pow-utils),
+# not in the llama.cpp fork — the fork's CMakeLists references pow_utils.cpp but
+# does not contain it, because upstream's Dockerfile copies it in at image build
+# time. Anyone cloning the fork alone therefore cannot build it. We reference
+# both repos as pinned submodules and compile the sampler directly, so a plain
+# `git clone --recursive && cmake` reproduces the binary.
+#
+# The FlatBuffers headers (proof_generated.h etc.) are pre-generated in the repo,
+# so no flatc is needed at build time.
+# ---------------------------------------------------------------------------
+set(MEOW_POW_DIR "${CMAKE_SOURCE_DIR}/vendor/tensorcash/shared-utils/pow-utils"
+    CACHE PATH "TensorCash pow-utils checkout")
+if(NOT EXISTS "${MEOW_POW_DIR}/pow_utils.cpp")
+  message(FATAL_ERROR
+    "proof-of-inference sources not found at ${MEOW_POW_DIR}.\n"
+    "Run: git submodule update --init --recursive")
+endif()
+
+find_package(OpenSSL REQUIRED)
+find_path(ARGON2_INCLUDE_DIR argon2.h)
+find_library(ARGON2_LIBRARY NAMES argon2)
+if(NOT ARGON2_INCLUDE_DIR OR NOT ARGON2_LIBRARY)
+  message(FATAL_ERROR "libargon2 not found — install libargon2-dev. "
+                      "It is REQUIRED: the chain is past v3 activation and every "
+                      "proof needs the Argon2id admission puzzle.")
+endif()
+find_path(FLATBUFFERS_INCLUDE_DIR flatbuffers/flatbuffers.h)
+if(NOT FLATBUFFERS_INCLUDE_DIR)
+  message(FATAL_ERROR "flatbuffers headers not found — install FlatBuffers v25 "
+                      "(the 2.x packaged by distros fails a hard version assert).")
+endif()
+
+# The *_generated.h checked into pow-utils were produced by flatc 23.5.26 and
+# carry a hard static_assert against the runtime version, so they refuse to
+# compile against any other FlatBuffers. Regenerate them from the .fbs schemas
+# with the local flatc — which is exactly what upstream's Dockerfile does, and
+# it keeps the build working across FlatBuffers releases.
+find_library(ZMQ_LIBRARY NAMES zmq)
+find_path(ZMQ_INCLUDE_DIR zmq.h)
+if(NOT ZMQ_LIBRARY OR NOT ZMQ_INCLUDE_DIR)
+  message(FATAL_ERROR "libzmq not found — install libzmq3-dev. It arrives with "
+                      "the MiningResponse serializer; the miner submits over "
+                      "stratum and does not use the ZMQ egress.")
+endif()
+
+find_program(FLATC_EXECUTABLE flatc)
+if(NOT FLATC_EXECUTABLE)
+  message(FATAL_ERROR "flatc not found — needed to regenerate the proof schemas. "
+                      "Install FlatBuffers v25 (compiler + headers).")
+endif()
+set(MEOW_FBS_DIR "${CMAKE_SOURCE_DIR}/vendor/tensorcash/shared-utils/fb-schemas"
+    CACHE PATH "TensorCash flatbuffers schemas")
+set(MEOW_FB_GEN "${CMAKE_BINARY_DIR}/fbgen")
+file(MAKE_DIRECTORY ${MEOW_FB_GEN})
+set(MEOW_FB_HEADERS
+  ${MEOW_FB_GEN}/proof_generated.h
+  ${MEOW_FB_GEN}/blockheader_generated.h
+  ${MEOW_FB_GEN}/validation_generated.h)
+add_custom_command(
+  OUTPUT ${MEOW_FB_HEADERS}
+  COMMAND ${FLATC_EXECUTABLE} --cpp -o ${MEOW_FB_GEN}
+          ${MEOW_FBS_DIR}/proof.fbs ${MEOW_FBS_DIR}/blockheader.fbs ${MEOW_FBS_DIR}/validation.fbs
+  DEPENDS ${MEOW_FBS_DIR}/proof.fbs ${MEOW_FBS_DIR}/blockheader.fbs ${MEOW_FBS_DIR}/validation.fbs
+  COMMENT "Regenerating FlatBuffers proof schemas with ${FLATC_EXECUTABLE}")
+add_custom_target(meow_fbgen DEPENDS ${MEOW_FB_HEADERS})
+
+# Stage the sources into the build tree and drop the FRESH generated headers in
+# beside them. Necessary because pow_utils.cpp uses a QUOTED include
+# (#include "proof_generated.h"), which the compiler resolves next to the source
+# file before any -I path — so include order alone cannot shadow the stale
+# checked-in copies. Upstream's Dockerfile stages the same way.
+set(MEOW_POI_STAGE ${CMAKE_BINARY_DIR}/poi)
+file(MAKE_DIRECTORY ${MEOW_POI_STAGE})
+set(MEOW_POI_STAGED
+  ${MEOW_POI_STAGE}/pow_utils.cpp ${MEOW_POI_STAGE}/pow_v3.cpp
+  ${MEOW_POI_STAGE}/bcred_table_r1024.cpp
+  ${MEOW_POI_STAGE}/pow_zmq_writer.cpp)
+add_custom_command(
+  OUTPUT ${MEOW_POI_STAGED}
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          ${MEOW_POW_DIR}/pow_utils.cpp ${MEOW_POW_DIR}/pow_utils.h
+          ${MEOW_POW_DIR}/pow_v3.cpp ${MEOW_POW_DIR}/pow_v3.h
+          ${MEOW_POW_DIR}/bcred_table_r1024.cpp ${MEOW_POW_DIR}/bcred_table_r1024.h
+          ${MEOW_POW_DIR}/any_map_dump.h
+          ${MEOW_POW_DIR}/pow_zmq_writer.cpp ${MEOW_POW_DIR}/pow_zmq_writer.h
+          ${MEOW_POW_DIR}/pow_zmq_writer_helpers.h
+          ${MEOW_POI_STAGE}
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${MEOW_FB_HEADERS} ${MEOW_POI_STAGE}
+  DEPENDS ${MEOW_FB_HEADERS} ${MEOW_POW_DIR}/pow_utils.cpp ${MEOW_POW_DIR}/pow_v3.cpp
+  COMMENT "Staging proof-of-inference sources with regenerated schemas")
+
+add_library(meow_poi STATIC ${MEOW_POI_STAGED})
+target_include_directories(meow_poi PUBLIC
+  ${MEOW_POI_STAGE} ${ARGON2_INCLUDE_DIR} ${FLATBUFFERS_INCLUDE_DIR} ${ZMQ_INCLUDE_DIR})
+target_link_libraries(meow_poi PUBLIC ${ARGON2_LIBRARY} ${ZMQ_LIBRARY} OpenSSL::Crypto)
+set_target_properties(meow_poi PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_executable(supr-meow-tsc
   src/main.cpp
   src/device.cpp
@@ -45,7 +145,7 @@ target_include_directories(supr-meow-tsc PRIVATE
   ${MEOW_LLAMA_DIR}/ggml/include
 )
 target_include_directories(supr-meow-tsc PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
-target_link_libraries(supr-meow-tsc PRIVATE llama ggml CUDA::cudart CUDA::nvml Threads::Threads)
+target_link_libraries(supr-meow-tsc PRIVATE meow_poi llama ggml CUDA::cudart CUDA::nvml Threads::Threads)
 
 # A miner is copied between rigs, so prefer a binary that does not chase host
 # libstdc++ versions. CUDA/NVML stay dynamic (they must match the driver).
