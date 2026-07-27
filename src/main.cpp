@@ -11,6 +11,7 @@
 #include "device.h"
 #include "stratum.h"
 #include "engine.h"
+#include "vdf.h"
 
 #include <atomic>
 #include <chrono>
@@ -41,6 +42,7 @@ struct Options {
     bool        no_color     = false;
     bool        protocol_test = false;
     bool        benchmark    = false;
+    bool        vdf_test     = false;
     int         slots = 8;
     std::vector<std::string> pools;   // repeated -o = failover order
     meow::DeviceTuning tuning;   // --cclock/--mclock/--pl/--fan/--lock-core
@@ -69,6 +71,8 @@ void print_usage() {
 "      --list-devices      Print every detected GPU and exit.\n"
 "      --dry-run           Set up devices, show telemetry, do not mine.\n"
 "      --benchmark         Load the model and measure per-GPU throughput.\n"
+"      --vdf-test          Self-test the VDF (prove, verify, and confirm a\n"
+"                          proof does NOT verify against another challenge).\n"
 "      --slots <n>         Concurrent windows per GPU (default 8).\n"
 "      --protocol-test     Connect to the pool and print jobs/targets/model\n"
 "                          without mining. Verifies pool reachability and\n"
@@ -114,6 +118,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--dry-run")         o.dry_run = true;
         else if (a == "--protocol-test")   o.protocol_test = true;
         else if (a == "--benchmark")       o.benchmark = true;
+        else if (a == "--vdf-test")        o.vdf_test = true;
         else if (a == "--slots")           { if (!need_value(i, argc, "--slots")) return false; o.slots = std::atoi(argv[++i]); }
         else if (a == "--no-color")        o.no_color = true;
         else if (eq("-o", "--pool"))       { if (!need_value(i, argc, "-o")) return false; o.pool = argv[++i]; o.pools.push_back(o.pool); }
@@ -217,6 +222,19 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("\n");
+    }
+
+    if (o.vdf_test) {
+        std::printf("VDF self-test (chiavdf, 1024-bit discriminant)\n");
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string verr;
+        const bool ok = meow::Vdf::self_test(verr, 1000);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        if (!ok) { std::fprintf(stderr, "  FAILED: %s\n", verr.c_str()); return 1; }
+        std::printf("  prove+verify of 1000 iterations in %.0f ms\n", ms);
+        std::printf("  wrong-challenge rejection: ok\n  VDF ready\n");
+        return 0;
     }
 
     if (o.benchmark) {

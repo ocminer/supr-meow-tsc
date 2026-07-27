@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(supr-meow-tsc LANGUAGES CXX)
+project(supr-meow-tsc LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -134,6 +134,38 @@ target_include_directories(meow_poi PUBLIC
 target_link_libraries(meow_poi PUBLIC ${ARGON2_LIBRARY} ${ZMQ_LIBRARY} OpenSSL::Crypto)
 set_target_properties(meow_poi PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# ---------------------------------------------------------------------------
+# VDF (chiavdf). Sequential by design, so it stays on the CPU. Cannot be
+# stubbed: a proof without a valid VDF is rejected by the network.
+# ---------------------------------------------------------------------------
+set(MEOW_CHIAVDF_DIR "${CMAKE_SOURCE_DIR}/vendor/tensorcash/shared-utils/chiavdf"
+    CACHE PATH "chiavdf checkout")
+if(NOT EXISTS "${MEOW_CHIAVDF_DIR}/src/verifier.h")
+  message(FATAL_ERROR
+    "chiavdf not found at ${MEOW_CHIAVDF_DIR}.\n"
+    "Run: git submodule update --init --recursive")
+endif()
+find_path(GMP_INCLUDE_DIR gmp.h)
+find_library(GMP_LIBRARY NAMES gmp)
+find_library(GMPXX_LIBRARY NAMES gmpxx)
+if(NOT GMP_INCLUDE_DIR OR NOT GMP_LIBRARY)
+  message(FATAL_ERROR "GMP not found — install libgmp-dev (chiavdf needs it).")
+endif()
+
+add_library(meow_vdf STATIC
+  src/vdf.cpp
+  ${MEOW_CHIAVDF_DIR}/src/refcode/lzcnt.c
+)
+target_include_directories(meow_vdf PUBLIC ${MEOW_CHIAVDF_DIR}/src ${GMP_INCLUDE_DIR})
+target_link_libraries(meow_vdf PUBLIC ${GMP_LIBRARY})
+if(GMPXX_LIBRARY)
+  target_link_libraries(meow_vdf PUBLIC ${GMPXX_LIBRARY})
+endif()
+# chiavdf's fixed-point paths are only correct under truncation rounding and
+# strict FP semantics; -ffast-math here would silently produce invalid proofs.
+target_compile_options(meow_vdf PRIVATE -fno-fast-math -frounding-math)
+set_target_properties(meow_vdf PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_executable(supr-meow-tsc
   src/main.cpp
   src/device.cpp
@@ -145,7 +177,7 @@ target_include_directories(supr-meow-tsc PRIVATE
   ${MEOW_LLAMA_DIR}/ggml/include
 )
 target_include_directories(supr-meow-tsc PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
-target_link_libraries(supr-meow-tsc PRIVATE meow_poi llama ggml CUDA::cudart CUDA::nvml Threads::Threads)
+target_link_libraries(supr-meow-tsc PRIVATE meow_poi meow_vdf llama ggml CUDA::cudart CUDA::nvml Threads::Threads)
 
 # A miner is copied between rigs, so prefer a binary that does not chase host
 # libstdc++ versions. CUDA/NVML stay dynamic (they must match the driver).
