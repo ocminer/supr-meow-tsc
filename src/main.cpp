@@ -10,6 +10,7 @@
 
 #include "device.h"
 #include "stratum.h"
+#include "engine.h"
 
 #include <atomic>
 #include <chrono>
@@ -39,6 +40,8 @@ struct Options {
     bool        dry_run      = false;
     bool        no_color     = false;
     bool        protocol_test = false;
+    bool        benchmark    = false;
+    int         slots = 8;
     std::vector<std::string> pools;   // repeated -o = failover order
     meow::DeviceTuning tuning;   // --cclock/--mclock/--pl/--fan/--lock-core
 };
@@ -65,6 +68,8 @@ void print_usage() {
 "      --log-interval <s>  Seconds between status lines (default 30).\n"
 "      --list-devices      Print every detected GPU and exit.\n"
 "      --dry-run           Set up devices, show telemetry, do not mine.\n"
+"      --benchmark         Load the model and measure per-GPU throughput.\n"
+"      --slots <n>         Concurrent windows per GPU (default 8).\n"
 "      --protocol-test     Connect to the pool and print jobs/targets/model\n"
 "                          without mining. Verifies pool reachability and\n"
 "                          that both sides speak TSC Stratum.\n"
@@ -108,6 +113,8 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--list-devices")    o.list_devices = true;
         else if (a == "--dry-run")         o.dry_run = true;
         else if (a == "--protocol-test")   o.protocol_test = true;
+        else if (a == "--benchmark")       o.benchmark = true;
+        else if (a == "--slots")           { if (!need_value(i, argc, "--slots")) return false; o.slots = std::atoi(argv[++i]); }
         else if (a == "--no-color")        o.no_color = true;
         else if (eq("-o", "--pool"))       { if (!need_value(i, argc, "-o")) return false; o.pool = argv[++i]; o.pools.push_back(o.pool); }
         else if (eq("-u", "--user"))       { if (!need_value(i, argc, "-u")) return false; o.user = argv[++i]; }
@@ -210,6 +217,34 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("\n");
+    }
+
+    if (o.benchmark) {
+        meow::EngineConfig ec;
+        ec.model_path       = o.model_path;
+        ec.slots_per_device = o.slots;
+        for (const auto& d : dm.devices()) ec.devices.push_back(d.index);
+
+        meow::InferenceEngine engine;
+        std::string eerr;
+        std::printf("loading %s\n", ec.model_path.c_str());
+        if (!engine.load(ec, eerr, [](const std::string& m){ std::printf("  %s\n", m.c_str()); std::fflush(stdout); })) {
+            std::fprintf(stderr, "error: %s\n", eerr.c_str());
+            return 1;
+        }
+        std::printf("  vocabulary: %d tokens\n\nrunning %d window(s) per GPU…\n", engine.n_vocab(), 2);
+        const auto st = engine.benchmark(2, eerr);
+        if (st.empty()) { std::fprintf(stderr, "error: %s\n", eerr.c_str()); return 1; }
+        std::printf("\n  %-5s %10s %10s %12s\n", "GPU", "tokens", "seconds", "tok/s");
+        double total = 0;
+        for (const auto& s2 : st) {
+            std::printf("  %-5d %10llu %10.1f %12.1f\n", s2.device,
+                        (unsigned long long)s2.tokens, s2.seconds, s2.tokens_per_s);
+            total += s2.tokens_per_s;
+        }
+        std::printf("  %-5s %10s %10s %12.1f  (aggregate)\n\n", "all", "", "", total);
+        dm.restore_all();
+        return 0;
     }
 
     if (o.protocol_test || !o.dry_run) {
