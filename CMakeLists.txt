@@ -8,12 +8,16 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 
 add_executable(supr-meow-tsc
   src/main.cpp
   src/device.cpp
+  src/stratum.cpp
 )
-target_link_libraries(supr-meow-tsc PRIVATE CUDA::cudart CUDA::nvml)
+target_include_directories(supr-meow-tsc PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
+target_link_libraries(supr-meow-tsc PRIVATE CUDA::cudart CUDA::nvml Threads::Threads)
 
 # A miner is copied between rigs, so prefer a binary that does not chase host
 # libstdc++ versions. CUDA/NVML stay dynamic (they must match the driver).

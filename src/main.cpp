@@ -9,6 +9,7 @@
 // =============================================================================
 
 #include "device.h"
+#include "stratum.h"
 
 #include <atomic>
 #include <chrono>
@@ -37,6 +38,8 @@ struct Options {
     bool        list_devices = false;
     bool        dry_run      = false;
     bool        no_color     = false;
+    bool        protocol_test = false;
+    std::vector<std::string> pools;   // repeated -o = failover order
     meow::DeviceTuning tuning;   // --cclock/--mclock/--pl/--fan/--lock-core
 };
 
@@ -48,9 +51,9 @@ void print_usage() {
 "  supr-meow-tsc -o <pool> -u <wallet>[.<worker>] [-p <pass>] [options]\n"
 "\n"
 "REQUIRED\n"
-"  -o, --pool <url>        Pool URL. TensorCash pools speak a WebSocket broker\n"
-"                          protocol, so this is ws:// or wss:// — NOT stratum.\n"
-"                          e.g. wss://tsc.suprnova.cc/ws\n"
+"  -o, --pool <url>        stratum+tcp://host:port (or stratum+ssl://).\n"
+"                          Repeat -o for failover pools, tried in order.\n"
+"                          e.g. stratum+tcp://tsc.suprnova.cc:3307\n"
 "  -u, --user <wallet>     TSC payout address, optionally .workername\n"
 "                          e.g. tc1qexample....rig01   (testnet: tct1...)\n"
 "\n"
@@ -62,6 +65,9 @@ void print_usage() {
 "      --log-interval <s>  Seconds between status lines (default 30).\n"
 "      --list-devices      Print every detected GPU and exit.\n"
 "      --dry-run           Set up devices, show telemetry, do not mine.\n"
+"      --protocol-test     Connect to the pool and print jobs/targets/model\n"
+"                          without mining. Verifies pool reachability and\n"
+"                          that both sides speak TSC Stratum.\n"
 "      --no-color          Plain output for logs and flight sheets.\n"
 "  -h, --help              This text.\n"
 "  -V, --version           Version.\n"
@@ -80,8 +86,9 @@ void print_usage() {
 "  On exit, fans are handed back to the driver and locked clocks released.\n"
 "\n"
 "EXAMPLES\n"
-"  supr-meow-tsc -o wss://tsc.suprnova.cc/ws -u tc1qexample.rig01 -p x\n"
-"  supr-meow-tsc -o wss://tsc.suprnova.cc/ws -u tc1qexample -d 0,1 --pl 400\n"
+"  supr-meow-tsc -o stratum+tcp://tsc.suprnova.cc:3307 -u tc1qexample.rig01 -p x\n"
+"  supr-meow-tsc -o stratum+tcp://pool-a:3307 -o stratum+tcp://pool-b:3307 -u tc1q…\n"
+"  supr-meow-tsc -o stratum+tcp://tsc.suprnova.cc:3307 -u tc1qexample --protocol-test\n"
 "  supr-meow-tsc --list-devices\n"
 "\n", kVersion);
 }
@@ -100,8 +107,9 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (eq("-V", "--version"))    { std::printf("supr-meow-tsc %s\n", kVersion); std::exit(0); }
         else if (a == "--list-devices")    o.list_devices = true;
         else if (a == "--dry-run")         o.dry_run = true;
+        else if (a == "--protocol-test")   o.protocol_test = true;
         else if (a == "--no-color")        o.no_color = true;
-        else if (eq("-o", "--pool"))       { if (!need_value(i, argc, "-o")) return false; o.pool = argv[++i]; }
+        else if (eq("-o", "--pool"))       { if (!need_value(i, argc, "-o")) return false; o.pool = argv[++i]; o.pools.push_back(o.pool); }
         else if (eq("-u", "--user"))       { if (!need_value(i, argc, "-u")) return false; o.user = argv[++i]; }
         else if (eq("-p", "--pass"))       { if (!need_value(i, argc, "-p")) return false; o.pass = argv[++i]; }
         else if (eq("-d", "--devices"))    { if (!need_value(i, argc, "-d")) return false; o.devices = argv[++i]; }
@@ -204,27 +212,72 @@ int main(int argc, char** argv) {
         std::printf("\n");
     }
 
-    if (!o.dry_run) {
-        if (o.pool.empty() || o.user.empty()) {
+    if (o.protocol_test || !o.dry_run) {
+        if (o.pools.empty() || o.user.empty()) {
             std::fprintf(stderr,
-                "error: -o and -u are required to mine (use --list-devices or --dry-run otherwise)\n");
+                "error: -o and -u are required (use --list-devices or --dry-run otherwise)\n");
             return 2;
         }
-        if (o.pool.rfind("stratum+tcp://", 0) == 0 || o.pool.rfind("stratum+ssl://", 0) == 0) {
-            std::fprintf(stderr,
-                "error: TensorCash does not use stratum. Pools speak a WebSocket broker\n"
-                "       protocol — use ws:// or wss:// (e.g. wss://tsc.suprnova.cc/ws).\n");
-            return 2;
+        std::vector<meow::PoolUrl> urls;
+        for (const auto& raw : o.pools) {
+            meow::PoolUrl u; std::string perr;
+            if (!meow::PoolUrl::parse(raw, u, perr)) {
+                std::fprintf(stderr, "error: %s\n", perr.c_str());
+                return 2;
+            }
+            urls.push_back(u);
         }
-        // The mining pipeline is not wired into this binary yet. Saying so is
-        // the only honest option: a miner that prints a hashrate it is not
-        // producing is worse than one that refuses to start.
+
+        meow::StratumClient client;
+        std::atomic<int> jobs{0};
+        meow::StratumCallbacks cb;
+        cb.on_log = [](const std::string& m) { std::printf("  [pool] %s\n", m.c_str()); std::fflush(stdout); };
+        cb.on_model = [](const meow::PoolModel& m) {
+            std::printf("  [pool] model %s@%.12s  difficulty %llu  precision %s\n",
+                        m.name.c_str(), m.commit.c_str(),
+                        (unsigned long long)m.difficulty, m.precision.c_str());
+            std::fflush(stdout);
+        };
+        cb.on_target = [](const std::string& t) {
+            std::printf("  [pool] share target %.16s…\n", t.c_str()); std::fflush(stdout);
+        };
+        cb.on_job = [&jobs](const meow::PoolJob& j) {
+            std::printf("  [pool] job %s  height %llu  %s\n",
+                        j.job_id.c_str(), (unsigned long long)j.height,
+                        j.clean ? "(clean — parent changed)" : "(continue)");
+            std::fflush(stdout);
+            jobs++;
+        };
+        cb.on_submit_result = [](bool ok, int code, const std::string& msg) {
+            std::printf("  [pool] share %s%s%s\n", ok ? "accepted" : "REJECTED",
+                        ok ? "" : " — ", ok ? "" : msg.c_str());
+            std::fflush(stdout);
+            (void)code;
+        };
+
+        client.configure(urls, o.user, o.pass, std::string("supr-meow-tsc/") + kVersion, cb);
+        std::printf("connecting to %s as %s\n\n", urls[0].raw.c_str(), o.user.c_str());
+        if (!client.start()) { std::fprintf(stderr, "error: cannot start pool client\n"); return 1; }
+
+        if (o.protocol_test) {
+            std::printf("protocol test — Ctrl-C to stop\n\n");
+            while (!g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            const auto st = client.stats();
+            std::printf("\n%d job(s) received, %llu reconnect(s)\n",
+                        jobs.load(), (unsigned long long)st.reconnects);
+            client.stop();
+            dm.restore_all();
+            return 0;
+        }
+
+        // Mining itself is not in this build. Say so plainly rather than
+        // printing a hashrate that is not being produced.
+        client.stop();
         std::fprintf(stderr,
-            "\nerror: this build does not mine yet.\n"
-            "       Device selection, tuning and telemetry are complete; the inference +\n"
-            "       proof-of-inference pipeline is still being integrated (see README.md).\n"
-            "       Use --dry-run to verify device setup, or run the current\n"
-            "       nepl-tsc miner stack meanwhile.\n\n");
+            "\nerror: this build connects to the pool but does not mine yet.\n"
+            "       Device setup, tuning, telemetry and the TSC Stratum client are done;\n"
+            "       the inference + proof-of-inference pipeline is next (see README.md).\n"
+            "       Try --protocol-test to verify pool connectivity.\n\n");
         return 3;
     }
 
