@@ -66,6 +66,12 @@ struct PoiMiner::Impl {
     void*  zmq_pull = nullptr;
     PoiJobParams job;
     std::unordered_map<std::string, std::string> params;   // re-registered per window
+    // req_id → job_id for recent jobs. A proof emitted at the last token of a
+    // window is drained on the NEXT on_logits call — which can already be in a
+    // new job. Labelling it with the CURRENT job made the pool submit it
+    // against the wrong work unit ("req_id mismatch: rpc=15 flatbuffer=14").
+    // The proof names its own unit (MiningResponse.req_id); label by that.
+    std::unordered_map<uint64_t, std::string> job_by_req;
     std::unique_ptr<PoiShare> pending;
     std::mutex mtx;
 
@@ -195,6 +201,13 @@ bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
         return false;
     }
 
+    impl_->job_by_req[p.request_id] = p.job_id;
+    if (impl_->job_by_req.size() > 16) {           // drop stale entries; the
+        for (auto it = impl_->job_by_req.begin(); // pool forgets old jobs too
+             it != impl_->job_by_req.end() && impl_->job_by_req.size() > 8;)
+            it = (it->second != p.job_id) ? impl_->job_by_req.erase(it) : ++it;
+    }
+
     impl_->job = p;
     ready_ = true;
     return true;
@@ -276,6 +289,13 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
             const auto* data = static_cast<const uint8_t*>(zmq_msg_data(&msg));
             auto share = std::make_unique<PoiShare>();
             share->job_id       = impl_->job.job_id;
+            {
+                const auto* mr0 = flatbuffers::GetRoot<proof::MiningResponse>(data);
+                if (mr0) {
+                    auto it = impl_->job_by_req.find(mr0->req_id());
+                    if (it != impl_->job_by_req.end()) share->job_id = it->second;
+                }
+            }
             // The pool dedups on (job, nonce) and rejects a repeat outright.
             // Blocks are submitted from the proof alone, so this value carries
             // no consensus meaning — it only has to be unique per job. Leaving
@@ -300,6 +320,16 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
                     std::memcpy(hdr + 76, pb->hash()->data(), 4);   // nonce = digest[:4]
                     SHA256(hdr, 80, h1);
                     SHA256(h1, 32, h2);
+                    // DISPLAY order (reversed): consensus interprets the raw
+                    // digest as a LITTLE-endian integer (check_hash_against
+                    // _target: "Interpret digest & target as Core does"), so
+                    // the hex that compares correctly as a big-endian number
+                    // against target hex is the byte-reversed digest — the
+                    // same convention as a displayed Core block hash. Claiming
+                    // raw order made the pool promote non-blocks (bcore:
+                    // "does not meet target difficulty") and would drop real
+                    // solutions whose raw-order hex merely LOOKS too large.
+                    std::reverse(h2, h2 + 32);
                     share->achieved_hex = bytes_to_hex(h2, 32);
                 }
             }
