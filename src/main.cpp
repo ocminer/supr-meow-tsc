@@ -52,6 +52,7 @@ struct Options {
     int         slots = 8;
     int         workers = 1;   // independent contexts per GPU (--workers)
     int         groups  = 8;   // parallel sampler threads per GPU (--groups)
+    int         egress_base = 47021;  // base loopback port for proof egress (--egress-base)
     std::vector<std::string> pools;   // repeated -o = failover order
     meow::DeviceTuning tuning;   // --cclock/--mclock/--pl/--fan/--lock-core
 };
@@ -130,6 +131,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--slots")           { if (!need_value(i, argc, "--slots")) return false; o.slots = std::atoi(argv[++i]); }
         else if (a == "--workers")         { if (!need_value(i, argc, "--workers")) return false; o.workers = std::atoi(argv[++i]); }
         else if (a == "--groups")          { if (!need_value(i, argc, "--groups")) return false; o.groups = std::atoi(argv[++i]); }
+        else if (a == "--egress-base")     { if (!need_value(i, argc, "--egress-base")) return false; o.egress_base = std::atoi(argv[++i]); }
         else if (a == "--no-color")        o.no_color = true;
         else if (eq("-o", "--pool"))       { if (!need_value(i, argc, "-o")) return false; o.pool = argv[++i]; o.pools.push_back(o.pool); }
         else if (eq("-u", "--user"))       { if (!need_value(i, argc, "-u")) return false; o.user = argv[++i]; }
@@ -365,12 +367,15 @@ int main(int argc, char** argv) {
         // Each pool runs the per-stream sampler tail across n_groups threads,
         // each its own coordinator — this is what uses the idle cores. Egress
         // ports are partitioned so no two coordinators collide (they also key
-        // the nonce partition): worker w, group g -> 47021 + w*64 + g.
+        // the nonce partition): worker w, group g -> egress_base + w*64 + g.
+        // --egress-base lets a SECOND process (one per GPU) claim a disjoint
+        // range, e.g. GPU 0 at 47021 and GPU 1 at 48021, so the two processes'
+        // loopback egress and nonce partitions never overlap.
         const int n_workers = engine.worker_count();
         std::vector<std::unique_ptr<meow::SamplerPool>> pools;
         for (int w = 0; w < n_workers; ++w) {
             auto sp = std::make_unique<meow::SamplerPool>();
-            if (!sp->init(n_streams, n_groups, 47021 + w * 64, engine.worker_device(w), eerr)) {
+            if (!sp->init(n_streams, n_groups, o.egress_base + w * 64, engine.worker_device(w), eerr)) {
                 std::fprintf(stderr, "error: %s\n", eerr.c_str());
                 client.stop();
                 return 1;
