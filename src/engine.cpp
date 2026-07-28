@@ -168,7 +168,8 @@ int InferenceEngine::generate_window(int device_slot, const std::string& prompt,
 int InferenceEngine::generate_windows_batched(int device_slot,
                                               const std::vector<std::string>& prompts,
                                               const BatchChooser& chooser,
-                                              std::string& error) {
+                                              std::string& error,
+                                              const BatchPrepare& prepare) {
     if (device_slot < 0 || device_slot >= static_cast<int>(instances_.size())) {
         error = "invalid device slot"; return -1;
     }
@@ -223,9 +224,14 @@ int InferenceEngine::generate_windows_batched(int device_slot,
     llama_batch nb = llama_batch_init(S, 0, S);
     for (int step = 0; step < cfg_.window_tokens; ++step) {
         nb.n_tokens = 0;
+        std::vector<const float*> all_logits(S, nullptr);
         for (int s = 0; s < S; ++s) {
-            const float* logits = llama_get_logits_ith(in.ctx, last_row[s]);
-            if (!logits) { llama_batch_free(nb); error = "no logits returned"; return -1; }
+            all_logits[s] = llama_get_logits_ith(in.ctx, last_row[s]);
+            if (!all_logits[s]) { llama_batch_free(nb); error = "no logits returned"; return -1; }
+        }
+        if (prepare) prepare(all_logits, n_vocab);
+        for (int s = 0; s < S; ++s) {
+            const float* logits = all_logits[s];
             const int chosen = chooser(s, logits, n_vocab, ctxv[s]);
             if (chosen < 0) { llama_batch_free(nb); error = "sampler aborted the window"; return -1; }
             ctxv[s].push_back((int64_t)chosen);

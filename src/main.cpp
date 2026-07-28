@@ -14,6 +14,9 @@
 #include "vdf.h"
 #include "poi.h"
 #include <random>
+#include <atomic>
+#include <thread>
+extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 #include <mutex>
 
 #include <atomic>
@@ -351,90 +354,108 @@ int main(int argc, char** argv) {
         }
 
         const int n_streams = std::max(1, o.slots);
-        meow::PoiMiner poi;
-        if (!poi.init(256, eerr, n_streams)) {
-            std::fprintf(stderr, "error: %s\n", eerr.c_str());
-            client.stop();
-            return 1;
-        }
-        std::printf("  proof-of-inference ready (VDF %s…)\n\n", poi.vdf_hex().substr(0, 12).c_str());
 
-
-        uint64_t windows = 0, shares = 0;
-        const uint64_t prompt_salt = std::random_device{}();
-        const auto t_start = std::chrono::steady_clock::now();
-
-        while (!g_stop) {
-            meow::PoolJob   j;
-            meow::PoolModel m;
-            { std::lock_guard<std::mutex> lk(jm); j = cur_job; m = cur_model; }
-            if (!j.valid || !m.valid || j.share_target.empty()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                continue;
+        // One sampler instance per device, initialised SEQUENTIALLY: the proof
+        // egress writer reads its port from the environment during init, so
+        // the ports must be set one at a time.
+        const size_t n_dev = engine.config().devices.size();
+        std::vector<std::unique_ptr<meow::PoiMiner>> miners;
+        for (size_t d = 0; d < n_dev; ++d) {
+            auto m = std::make_unique<meow::PoiMiner>();
+            if (!m->init(256, eerr, n_streams, 47021 + static_cast<int>(d))) {
+                std::fprintf(stderr, "error: %s\n", eerr.c_str());
+                client.stop();
+                return 1;
             }
-            if (job_dirty.exchange(false)) {
-                meow::PoiJobParams p;
-                p.header_prefix    = j.header_prefix;
-                p.block_target     = j.block_target;
-                p.share_target     = j.share_target;
-                p.model_identifier = m.name + "@" + m.commit;
-                p.model_difficulty = m.difficulty;
-                p.normalizer       = m.normalizer;
-                p.job_id           = j.job_id;
-                p.request_id       = j.request_id;
-                p.valid            = true;
-                std::string perr;
-                if (!poi.set_job(p, perr)) {
-                    std::fprintf(stderr, "  job rejected: %s\n", perr.c_str());
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
+            miners.push_back(std::move(m));
+        }
+        std::printf("  proof-of-inference ready on %zu device(s)\n\n", n_dev);
+
+        std::atomic<uint64_t> windows{0}, shares{0};
+        std::mutex submit_mx;                    // one stratum socket, N miners
+        const auto t_start = std::chrono::steady_clock::now();
+        const uint64_t prompt_salt = std::random_device{}();
+
+        auto mine_device = [&](int slot) {
+            meow::PoiMiner& poi = *miners[slot];
+            pow_gpu_bind_device(engine.config().devices[slot]);
+            uint64_t my_windows = 0;
+            while (!g_stop) {
+                meow::PoolJob   j;
+                meow::PoolModel m;
+                { std::lock_guard<std::mutex> lk(jm); j = cur_job; m = cur_model; }
+                if (!j.valid || !m.valid || j.share_target.empty()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     continue;
                 }
-            }
+                if (!poi.ready() || poi.job_id() != j.job_id) {
+                    meow::PoiJobParams p;
+                    p.header_prefix    = j.header_prefix;
+                    p.block_target     = j.block_target;
+                    p.share_target     = j.share_target;
+                    p.model_identifier = m.name + "@" + m.commit;
+                    p.model_difficulty = m.difficulty;
+                    p.normalizer       = m.normalizer;
+                    p.job_id           = j.job_id;
+                    p.request_id       = j.request_id;
+                    p.valid            = true;
+                    std::string perr;
+                    if (!poi.set_job(p, perr)) {
+                        std::fprintf(stderr, "  job rejected: %s\n", perr.c_str());
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                        continue;
+                    }
+                }
 
-            // Every window MUST use a different prompt per STREAM: the v3
-            // admission grind folds the prompt into its preimage and its
-            // commitment, so identical prompts yield identical transcripts —
-            // rejected as duplicates. Salt is random per run; stream and
-            // window index keep every window unique across rigs and restarts.
-            std::vector<std::string> prompts;
-            prompts.reserve(n_streams);
-            for (int st = 0; st < n_streams; ++st)
-                prompts.push_back("Explain distributed consensus in detail. [" +
-                    std::to_string(prompt_salt) + "-" + std::to_string(windows) +
-                    "-" + std::to_string(st) + "]");
+                std::vector<std::string> prompts;
+                prompts.reserve(n_streams);
+                for (int st = 0; st < n_streams; ++st)
+                    prompts.push_back("Explain distributed consensus in detail. [" +
+                        std::to_string(prompt_salt) + "-" + std::to_string(slot) + "-" +
+                        std::to_string(my_windows) + "-" + std::to_string(st) + "]");
 
-            // One batched pass: N windows in lock-step on device 0, one decode
-            // per step for all streams. The sampler runs per stream per step.
-            std::string gerr;
-            const int n = engine.generate_windows_batched(0, prompts,
-                [&](int stream, const float* logits, int n_vocab,
-                    const std::vector<int64_t>& ctx) -> int {
-                    return poi.on_logits(stream, logits, n_vocab, ctx, 1.0f, 50, 1.0f);
-                }, gerr);
-            if (n < 0) {
-                std::fprintf(stderr, "  window failed: %s\n", gerr.c_str());
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                continue;
-            }
-            windows += n;
+                std::string gerr;
+                const int n = engine.generate_windows_batched(slot, prompts,
+                    [&](int stream, const float* logits, int n_vocab,
+                        const std::vector<int64_t>& ctx) -> int {
+                        return poi.on_logits(stream, logits, n_vocab, ctx, 1.0f, 50, 1.0f);
+                    }, gerr,
+                    [&](const std::vector<const float*>& all, int n_vocab) {
+                        poi.prepare_batch(all, n_vocab);
+                    });
+                if (n < 0) {
+                    std::fprintf(stderr, "  window failed (gpu %d): %s\n", slot, gerr.c_str());
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    continue;
+                }
+                my_windows += n;
+                windows += n;
 
-            while (auto sh = poi.take_share()) {
-                client.submit(sh->job_id, sh->nonce, sh->proof_b64, sh->achieved_hex, sh->vdf_tick);
-                ++shares;
+                while (auto sh = poi.take_share()) {
+                    std::lock_guard<std::mutex> lk(submit_mx);
+                    client.submit(sh->job_id, sh->nonce, sh->proof_b64, sh->achieved_hex, sh->vdf_tick);
+                    ++shares;
+                }
             }
+        };
 
-            if (windows % 5 == 0) {
-                const double secs = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - t_start).count();
-                const auto st = client.stats();
-                std::printf("  %llu windows, %llu submitted | %.2f PoI/s | pool: %llu acc %llu rej %llu stale\n",
-                            (unsigned long long)windows, (unsigned long long)shares,
-                            secs > 0 ? double(windows) / secs : 0.0,
-                            (unsigned long long)st.accepted, (unsigned long long)st.rejected,
-                            (unsigned long long)st.stale);
-                std::fflush(stdout);
-            }
+        std::vector<std::thread> workers;
+        for (size_t d = 0; d < n_dev; ++d)
+            workers.emplace_back(mine_device, static_cast<int>(d));
+
+        while (!g_stop) {
+            std::this_thread::sleep_for(std::chrono::seconds(20));
+            const double secs = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_start).count();
+            const auto st = client.stats();
+            std::printf("  %llu windows, %llu submitted | %.2f PoI/s | pool: %llu acc %llu rej %llu stale\n",
+                        (unsigned long long)windows.load(), (unsigned long long)shares.load(),
+                        secs > 0 ? double(windows.load()) / secs : 0.0,
+                        (unsigned long long)st.accepted, (unsigned long long)st.rejected,
+                        (unsigned long long)st.stale);
+            std::fflush(stdout);
         }
+        for (auto& w : workers) w.join();
 
         client.stop();
         dm.restore_all();

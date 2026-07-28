@@ -9,6 +9,7 @@
 #include <cstring>
 #include <mutex>
 #include <deque>
+#include <cstring>
 #include <stdexcept>
 #include <cstdio>
 #include <unordered_map>
@@ -71,6 +72,12 @@ struct PoiMiner::Impl {
     std::unordered_map<int, size_t> prompt_len;  // per sequence: window prompt length
     std::deque<std::unique_ptr<PoiShare>> pending_q;  // several streams can emit
                                                       // between two drains
+    // Batched presort output, one slice per stream (idx: n_vocab each).
+    std::vector<uint32_t> batch_idx;
+    std::vector<float>    batch_head;
+    std::vector<double>   batch_stats;
+    int                   batch_n_vocab = 0;
+    bool                  batch_ready = false;
     // req_id → job_id for recent jobs. A proof emitted at the last token of a
     // window is drained on the NEXT on_logits call — which can already be in a
     // new job. Labelling it with the CURRENT job made the pool submit it
@@ -88,7 +95,13 @@ struct PoiMiner::Impl {
 PoiMiner::PoiMiner() : impl_(std::make_unique<Impl>()) {}
 PoiMiner::~PoiMiner() = default;
 
-bool PoiMiner::init(int window_tokens, std::string& error, int n_streams) {
+bool PoiMiner::init(int window_tokens, std::string& error, int n_streams,
+                    int egress_port) {
+    // Partition the nonce space per instance: the pool dedups on (job, nonce),
+    // and two devices both counting 1,2,3… collide on every share the second
+    // one submits ("duplicate share"). The egress port is already unique per
+    // instance, so it doubles as the partition key.
+    nonce_seq_ = static_cast<uint64_t>(egress_port) << 32;
     n_streams_ = std::max(1, n_streams);
     window_tokens_ = window_tokens;
     if (window_tokens != 256) {
@@ -107,13 +120,15 @@ bool PoiMiner::init(int window_tokens, std::string& error, int n_streams) {
     ::setenv("POW_EGRESS_MODE", "broker", 1);      // broker mode emits shares AND solutions
     ::setenv("POW_PROXY_ENABLE", "false", 1);      // ...and carries pow_blob_hash
     ::setenv("ZMQ_PUSH_HOST", "127.0.0.1", 1);
-    ::setenv("ZMQ_PUSH_PORT", std::to_string(kEgressPort).c_str(), 1);
+    // Per-instance: the writer reads this env at initialize(), so two
+    // PoiMiners must init SEQUENTIALLY, each setting its own port first.
+    ::setenv("ZMQ_PUSH_PORT", std::to_string(egress_port).c_str(), 1);
 
     impl_->zmq_ctx = zmq_ctx_new();
     if (!impl_->zmq_ctx) { error = "zmq_ctx_new failed"; return false; }
     impl_->zmq_pull = zmq_socket(impl_->zmq_ctx, ZMQ_PULL);
     if (!impl_->zmq_pull) { error = "zmq_socket failed"; return false; }
-    const std::string ep = "tcp://127.0.0.1:" + std::to_string(kEgressPort);
+    const std::string ep = "tcp://127.0.0.1:" + std::to_string(egress_port);
     if (zmq_bind(impl_->zmq_pull, ep.c_str()) != 0) {
         error = std::string("cannot bind proof egress on ") + ep + ": " + zmq_strerror(zmq_errno());
         return false;
@@ -215,8 +230,35 @@ bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
     }
 
     impl_->job = p;
+    job_id_ = p.job_id;
     ready_ = true;
     return true;
+}
+
+#ifdef POW_GPU_SORT_ENABLED
+extern "C" bool pow_gpu_sort_and_stats_batched(
+        const float* const* h_logits, int S, int n, float inv_temp, int snap_bf16,
+        uint32_t* h_idx, float* h_head, double* h_stats);
+extern "C" void pow_gpu_inject_presorted(const uint32_t* idx, const double* stats, float head);
+#endif
+
+void PoiMiner::prepare_batch(const std::vector<const float*>& logits, int n_vocab) {
+#ifdef POW_GPU_SORT_ENABLED
+    impl_->batch_ready = false;
+    const int S = static_cast<int>(logits.size());
+    if (S < 1) return;
+    impl_->batch_idx.resize(static_cast<size_t>(S) * n_vocab);
+    impl_->batch_head.resize(S);
+    impl_->batch_stats.resize(static_cast<size_t>(S) * 6);
+    if (pow_gpu_sort_and_stats_batched(logits.data(), S, n_vocab, 1.0f, /*snap_bf16=*/1,
+                                       impl_->batch_idx.data(), impl_->batch_head.data(),
+                                       impl_->batch_stats.data())) {
+        impl_->batch_n_vocab = n_vocab;
+        impl_->batch_ready = true;
+    }
+#else
+    (void)logits; (void)n_vocab;
+#endif
 }
 
 int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
@@ -227,6 +269,15 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
         // A window starts when the context stops growing — the engine is back
         // to prompt-only. The coordinator needs a row allocated from those exact
         // prompt tokens, and it must be reallocated per window, not once per job.
+#ifdef POW_GPU_SORT_ENABLED
+        if (impl_->batch_ready &&
+            seq_id >= 0 && (size_t)(seq_id + 1) * impl_->batch_n_vocab <= impl_->batch_idx.size()) {
+            pow_gpu_inject_presorted(
+                impl_->batch_idx.data() + (size_t)seq_id * impl_->batch_n_vocab,
+                impl_->batch_stats.data() + (size_t)seq_id * 6,
+                impl_->batch_head[seq_id]);
+        }
+#endif
         auto lc = impl_->last_ctx.find(seq_id);
         if (lc == impl_->last_ctx.end() || context.size() <= lc->second) {
             std::unordered_map<int, std::vector<int64_t>> prompts{{seq_id, context}};

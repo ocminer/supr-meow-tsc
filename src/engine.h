@@ -81,10 +81,15 @@ public:
     // which is the sampler's sequence id.
     using BatchChooser = std::function<int(int stream, const float* logits, int n_vocab,
                                            const std::vector<int64_t>& context)>;
+    // Called once per step with every stream's logits, BEFORE the per-stream
+    // chooser calls — the sampler batches its GPU work across streams here.
+    using BatchPrepare = std::function<void(const std::vector<const float*>&, int n_vocab)>;
+
     // Returns windows completed (== streams on success), -1 on error.
     int generate_windows_batched(int device_slot,
                                  const std::vector<std::string>& prompts,
-                                 const BatchChooser& chooser, std::string& error);
+                                 const BatchChooser& chooser, std::string& error,
+                                 const BatchPrepare& prepare = nullptr);
 
     // Throughput measurement across every loaded device, used by --benchmark.
     std::vector<DeviceEngineStats> benchmark(int windows_per_device, std::string& error);

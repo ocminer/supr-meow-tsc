@@ -274,3 +274,193 @@ extern "C" bool pow_gpu_sort_and_stats(const float* h_vals, int n, float inv_tem
 }
 
 extern "C" void pow_gpu_shutdown(void) { g_scratch.release(); }
+
+// ==========================================================================
+// Batched segmented path — ONE launch chain samples EVERY stream's vocabulary.
+//
+// The per-stream entry above costs ~1 ms per call and is invoked serially per
+// stream per step, so at 16 streams the GPU idles behind 16 small launch
+// chains. Here the engine hands over all S logits arrays at once: snap, pack,
+// one DeviceSegmentedRadixSort over S*n keys, one unpack, one stats grid with
+// blockIdx.y = stream. Results land in per-stream host buffers, and the
+// sampler consumes them through a thread-local injection slot instead of
+// launching anything itself.
+//
+// The snap is the verbatim GPU twin of snap_logits_to_precision_inplace
+// ("bf16"): x + (0x7FFF + ((x>>16)&1)) & 0xFFFF0000 — same bits, same
+// round-to-nearest-even, same (absent) NaN handling, because the SORT ORDER
+// must stay bit-exact with the CPU comparator.
+// ==========================================================================
+#include <vector>
+
+__global__ void k_snap_bf16(float* __restrict__ v, int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        uint32_t x = __float_as_uint(v[i]);
+        x = (x + (0x00007FFFu + ((x >> 16) & 1u))) & 0xFFFF0000u;
+        v[i] = __uint_as_float(x);
+    }
+}
+
+__global__ void k_pack_seg(const float* __restrict__ vals, uint64_t* __restrict__ keys,
+                           int n, int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) keys[i] = pack_key(vals[i], static_cast<uint32_t>(i % n));
+}
+
+__global__ void k_unpack_seg(const uint64_t* __restrict__ keys,
+                             const float*    __restrict__ vals,
+                             uint32_t*       __restrict__ idx_out,
+                             float*          __restrict__ val_out,
+                             int n, int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        const int seg = i / n;
+        const uint32_t id = static_cast<uint32_t>(keys[i] & 0xFFFFFFFFull);
+        idx_out[i] = id;
+        val_out[i] = vals[seg * n + id];
+    }
+}
+
+__global__ void k_stats_seg(const float* __restrict__ sorted, int n, float inv_temp,
+                            const float* __restrict__ heads,
+                            double* __restrict__ out /* [S][6] */) {
+    const int seg = blockIdx.y;
+    const float* v = sorted + static_cast<size_t>(seg) * n;
+    const double max_scaled = static_cast<double>(heads[seg]) * static_cast<double>(inv_temp);
+    __shared__ double sh[6][32];
+    double acc[6] = {0,0,0,0,0,0};
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
+        const double x = static_cast<double>(v[i]);
+        acc[0] += exp(x * static_cast<double>(inv_temp) - max_scaled);
+        if      (i < 50)   acc[1] += x;
+        else if (i < 500)  acc[2] += x;
+        else if (i < 2000) acc[3] += x;
+        else               acc[4] += x;
+        acc[5] += x;
+    }
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int b = 0; b < 6; ++b) {
+        double x = acc[b];
+        for (int off = 16; off > 0; off >>= 1) x += __shfl_down_sync(0xFFFFFFFFu, x, off);
+        if (lane == 0) sh[b][warp] = x;
+    }
+    __syncthreads();
+    if (threadIdx.x < 6) {
+        const int nwarp = (blockDim.x + 31) / 32;
+        double t = 0.0;
+        for (int w = 0; w < nwarp; ++w) t += sh[threadIdx.x][w];
+        atomicAdd(&out[seg * 6 + threadIdx.x], t);
+    }
+}
+
+namespace {
+struct BatchScratch {
+    int cap_total = 0, cap_seg = 0;
+    float*    d_vals = nullptr;
+    uint64_t* d_keys_in = nullptr;
+    uint64_t* d_keys_out = nullptr;
+    uint32_t* d_idx = nullptr;
+    float*    d_sorted = nullptr;
+    float*    d_heads = nullptr;
+    double*   d_stats = nullptr;
+    int*      d_offs = nullptr;
+    void*     d_temp = nullptr;
+    size_t    temp_bytes = 0;
+    cudaStream_t stream = nullptr;
+    bool failed = false;
+
+    bool ensure(int S, int n) {
+        if (failed) return false;
+        const int total = S * n;
+        if (total <= cap_total && S <= cap_seg) return true;
+        release();
+        bool ok = cudaMalloc(&d_vals, sizeof(float)*total) == cudaSuccess
+               && cudaMalloc(&d_keys_in, sizeof(uint64_t)*total) == cudaSuccess
+               && cudaMalloc(&d_keys_out, sizeof(uint64_t)*total) == cudaSuccess
+               && cudaMalloc(&d_idx, sizeof(uint32_t)*total) == cudaSuccess
+               && cudaMalloc(&d_sorted, sizeof(float)*total) == cudaSuccess
+               && cudaMalloc(&d_heads, sizeof(float)*S) == cudaSuccess
+               && cudaMalloc(&d_stats, sizeof(double)*6*S) == cudaSuccess
+               && cudaMalloc(&d_offs, sizeof(int)*(S+1)) == cudaSuccess
+               && (stream || cudaStreamCreate(&stream) == cudaSuccess);
+        if (ok) {
+            std::vector<int> offs(S+1);
+            for (int i = 0; i <= S; ++i) offs[i] = i * n;
+            ok = cudaMemcpyAsync(d_offs, offs.data(), sizeof(int)*(S+1),
+                                 cudaMemcpyHostToDevice, stream) == cudaSuccess
+              && cudaStreamSynchronize(stream) == cudaSuccess;
+        }
+        if (ok) {
+            size_t bytes = 0;
+            cub::DeviceSegmentedRadixSort::SortKeys(nullptr, bytes, d_keys_in, d_keys_out,
+                                                    total, S, d_offs, d_offs+1, 0, 64, stream);
+            ok = cudaMalloc(&d_temp, bytes) == cudaSuccess;
+            temp_bytes = bytes;
+        }
+        if (!ok) { failed = true;
+            std::fprintf(stderr, "[pow-gpu] batched scratch alloc FAILED — per-stream path stays\n");
+            return false; }
+        cap_total = total; cap_seg = S;
+        return true;
+    }
+    void release() {
+        for (void* p : {(void*)d_vals,(void*)d_keys_in,(void*)d_keys_out,(void*)d_idx,
+                        (void*)d_sorted,(void*)d_heads,(void*)d_stats,(void*)d_offs,(void*)d_temp})
+            if (p) cudaFree(p);
+        d_vals=nullptr; d_keys_in=nullptr; d_keys_out=nullptr; d_idx=nullptr;
+        d_sorted=nullptr; d_heads=nullptr; d_stats=nullptr; d_offs=nullptr; d_temp=nullptr;
+        temp_bytes=0; cap_total=0; cap_seg=0;
+    }
+};
+thread_local BatchScratch g_batch;
+
+// Thread-local injection: the sampler's patched sort block consumes ONE
+// pre-sorted result instead of launching, then the slot auto-clears.
+struct Injected { const uint32_t* idx = nullptr; const double* stats = nullptr; float head = 0.0f; };
+thread_local Injected g_inj;
+}  // namespace
+
+extern "C" bool pow_gpu_sort_and_stats_batched(
+        const float* const* h_logits, int S, int n, float inv_temp, int snap_bf16,
+        uint32_t* h_idx /* [S*n] */, float* h_head /* [S] */, double* h_stats /* [S*6] */) {
+    if (S < 1 || n < 1) return false;
+    if (!g_batch.ensure(S, n)) return false;
+    auto& b = g_batch;
+    const int total = S * n;
+    for (int s = 0; s < S; ++s)
+        if (cudaMemcpyAsync(b.d_vals + (size_t)s*n, h_logits[s], sizeof(float)*n,
+                            cudaMemcpyHostToDevice, b.stream) != cudaSuccess) return false;
+    const int T = 256, G = (total + T - 1) / T;
+    if (snap_bf16) k_snap_bf16<<<G, T, 0, b.stream>>>(b.d_vals, total);
+    k_pack_seg<<<G, T, 0, b.stream>>>(b.d_vals, b.d_keys_in, n, total);
+    cub::DeviceSegmentedRadixSort::SortKeys(b.d_temp, b.temp_bytes, b.d_keys_in, b.d_keys_out,
+                                            total, S, b.d_offs, b.d_offs + 1, 0, 64, b.stream);
+    k_unpack_seg<<<G, T, 0, b.stream>>>(b.d_keys_out, b.d_vals, b.d_idx, b.d_sorted, n, total);
+    if (cudaMemcpy2DAsync(b.d_heads, sizeof(float), b.d_sorted, sizeof(float)*(size_t)n,
+                          sizeof(float), S, cudaMemcpyDeviceToDevice, b.stream) != cudaSuccess)
+        return false;
+    if (cudaMemsetAsync(b.d_stats, 0, sizeof(double)*6*S, b.stream) != cudaSuccess) return false;
+    dim3 grid(64, S);
+    k_stats_seg<<<grid, 256, 0, b.stream>>>(b.d_sorted, n, inv_temp, b.d_heads, b.d_stats);
+    bool ok = cudaMemcpyAsync(h_idx, b.d_idx, sizeof(uint32_t)*total, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
+           && cudaMemcpyAsync(h_head, b.d_heads, sizeof(float)*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
+           && cudaMemcpyAsync(h_stats, b.d_stats, sizeof(double)*6*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess;
+    return ok && cudaStreamSynchronize(b.stream) == cudaSuccess;
+}
+
+extern "C" void pow_gpu_inject_presorted(const uint32_t* idx, const double* stats, float head) {
+    g_inj.idx = idx; g_inj.stats = stats; g_inj.head = head;
+}
+extern "C" bool pow_gpu_take_presorted(const uint32_t** idx, const double** stats, float* head) {
+    if (!g_inj.idx) return false;
+    *idx = g_inj.idx; *stats = g_inj.stats; *head = g_inj.head;
+    g_inj.idx = nullptr; g_inj.stats = nullptr;
+    return true;
+}
+
+// Bind the calling thread's CUDA context to a device — each mining thread
+// must run its sampler kernels on ITS OWN GPU, not on device 0 by default.
+extern "C" bool pow_gpu_bind_device(int cuda_ordinal) {
+    return cudaSetDevice(cuda_ordinal) == cudaSuccess;
+}

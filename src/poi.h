@@ -50,11 +50,19 @@ public:
     // window_tokens must match the chain's PoW window (256).
     // n_streams = concurrent windows (engine slots); each stream is a
     // sampler sequence with its own params row and window state.
-    bool init(int window_tokens, std::string& error, int n_streams = 1);
+    // egress_port: loopback port for this instance's proof egress — must be
+    // unique per PoiMiner (one coordinator+writer pair per device).
+    bool init(int window_tokens, std::string& error, int n_streams = 1,
+              int egress_port = 47021);
 
     // Install a new job. Recomputes the VDF for the new parent when the parent
     // changed — the VDF is bound to it, so a stale one invalidates every proof.
     bool set_job(const PoiJobParams& p, std::string& error);
+
+    // Pre-sorts EVERY stream's logits in one segmented GPU launch; results
+    // are consumed by the next on_logits call per stream. Call once per step
+    // with all streams' logits, before the per-stream on_logits calls.
+    void prepare_batch(const std::vector<const float*>& logits, int n_vocab);
 
     // Per generated token, in place of the engine's argmax. Returns the token
     // the sampler chose, which MUST be fed back to the engine — the transcript
@@ -67,6 +75,7 @@ public:
     std::unique_ptr<PoiShare> take_share();
 
     bool ready() const { return ready_; }
+    const std::string& job_id() const { return job_id_; }
     const std::string& vdf_hex() const { return vdf_hex_; }
     uint64_t vdf_tick() const { return vdf_tick_; }
 
@@ -77,6 +86,7 @@ private:
     std::string vdf_hex_;
     uint64_t    vdf_tick_ = 0;
     std::string parent_hash_hex_;   // to detect a parent change
+    std::string job_id_;            // job the current params belong to
     const char* stage_ = "";       // which coordinator call is in flight
     int         n_streams_ = 1;
     int         window_tokens_ = 256;
