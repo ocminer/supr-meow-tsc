@@ -232,10 +232,22 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
 
         // Labelled individually: "unordered_map::at" from any of the three is
         // indistinguishable otherwise, and they fail for different reasons.
+        // The hasher digests the context EXACTLY as handed to it — it neither
+        // pads nor truncates. The verifier always replays a fixed 256-token
+        // window, zero-padded on the LEFT. So the caller owns that shape: pass
+        // the growing context raw and the two agree only when it happens to be
+        // 256 long. That is why exactly one step per window ever verified — with
+        // a 22-token prompt, step 234 gives 22+234=256, and 234 was the single
+        // index missing from the verifier's failed-step list.
+        std::vector<int64_t> window(window_tokens_, 0);
+        const size_t take = std::min<size_t>(context.size(),
+                                             static_cast<size_t>(window_tokens_));
+        std::copy(context.end() - take, context.end(), window.end() - take);
+
         stage_ = "sample_token_complete";
         auto r = impl_->coord.sample_token_complete(seq_id, logits, n_vocab,
                                                     temperature, top_k, top_p,
-                                                    context, "bf16");
+                                                    window, "bf16");
         stage_ = "record_complete_step";
         impl_->coord.record_complete_step(seq_id, r, true);
         // ONLY at the end of a full window: check_solutions() reads
