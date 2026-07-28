@@ -4,6 +4,7 @@
 #include "vdf.h"
 
 #include <zmq.h>
+#include <openssl/sha.h>
 
 #include <cstring>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include <algorithm>
 
 #include "pow_utils.h"
+#include "proof_generated.h"
 
 namespace meow {
 namespace {
@@ -126,14 +128,15 @@ bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
     // The VDF is bound to the PARENT hash, which lives at bytes 4..36 of the
     // header prefix. Recompute only when the parent actually changed: it is a
     // sequential computation and redoing it per job would stall mining.
-    // The header stores the parent hash in INTERNAL byte order; bcore's work
-    // unit — and therefore the verifier — uses RPC DISPLAY order, which is the
-    // reverse. Both the VDF challenge and block_hash must use display order or
-    // every proof verifies RED while looking perfectly well-formed.
-    const std::string parent_internal = p.header_prefix.substr(8, 64);
-    auto parent_bytes = hex_to_bytes(parent_internal);
-    std::reverse(parent_bytes.begin(), parent_bytes.end());
-    const std::string parent = bytes_to_hex(parent_bytes.data(), parent_bytes.size());
+    // INTERNAL byte order, exactly as serialized in the header — bcore's
+    // QuickVerifier reads the VDF challenge as `header_prefix.data() + 4` raw
+    // ("expects the 32 bytes exactly as serialized in the header",
+    // quick_verifier.cpp) and rejected every display-order proof with
+    // "VDF verification failed". The share verifier checks the VDF against the
+    // proof's own block_hash field, so declaring block_hash in the SAME raw
+    // order keeps consensus and share verification in agreement.
+    const std::string parent = p.header_prefix.substr(8, 64);
+    auto parent_bytes = hex_to_bytes(parent);
     if (parent != parent_hash_hex_ || vdf_hex_.empty()) {
         const auto prev = parent_bytes;
         // Tick count is the VDF's difficulty; the chain reads it from the proof.
@@ -280,7 +283,27 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
             share->nonce        = ++nonce_seq_;
             share->proof_b64    = base64(data, static_cast<size_t>(n));
             share->vdf_tick     = vdf_tick_;
-            share->achieved_hex = bytes_to_hex(r.digest.data(), r.digest.size());
+            // The claim the pool judges is the HEADER HASH —
+            // SHA256d(header76 || digest[:4]) — because that is what consensus
+            // compares against targets (PowHasher::check_solution and the
+            // verifier's block sanity both build exactly this). Neither the
+            // per-step digest nor Proof.hash is the compared value; claiming
+            // either gets shares rejected on the pool's threshold checks.
+            share->achieved_hex.clear();
+            {
+                const auto* mr = flatbuffers::GetRoot<proof::MiningResponse>(data);
+                const auto* pb = mr ? mr->pow_blob() : nullptr;
+                if (pb && pb->hash() && pb->hash()->size() == 32 &&
+                    pb->header_prefix() && pb->header_prefix()->size() == 76) {
+                    uint8_t hdr[80], h1[32], h2[32];
+                    std::memcpy(hdr, pb->header_prefix()->data(), 76);
+                    std::memcpy(hdr + 76, pb->hash()->data(), 4);   // nonce = digest[:4]
+                    SHA256(hdr, 80, h1);
+                    SHA256(h1, 32, h2);
+                    share->achieved_hex = bytes_to_hex(h2, 32);
+                }
+            }
+            if (share->achieved_hex.empty()) { zmq_msg_close(&msg); return static_cast<int>(r.token_id); }
             {
                 std::lock_guard<std::mutex> lk(impl_->mtx);
                 impl_->pending = std::move(share);
