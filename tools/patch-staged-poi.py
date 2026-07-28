@@ -200,6 +200,209 @@ PATCHES = [
         "    double                gpu_stats_[6] = {0,0,0,0,0,0};  // fused kernel output\n"
         "    bool                  gpu_stats_valid_ = false;",
     ),
+    (
+        "pow_utils.h",
+        "    std::vector<uint8_t> keep_;     // size n_vocab",
+        "    std::vector<uint8_t> keep_;     // size n_vocab\n"
+        "    // Survivor ids after top-k, ASCENDING (<= top_k of them). The tail\n"
+        "    // math only involves these; everything else is -inf/zero.\n"
+        "    std::vector<int32_t> surv_ids_;\n"
+        "    bool                 surv_valid_ = false;",
+    ),
+    (
+        "pow_utils.cpp",
+        # ---- tail 1/3: top-k from the sorted prefix, not a full scan ---------
+        """        survivors = 0;
+        for (int i = 0; i < n_vocab; ++i) {
+            if (working_logits[i] > kth_pre) {        // strict exclusiveness (intentional)
+                keep_[i] = 1u;
+                ++survivors;
+            } else {
+                logits_[i] = ninf;
+            }
+        }
+""",
+        """        // pretemp_desc_ is sorted DESC, so {i : value > kth_pre} is exactly its
+        // leading prefix — and since rank kpos itself equals kth_pre, that
+        // prefix lives entirely inside ranks [0, kpos). Reading <=50 ranks
+        // replaces a 151,936-entry branchy scan; the survivor SET is identical,
+        // which is all that matters downstream.
+        surv_valid_ = false;
+        surv_ids_.clear();
+        for (int r = 0; r < kpos; ++r) {
+            if (!(pretemp_desc_[r].first > kth_pre)) break;   // prefix ended
+            surv_ids_.push_back(pretemp_desc_[r].second);
+        }
+        if (static_cast<int>(surv_ids_.size()) < kpos) {
+            // Sum/mask order must match the reference, which walks ascending
+            // token id. Sorting <=50 ids is free next to a full pass.
+            std::sort(surv_ids_.begin(), surv_ids_.end());
+            std::fill(keep_.begin(), keep_.begin() + n_vocab, 0u);
+            std::fill(logits_.begin(), logits_.begin() + n_vocab, ninf);
+            const bool scaled = (temperature != 1.0f);
+            const float invT  = scaled ? (1.0f / temperature) : 1.0f;
+            for (int id : surv_ids_) {
+                keep_[id]   = 1u;
+                logits_[id] = scaled ? (working_logits[id] * invT) : working_logits[id];
+            }
+            survivors  = static_cast<int>(surv_ids_.size());
+            surv_valid_ = true;
+        } else {
+            // Degenerate (ties filled the whole prefix): reference path.
+            survivors = 0;
+            for (int i = 0; i < n_vocab; ++i) {
+                if (working_logits[i] > kth_pre) {    // strict exclusiveness (intentional)
+                    keep_[i] = 1u;
+                    ++survivors;
+                } else {
+                    logits_[i] = ninf;
+                }
+            }
+        }
+""",
+    ),
+    (
+        "pow_utils.cpp",
+        # ---- tail 2/3: log_Z + masked softmax over survivors only ------------
+        """    result.softmax_log_z = -std::numeric_limits<float>::infinity();
+    float max_kept = ninf;
+    for (int i = 0; i < n_vocab; ++i) {
+        if (logits_[i] != ninf) {
+            max_kept = std::max(max_kept, logits_[i]);
+        }
+    }
+    if (max_kept != ninf) {
+        double kept_sum = 0.0;
+        for (int i = 0; i < n_vocab; ++i) {
+            if (logits_[i] != ninf) {
+                kept_sum += std::exp(double(logits_[i] - max_kept));
+            }
+        }
+        result.softmax_log_z = max_kept + static_cast<float>(std::log(kept_sum));
+    }
+""",
+        """    result.softmax_log_z = -std::numeric_limits<float>::infinity();
+    float max_kept = ninf;
+    if (surv_valid_) {
+        // Same values, same ASCENDING-id accumulation order as the reference
+        // loops — so kept_sum is bit-identical, not merely close.
+        for (int id : surv_ids_) max_kept = std::max(max_kept, logits_[id]);
+        if (max_kept != ninf) {
+            double kept_sum = 0.0;
+            for (int id : surv_ids_) kept_sum += std::exp(double(logits_[id] - max_kept));
+            result.softmax_log_z = max_kept + static_cast<float>(std::log(kept_sum));
+        }
+    } else {
+    for (int i = 0; i < n_vocab; ++i) {
+        if (logits_[i] != ninf) {
+            max_kept = std::max(max_kept, logits_[i]);
+        }
+    }
+    if (max_kept != ninf) {
+        double kept_sum = 0.0;
+        for (int i = 0; i < n_vocab; ++i) {
+            if (logits_[i] != ninf) {
+                kept_sum += std::exp(double(logits_[i] - max_kept));
+            }
+        }
+        result.softmax_log_z = max_kept + static_cast<float>(std::log(kept_sum));
+    }
+    }
+""",
+    ),
+    (
+        "pow_utils.cpp",
+        """    } else {
+        // Standard masked softmax once
+        float max_masked = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < n_vocab; ++i) if (logits_[i] != ninf) max_masked = std::max(max_masked, logits_[i]);
+
+        double Z = 0.0;
+        for (int i = 0; i < n_vocab; ++i) {
+            if (logits_[i] == ninf) { probs_[i] = 0.0f; continue; }
+            float e = std::exp(logits_[i] - max_masked);
+            probs_[i] = e;
+            Z += e;
+        }
+        if (Z > 0.0) {
+            const float invZ = float(1.0 / Z);
+            for (int i = 0; i < n_vocab; ++i) probs_[i] *= invZ;
+        } else {
+            std::fill(probs_.begin(), probs_.begin() + n_vocab, 0.0f);
+        }
+    }
+""",
+        """    } else if (surv_valid_) {
+        // Survivor-only masked softmax. probs_ is zero everywhere else, so a
+        // single fill replaces the 151,936-iteration branchy loops; Z still
+        // accumulates in ascending-id order, so it is bit-identical.
+        float max_masked = -std::numeric_limits<float>::infinity();
+        for (int id : surv_ids_) max_masked = std::max(max_masked, logits_[id]);
+        std::fill(probs_.begin(), probs_.begin() + n_vocab, 0.0f);
+        double Z = 0.0;
+        for (int id : surv_ids_) {
+            const float e = std::exp(logits_[id] - max_masked);
+            probs_[id] = e;
+            Z += e;
+        }
+        if (Z > 0.0) {
+            const float invZ = float(1.0 / Z);
+            for (int id : surv_ids_) probs_[id] *= invZ;
+        } else {
+            std::fill(probs_.begin(), probs_.begin() + n_vocab, 0.0f);
+        }
+    } else {
+        // Standard masked softmax once
+        float max_masked = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < n_vocab; ++i) if (logits_[i] != ninf) max_masked = std::max(max_masked, logits_[i]);
+
+        double Z = 0.0;
+        for (int i = 0; i < n_vocab; ++i) {
+            if (logits_[i] == ninf) { probs_[i] = 0.0f; continue; }
+            float e = std::exp(logits_[i] - max_masked);
+            probs_[i] = e;
+            Z += e;
+        }
+        if (Z > 0.0) {
+            const float invZ = float(1.0 / Z);
+            for (int i = 0; i < n_vocab; ++i) probs_[i] *= invZ;
+        } else {
+            std::fill(probs_.begin(), probs_.begin() + n_vocab, 0.0f);
+        }
+    }
+""",
+    ),
+    (
+        "pow_utils.cpp",
+        # ---- tail 3/3: CDF as constant runs between survivors ----------------
+        """    float cumulative = 0.0f;
+    for (int i = 0; i < n_vocab; ++i) {
+        cumulative += probs_[i];
+        cdf_[i] = cumulative;
+    }
+""",
+        """    float cumulative = 0.0f;
+    if (surv_valid_) {
+        // probs_ is zero except at survivors, and `x + 0.0f == x` exactly, so
+        // the CDF is a step function: constant runs broken only at survivor
+        // ids. std::fill writes the runs sequentially instead of doing 151,936
+        // dependent float adds. Values are bit-identical to the reference.
+        int pos = 0;
+        for (int id : surv_ids_) {
+            if (id > pos) std::fill(cdf_.begin() + pos, cdf_.begin() + id, cumulative);
+            cumulative += probs_[id];
+            cdf_[id] = cumulative;
+            pos = id + 1;
+        }
+        if (pos < n_vocab) std::fill(cdf_.begin() + pos, cdf_.begin() + n_vocab, cumulative);
+    } else {
+    for (int i = 0; i < n_vocab; ++i) {
+        cumulative += probs_[i];
+        cdf_[i] = cumulative;
+    }
+    }
+""",
+    ),
 ]
 
 def main(stage_dir: str) -> int:
