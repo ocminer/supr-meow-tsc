@@ -15,6 +15,7 @@
 #include <utility>
 #include <stdexcept>
 #include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 #include <algorithm>
 
@@ -22,6 +23,17 @@
 #include "proof_generated.h"
 
 namespace meow {
+
+// Early declarations: SamplerPool::Impl manages pinned receive buffers and is
+// defined before the block that declares the rest of the pow_gpu interface.
+#ifdef POW_GPU_SORT_ENABLED
+extern "C" void* pow_gpu_host_alloc(size_t bytes);
+extern "C" void  pow_gpu_host_free(void* p);
+#else
+static inline void* pow_gpu_host_alloc(size_t bytes) { return std::malloc(bytes); }
+static inline void  pow_gpu_host_free(void* p) { std::free(p); }
+#endif
+
 namespace {
 
 std::vector<uint8_t> hex_to_bytes(const std::string& h) {
@@ -150,6 +162,8 @@ bool PoiMiner::init(int window_tokens, std::string& error, int n_streams,
 }
 
 static std::mutex g_vdf_mtx;   // chiavdf global state is not thread-safe
+static thread_local double g_prof_sort = 0.0, g_prof_wait = 0.0;
+static thread_local uint64_t g_prof_n = 0;
 
 bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
     impl_->last_ctx.clear();   // force fresh rows on every stream's next window
@@ -451,9 +465,30 @@ struct SamplerPool::Impl {
     int                                         in_nvocab = 0;
     const std::vector<std::vector<int64_t>>*    in_ctx = nullptr;
     std::vector<int>*                           out_tokens = nullptr;
-    std::vector<uint32_t> sort_idx; std::vector<float> sort_val;
-    std::vector<float> sort_head; std::vector<double> sort_stats;
+    // PINNED receive buffers (see pow_gpu_host_alloc) — pageable destinations
+    // turned the "async" D2H into a 10.5 ms/step synchronous stall.
+    uint32_t* sort_idx = nullptr; float* sort_val = nullptr;
+    float* sort_head = nullptr; double* sort_stats = nullptr;
+    size_t sort_cap = 0; int sort_S = 0;
     int sort_stride = 0; bool sort_ok = false;
+    void free_sort_bufs() {
+        pow_gpu_host_free(sort_idx);  pow_gpu_host_free(sort_val);
+        pow_gpu_host_free(sort_head); pow_gpu_host_free(sort_stats);
+        sort_idx = nullptr; sort_val = nullptr; sort_head = nullptr; sort_stats = nullptr;
+        sort_cap = 0; sort_S = 0;
+    }
+    bool ensure_sort_bufs(int S, int K) {
+        const size_t need = (size_t)S * K;
+        if (need <= sort_cap && S <= sort_S) return sort_idx != nullptr;
+        free_sort_bufs();
+        sort_idx   = (uint32_t*)pow_gpu_host_alloc(sizeof(uint32_t) * need);
+        sort_val   = (float*)   pow_gpu_host_alloc(sizeof(float) * need);
+        sort_head  = (float*)   pow_gpu_host_alloc(sizeof(float) * (size_t)S);
+        sort_stats = (double*)  pow_gpu_host_alloc(sizeof(double) * 6 * (size_t)S);
+        if (!sort_idx || !sort_val || !sort_head || !sort_stats) { free_sort_bufs(); return false; }
+        sort_cap = need; sort_S = S;
+        return true;
+    }
 
     ~Impl() {
         {
@@ -463,6 +498,7 @@ struct SamplerPool::Impl {
         }
         cv_go.notify_all();
         for (auto& t : threads) if (t.joinable()) t.join();
+        free_sort_bufs();
     }
 
     void worker(int g) {
@@ -487,9 +523,9 @@ struct SamplerPool::Impl {
             for (int s = lo; s < hi && ok; ++s) {
                 const int local = s - lo;
                 if (sort_ok)
-                    pow_gpu_inject_presorted(sort_idx.data() + (size_t)s * sort_stride,
-                                             sort_val.data() + (size_t)s * sort_stride,
-                                             sort_stats.data() + (size_t)s * 6,
+                    pow_gpu_inject_presorted(sort_idx + (size_t)s * sort_stride,
+                                             sort_val + (size_t)s * sort_stride,
+                                             sort_stats + (size_t)s * 6,
                                              sort_head[s], sort_stride);
                 const int tok = miners[g]->on_logits(local, (*logits)[s], nvoc,
                                                      (*ctx)[s], 1.0f, 50, 1.0f);
@@ -554,15 +590,14 @@ bool SamplerPool::sample_step(const std::vector<const float*>& logits, int n_voc
     {
         const int S = impl_->n_streams;
         const int K = std::min(2048, n_vocab);   // CPU tail reads only top-k
-        impl_->sort_idx.resize((size_t)S * K);
-        impl_->sort_val.resize((size_t)S * K);
-        impl_->sort_head.resize(S);
-        impl_->sort_stats.resize((size_t)S * 6);
         impl_->sort_stride = K;
+        if (!impl_->ensure_sort_bufs(S, K)) { impl_->sort_ok = false; return false; }
+        const auto ts0 = std::chrono::steady_clock::now();
         impl_->sort_ok = pow_gpu_sort_and_stats_batched_k(
             logits.data(), S, n_vocab, K, 1.0f, 1,
-            impl_->sort_idx.data(), impl_->sort_val.data(),
-            impl_->sort_head.data(), impl_->sort_stats.data());
+            impl_->sort_idx, impl_->sort_val,
+            impl_->sort_head, impl_->sort_stats);
+        g_prof_sort += std::chrono::duration<double>(std::chrono::steady_clock::now() - ts0).count();
     }
     {
         std::lock_guard<std::mutex> lk(impl_->mtx);
@@ -576,10 +611,17 @@ bool SamplerPool::sample_step(const std::vector<const float*>& logits, int n_voc
     impl_->cv_go.notify_all();
     const uint64_t g = impl_->gen;
     std::unique_lock<std::mutex> lk(impl_->mtx);
+    const auto tw0 = std::chrono::steady_clock::now();
     impl_->cv_done.wait(lk, [&]{
         for (int i = 0; i < impl_->groups; ++i) if (impl_->done[i] != g) return false;
         return true;
     });
+    g_prof_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count();
+    if (++g_prof_n % 512 == 0) {
+        std::fprintf(stderr, "[prof2] sort=%.1f ms/step  wait(tail)=%.1f ms/step\n",
+                     1000.0 * g_prof_sort / g_prof_n, 1000.0 * g_prof_wait / g_prof_n);
+        std::fflush(stderr);
+    }
     return impl_->step_ok;
 }
 

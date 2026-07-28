@@ -318,6 +318,7 @@ int InferenceEngine::generate_windows_stepwise(int device_slot,
     }
 
     llama_batch nb = llama_batch_init(S, 0, S);
+    double t_sample = 0.0, t_decode = 0.0;   // per-window phase timers
     for (int step_i = 0; step_i < cfg_.window_tokens; ++step_i) {
         nb.n_tokens = 0;
         std::vector<const float*> all_logits(S, nullptr);
@@ -325,10 +326,12 @@ int InferenceEngine::generate_windows_stepwise(int device_slot,
             all_logits[s] = llama_get_logits_ith(in.ctx, last_row[s]);
             if (!all_logits[s]) { llama_batch_free(nb); error = "no logits returned"; return -1; }
         }
+        const auto t0 = std::chrono::steady_clock::now();
         std::vector<int> chosen(S, -1);
         if (!step(all_logits, n_vocab, ctxv, chosen)) {
             llama_batch_free(nb); error = "sampler step failed"; return -1;
         }
+        t_sample += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         for (int s = 0; s < S; ++s) {
             if (chosen[s] < 0) { llama_batch_free(nb); error = "sampler aborted a window"; return -1; }
             ctxv[s].push_back((int64_t)chosen[s]);
@@ -340,8 +343,15 @@ int InferenceEngine::generate_windows_stepwise(int device_slot,
             nb.logits[r] = true;
             last_row[s] = r;
         }
+        const auto t1 = std::chrono::steady_clock::now();
         if (llama_decode(in.ctx, nb) != 0) { llama_batch_free(nb); error = "decode failed mid-window"; return -1; }
+        t_decode += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     }
+    { static int prof = 0;
+      if (prof++ < 6)
+          std::fprintf(stderr, "[prof] window batch: sample=%.2fs decode=%.2fs (per step: %.1f/%.1f ms)\n",
+                       t_sample, t_decode,
+                       1000.0*t_sample/cfg_.window_tokens, 1000.0*t_decode/cfg_.window_tokens); }
     llama_batch_free(nb);
     return S;
 }

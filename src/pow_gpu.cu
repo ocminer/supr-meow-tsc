@@ -33,8 +33,11 @@
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
 #include <cstdint>
+#include <cstring>
+#include <chrono>
 #include <cstdio>
 #include <thread>
+#include <cstdlib>
 
 extern "C" {
 bool pow_gpu_available(void);
@@ -293,6 +296,16 @@ extern "C" void pow_gpu_shutdown(void) { g_scratch.release(); }
 // ==========================================================================
 #include <vector>
 
+// Widen wire-format bf16 (top-16 bits, already RNE-snapped on the host during
+// the staging pass) back to fp32. `u16 << 16` reproduces EXACTLY the bits that
+// k_snap_bf16 would produce from the fp32 input — same snap, half the PCIe
+// traffic. On a x4-riser link (GPU0: Gen3 x4, ~3 GB/s) the wire size IS the
+// step time, so this is worth ~2x there.
+__global__ void k_widen_bf16(const uint16_t* __restrict__ w, float* __restrict__ v, int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) v[i] = __uint_as_float(static_cast<uint32_t>(w[i]) << 16);
+}
+
 __global__ void k_snap_bf16(float* __restrict__ v, int total) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) {
@@ -306,6 +319,43 @@ __global__ void k_pack_seg(const float* __restrict__ vals, uint64_t* __restrict_
                            int n, int total) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) keys[i] = pack_key(vals[i], static_cast<uint32_t>(i % n));
+}
+
+// Combined-key variant: segment id rides in the TOP bits, so ONE flat radix
+// sort of all S*n keys produces segment-major / value-descending / id-ascending
+// order — no DeviceSegmentedRadixSort, which is 5-10x slower than a flat sort
+// for few-large-segments (measured 17-22 ms vs a target of ~2 ms).
+// Layout: [55..50]=seg (S<=64), [49..18]=transformed value, [17..0]=id
+// (n<=262144). Sorted ascending over bits [0,56).
+__device__ __forceinline__ uint32_t transform_val(float v) {
+    uint32_t u = __float_as_uint(v);
+    if (u == 0x80000000u) u = 0x00000000u;      // -0.0 == +0.0, same rank
+    u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return ~u;                                   // ascending sort => value DESC
+}
+
+__global__ void k_pack_flat(const float* __restrict__ vals, uint64_t* __restrict__ keys,
+                            int n, int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        const uint64_t seg = static_cast<uint64_t>(i / n);
+        const uint64_t idx = static_cast<uint64_t>(i % n);
+        keys[i] = (seg << 50) | (static_cast<uint64_t>(transform_val(vals[i])) << 18) | idx;
+    }
+}
+
+__global__ void k_unpack_flat(const uint64_t* __restrict__ keys,
+                              const float*    __restrict__ vals,
+                              uint32_t*       __restrict__ idx_out,
+                              float*          __restrict__ val_out,
+                              int n, int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        const int seg = static_cast<int>(keys[i] >> 50);
+        const uint32_t id = static_cast<uint32_t>(keys[i] & 0x3FFFFULL);
+        idx_out[i] = id;
+        val_out[i] = vals[static_cast<size_t>(seg) * n + id];
+    }
 }
 
 __global__ void k_unpack_seg(const uint64_t* __restrict__ keys,
@@ -358,6 +408,7 @@ namespace {
 struct BatchScratch {
     int cap_total = 0, cap_seg = 0;
     float*    d_vals = nullptr;
+    uint16_t* d_wire = nullptr;   // bf16 wire format (contiguous fast path)
     uint64_t* d_keys_in = nullptr;
     uint64_t* d_keys_out = nullptr;
     uint32_t* d_idx = nullptr;
@@ -376,6 +427,7 @@ struct BatchScratch {
         if (total <= cap_total && S <= cap_seg) return true;
         release();
         bool ok = cudaMalloc(&d_vals, sizeof(float)*total) == cudaSuccess
+               && cudaMalloc(&d_wire, sizeof(uint16_t)*total) == cudaSuccess
                && cudaMalloc(&d_keys_in, sizeof(uint64_t)*total) == cudaSuccess
                && cudaMalloc(&d_keys_out, sizeof(uint64_t)*total) == cudaSuccess
                && cudaMalloc(&d_idx, sizeof(uint32_t)*total) == cudaSuccess
@@ -392,9 +444,12 @@ struct BatchScratch {
               && cudaStreamSynchronize(stream) == cudaSuccess;
         }
         if (ok) {
-            size_t bytes = 0;
-            cub::DeviceSegmentedRadixSort::SortKeys(nullptr, bytes, d_keys_in, d_keys_out,
+            size_t b1 = 0, b2 = 0;
+            cub::DeviceSegmentedRadixSort::SortKeys(nullptr, b1, d_keys_in, d_keys_out,
                                                     total, S, d_offs, d_offs+1, 0, 64, stream);
+            cub::DeviceRadixSort::SortKeys(nullptr, b2, d_keys_in, d_keys_out,
+                                           total, 0, 56, stream);
+            const size_t bytes = b1 > b2 ? b1 : b2;
             ok = cudaMalloc(&d_temp, bytes) == cudaSuccess;
             temp_bytes = bytes;
         }
@@ -405,10 +460,10 @@ struct BatchScratch {
         return true;
     }
     void release() {
-        for (void* p : {(void*)d_vals,(void*)d_keys_in,(void*)d_keys_out,(void*)d_idx,
+        for (void* p : {(void*)d_vals,(void*)d_wire,(void*)d_keys_in,(void*)d_keys_out,(void*)d_idx,
                         (void*)d_sorted,(void*)d_heads,(void*)d_stats,(void*)d_offs,(void*)d_temp})
             if (p) cudaFree(p);
-        d_vals=nullptr; d_keys_in=nullptr; d_keys_out=nullptr; d_idx=nullptr;
+        d_vals=nullptr; d_wire=nullptr; d_keys_in=nullptr; d_keys_out=nullptr; d_idx=nullptr;
         d_sorted=nullptr; d_heads=nullptr; d_stats=nullptr; d_offs=nullptr; d_temp=nullptr;
         temp_bytes=0; cap_total=0; cap_seg=0;
     }
@@ -420,6 +475,8 @@ thread_local BatchScratch g_batch;
 struct Injected { const uint32_t* idx = nullptr; const float* val = nullptr;
                   const double* stats = nullptr; float head = 0.0f; int count = 0; };
 thread_local Injected g_inj;
+thread_local double p_stage = 0, p_issue = 0, p_gpu = 0;
+thread_local uint64_t p_n = 0;
 }  // namespace
 
 extern "C" bool pow_gpu_sort_and_stats_batched(
@@ -478,35 +535,198 @@ extern "C" bool pow_gpu_bind_device(int cuda_ordinal) {
 // `topk` ranks of idx+val ride back to the host (the CPU tail reads no further
 // when GPU stats are valid). This is the version that hung in the miner.
 extern "C" bool pow_gpu_sort_and_stats_batched_k(
-        const float* const* h_logits, int S, int n, int topk, float inv_temp, int snap_bf16,
+        const float* const* h_logits, int S, int n, int topk, float inv_temp, int snap_bf16_in,
         uint32_t* h_idx /* [S*topk] */, float* h_val /* [S*topk] */,
         float* h_head /* [S] */, double* h_stats /* [S*6] */) {
+    int snap_bf16 = snap_bf16_in;
     if (S < 1 || n < 1) return false;
     if (topk < 1 || topk > n) topk = n;
     if (!g_batch.ensure(S, n)) return false;
     auto& b = g_batch;
     const int total = S * n;
-    for (int s = 0; s < S; ++s)
-        if (cudaMemcpyAsync(b.d_vals + (size_t)s*n, h_logits[s], sizeof(float)*n,
-                            cudaMemcpyHostToDevice, b.stream) != cudaSuccess) return false;
+    const auto tA = std::chrono::steady_clock::now();
+    static thread_local cudaEvent_t ev[9] = {};
+    static thread_local bool ev_ready = false;
+    const bool ev_prof = [](){ const char* e = std::getenv("POW_GPU_EVPROF"); return e && *e == '1'; }();
+    if (ev_prof && !ev_ready) { for (auto& e : ev) cudaEventCreate(&e); ev_ready = true; }
+    #define EVR(i) if (ev_prof) cudaEventRecord(ev[i], b.stream)
+    EVR(8);   // FIRST thing on the stream this call: 8→0 spans H2D + any queue delay
+
+    // The measured wall at 48 streams was HOST-side: 48 cudaMemcpyAsync calls
+    // per step (~150k driver calls/s) serialize in the driver and contend
+    // across processes. llama.cpp writes one output row per batch slot into a
+    // single buffer, and the stepwise loop assigns rows in stream order — so
+    // the 48 "separate" logits arrays are almost always ONE contiguous block.
+    // Detect that and make it ONE driver call.
+    bool contiguous = true;
+    { static const bool allow = [](){ const char* e = std::getenv("POW_GPU_CONTIG");
+        return !(e && *e == '0'); }();
+      if (!allow) contiguous = false; }
+    if (contiguous)
+        for (int s = 1; s < S; ++s)
+            if (h_logits[s] != h_logits[0] + (size_t)s * n) { contiguous = false; break; }
+    { static bool once = false;
+      if (!once) { once = true;
+        std::fprintf(stderr, "[pow-gpu] batched H2D path: %s (S=%d)\n",
+                     contiguous ? "CONTIGUOUS (1 copy/step)" : "per-stream (S copies/step)", S);
+        std::fflush(stderr); } }
+    if (contiguous) {
+        // Page-lock llama's logits buffer ONCE per thread: a pageable 29 MB
+        // H2D goes through the driver's staging path (~8-10 ms/step measured);
+        // registered memory is straight DMA (~1 ms). The buffer address is
+        // stable for the life of the context, so one registration serves every
+        // step. Failure is non-fatal — the copy still works, just slower.
+        static thread_local const void* reg_base = nullptr;
+        static thread_local size_t      reg_size = 0;
+        static thread_local int         reg_state = 0;   // 0=untried 1=ok -1=failed
+        // Try registration ONCE. The failed branch used to re-fire every step
+        // (reg_base stays null, so `reg_base != h_logits[0]` was always true):
+        // 1687 retries, each walking 29 MB of pages inside the driver before
+        // failing — the hidden ~9 ms/step that no GPU event could see.
+        if (reg_state == 0 || (reg_state > 0 && reg_base != (const void*)h_logits[0])) {
+            if (reg_base) { cudaHostUnregister(const_cast<void*>(reg_base)); reg_base = nullptr; }
+            const cudaError_t rc = cudaHostRegister(const_cast<float*>(h_logits[0]),
+                                                    sizeof(float)*(size_t)total,
+                                                    cudaHostRegisterPortable);
+            if (rc == cudaSuccess) {
+                reg_base = h_logits[0]; reg_size = sizeof(float)*(size_t)total; reg_state = 1;
+                std::fprintf(stderr, "[pow-gpu] logits page-locked (%zu MB) — DMA H2D\n", reg_size >> 20);
+            } else {
+                reg_state = -1;
+                cudaGetLastError();
+                std::fprintf(stderr, "[pow-gpu] cudaHostRegister failed (%s) — pinned STAGING instead\n",
+                             cudaGetErrorName(rc));
+            }
+            std::fflush(stderr);
+        }
+        // bf16 wire: narrow to the snapped top-16 bits DURING the staging pass
+        // we pay anyway, ship half the bytes, widen on device (bit-identical
+        // to snapping the fp32 on device). POW_GPU_BF16_WIRE=0 restores fp32.
+        static thread_local uint16_t* stage16 = nullptr;
+        static thread_local size_t stage16_cap = 0;
+        static const bool bf16_wire = [](){ const char* e = std::getenv("POW_GPU_BF16_WIRE");
+            return !(e && *e == '0'); }();
+        bool shipped16 = false;
+        if (bf16_wire && snap_bf16) {
+            if (stage16_cap < (size_t)total) {
+                if (stage16) cudaFreeHost(stage16);
+                stage16 = nullptr; stage16_cap = 0;
+                if (cudaMallocHost(&stage16, sizeof(uint16_t)*(size_t)total) == cudaSuccess)
+                    stage16_cap = (size_t)total;
+                else cudaGetLastError();
+            }
+            if (stage16) {
+                const uint32_t* in = reinterpret_cast<const uint32_t*>(h_logits[0]);
+                for (int i = 0; i < total; ++i) {
+                    const uint32_t x = in[i];
+                    stage16[i] = static_cast<uint16_t>((x + (0x00007FFFu + ((x >> 16) & 1u))) >> 16);
+                }
+                if (cudaMemcpyAsync(b.d_wire, stage16, sizeof(uint16_t)*(size_t)total,
+                                    cudaMemcpyHostToDevice, b.stream) != cudaSuccess) return false;
+                shipped16 = true;
+            }
+        }
+        if (!shipped16) {
+            const float* src = h_logits[0];
+            if (reg_state < 0) {
+                static thread_local float* stage = nullptr;
+                static thread_local size_t stage_cap = 0;
+                if (stage_cap < (size_t)total) {
+                    if (stage) cudaFreeHost(stage);
+                    stage = nullptr; stage_cap = 0;
+                    if (cudaMallocHost(&stage, sizeof(float)*(size_t)total) == cudaSuccess)
+                        stage_cap = (size_t)total;
+                    else cudaGetLastError();
+                }
+                if (stage) { std::memcpy(stage, h_logits[0], sizeof(float)*(size_t)total); src = stage; }
+            }
+            if (cudaMemcpyAsync(b.d_vals, src, sizeof(float)*total,
+                                cudaMemcpyHostToDevice, b.stream) != cudaSuccess) return false;
+        }
+        p_stage += std::chrono::duration<double>(std::chrono::steady_clock::now() - tA).count();
+        EVR(0);
+        if (shipped16) {
+            k_widen_bf16<<<(total + 255) / 256, 256, 0, b.stream>>>(b.d_wire, b.d_vals, total);
+            snap_bf16 = 0;   // values are already snapped; skip k_snap_bf16
+        }
+    } else {
+        for (int s = 0; s < S; ++s)
+            if (cudaMemcpyAsync(b.d_vals + (size_t)s*n, h_logits[s], sizeof(float)*n,
+                                cudaMemcpyHostToDevice, b.stream) != cudaSuccess) return false;
+    }
     const int T = 256, G = (total + T - 1) / T;
     if (snap_bf16) k_snap_bf16<<<G, T, 0, b.stream>>>(b.d_vals, total);
-    k_pack_seg<<<G, T, 0, b.stream>>>(b.d_vals, b.d_keys_in, n, total);
-    cub::DeviceSegmentedRadixSort::SortKeys(b.d_temp, b.temp_bytes, b.d_keys_in, b.d_keys_out,
-                                            total, S, b.d_offs, b.d_offs + 1, 0, 64, b.stream);
-    k_unpack_seg<<<G, T, 0, b.stream>>>(b.d_keys_out, b.d_vals, b.d_idx, b.d_sorted, n, total);
+    EVR(1);
+    if (S <= 64 && n <= (1 << 18)) {
+        // Flat combined-key sort: one radix pass over all S*n keys.
+        k_pack_flat<<<G, T, 0, b.stream>>>(b.d_vals, b.d_keys_in, n, total);
+        EVR(2);
+        cub::DeviceRadixSort::SortKeys(b.d_temp, b.temp_bytes, b.d_keys_in, b.d_keys_out,
+                                       total, 0, 56, b.stream);
+        EVR(3);
+        k_unpack_flat<<<G, T, 0, b.stream>>>(b.d_keys_out, b.d_vals, b.d_idx, b.d_sorted, n, total);
+        EVR(4);
+    } else {
+        k_pack_seg<<<G, T, 0, b.stream>>>(b.d_vals, b.d_keys_in, n, total);
+        cub::DeviceSegmentedRadixSort::SortKeys(b.d_temp, b.temp_bytes, b.d_keys_in, b.d_keys_out,
+                                                total, S, b.d_offs, b.d_offs + 1, 0, 64, b.stream);
+        k_unpack_seg<<<G, T, 0, b.stream>>>(b.d_keys_out, b.d_vals, b.d_idx, b.d_sorted, n, total);
+    }
     if (cudaMemcpy2DAsync(b.d_heads, sizeof(float), b.d_sorted, sizeof(float)*(size_t)n,
                           sizeof(float), S, cudaMemcpyDeviceToDevice, b.stream) != cudaSuccess)
         return false;
     if (cudaMemsetAsync(b.d_stats, 0, sizeof(double)*6*S, b.stream) != cudaSuccess) return false;
     dim3 grid(64, S);
+    EVR(5);
     k_stats_seg<<<grid, 256, 0, b.stream>>>(b.d_sorted, n, inv_temp, b.d_heads, b.d_stats);
+    EVR(6);
     // Top-`topk` of each stream only: src stride n, dst stride topk, height S.
+    const auto tB = std::chrono::steady_clock::now();
     bool ok = cudaMemcpy2DAsync(h_idx, sizeof(uint32_t)*topk, b.d_idx, sizeof(uint32_t)*(size_t)n,
                                 sizeof(uint32_t)*topk, S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
            && cudaMemcpy2DAsync(h_val, sizeof(float)*topk, b.d_sorted, sizeof(float)*(size_t)n,
                                 sizeof(float)*topk, S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
            && cudaMemcpyAsync(h_head, b.d_heads, sizeof(float)*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
            && cudaMemcpyAsync(h_stats, b.d_stats, sizeof(double)*6*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess;
-    return ok && cudaStreamSynchronize(b.stream) == cudaSuccess;
+    p_issue += std::chrono::duration<double>(std::chrono::steady_clock::now() - tB).count();
+    const auto tC = std::chrono::steady_clock::now();
+    ok = ok && cudaStreamSynchronize(b.stream) == cudaSuccess;
+    p_gpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - tC).count();
+    if (ev_prof && ok) {
+        EVR(7);   // after everything (recorded post-sync; timeline query below)
+        static thread_local uint64_t evn = 0;
+        static thread_local float evacc[7] = {};
+        float dt = 0;
+        static thread_local float ev_h2d = 0;
+        cudaEventElapsedTime(&dt, ev[8], ev[0]); ev_h2d += dt;
+        for (int i = 0; i < 7; ++i) {
+            if (i == 4 && !(S <= 64 && n <= (1 << 18))) continue;
+            cudaEventElapsedTime(&dt, ev[i], ev[i+1]); evacc[i] += dt;
+        }
+        if (++evn % 256 == 0) {
+            std::fprintf(stderr, "[evprof] h2d+delay=%.2f snap=%.2f pack=%.2f sort=%.2f unpack=%.2f gap=%.2f stats=%.2f d2h=%.2f ms\n",
+                         ev_h2d/evn, evacc[0]/evn, evacc[1]/evn, evacc[2]/evn, evacc[3]/evn,
+                         evacc[4]/evn, evacc[5]/evn, evacc[6]/evn);
+            std::fflush(stderr);
+        }
+    }
+    if (++p_n % 512 == 0) {
+        std::fprintf(stderr, "[prof3] stage+h2d=%.1f issue=%.1f gpuwait=%.1f ms/step\n",
+                     1000.0*p_stage/p_n, 1000.0*p_issue/p_n, 1000.0*p_gpu/p_n);
+        std::fflush(stderr);
+    }
+    return ok;
+}
+
+// Pinned host allocation for the sampler's receive buffers. An "async" D2H
+// into pageable memory is synchronous in effect — the driver stages it and
+// blocks; with a PITCHED 2D copy it degrades to row-by-row staging, which
+// measured 10.5 ms/step. Pinned destinations make the same copies true DMA.
+extern "C" void* pow_gpu_host_alloc(size_t bytes) {
+    void* p = nullptr;
+    if (cudaMallocHost(&p, bytes) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+    return p;
+}
+extern "C" void pow_gpu_host_free(void* p) {
+    if (p) cudaFreeHost(p);
 }
