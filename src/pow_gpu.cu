@@ -418,7 +418,7 @@ thread_local BatchScratch g_batch;
 // Thread-local injection: the sampler's patched sort block consumes ONE
 // pre-sorted result instead of launching, then the slot auto-clears.
 struct Injected { const uint32_t* idx = nullptr; const float* val = nullptr;
-                  const double* stats = nullptr; float head = 0.0f; };
+                  const double* stats = nullptr; float head = 0.0f; int count = 0; };
 thread_local Injected g_inj;
 }  // namespace
 
@@ -457,13 +457,13 @@ extern "C" bool pow_gpu_sort_and_stats_batched(
 }
 
 extern "C" void pow_gpu_inject_presorted(const uint32_t* idx, const float* val,
-                                          const double* stats, float head) {
-    g_inj.idx = idx; g_inj.val = val; g_inj.stats = stats; g_inj.head = head;
+                                          const double* stats, float head, int count) {
+    g_inj.idx = idx; g_inj.val = val; g_inj.stats = stats; g_inj.head = head; g_inj.count = count;
 }
 extern "C" bool pow_gpu_take_presorted(const uint32_t** idx, const float** val,
-                                       const double** stats, float* head) {
+                                       const double** stats, float* head, int* count) {
     if (!g_inj.idx) return false;
-    *idx = g_inj.idx; *val = g_inj.val; *stats = g_inj.stats; *head = g_inj.head;
+    *idx = g_inj.idx; *val = g_inj.val; *stats = g_inj.stats; *head = g_inj.head; *count = g_inj.count;
     g_inj.idx = nullptr; g_inj.val = nullptr; g_inj.stats = nullptr;
     return true;
 }
@@ -472,4 +472,41 @@ extern "C" bool pow_gpu_take_presorted(const uint32_t** idx, const float** val,
 // must run its sampler kernels on ITS OWN GPU, not on device 0 by default.
 extern "C" bool pow_gpu_bind_device(int cuda_ordinal) {
     return cudaSetDevice(cuda_ordinal) == cudaSuccess;
+}
+
+// Truncated-copy variant under debug: identical sort/stats, but only the top
+// `topk` ranks of idx+val ride back to the host (the CPU tail reads no further
+// when GPU stats are valid). This is the version that hung in the miner.
+extern "C" bool pow_gpu_sort_and_stats_batched_k(
+        const float* const* h_logits, int S, int n, int topk, float inv_temp, int snap_bf16,
+        uint32_t* h_idx /* [S*topk] */, float* h_val /* [S*topk] */,
+        float* h_head /* [S] */, double* h_stats /* [S*6] */) {
+    if (S < 1 || n < 1) return false;
+    if (topk < 1 || topk > n) topk = n;
+    if (!g_batch.ensure(S, n)) return false;
+    auto& b = g_batch;
+    const int total = S * n;
+    for (int s = 0; s < S; ++s)
+        if (cudaMemcpyAsync(b.d_vals + (size_t)s*n, h_logits[s], sizeof(float)*n,
+                            cudaMemcpyHostToDevice, b.stream) != cudaSuccess) return false;
+    const int T = 256, G = (total + T - 1) / T;
+    if (snap_bf16) k_snap_bf16<<<G, T, 0, b.stream>>>(b.d_vals, total);
+    k_pack_seg<<<G, T, 0, b.stream>>>(b.d_vals, b.d_keys_in, n, total);
+    cub::DeviceSegmentedRadixSort::SortKeys(b.d_temp, b.temp_bytes, b.d_keys_in, b.d_keys_out,
+                                            total, S, b.d_offs, b.d_offs + 1, 0, 64, b.stream);
+    k_unpack_seg<<<G, T, 0, b.stream>>>(b.d_keys_out, b.d_vals, b.d_idx, b.d_sorted, n, total);
+    if (cudaMemcpy2DAsync(b.d_heads, sizeof(float), b.d_sorted, sizeof(float)*(size_t)n,
+                          sizeof(float), S, cudaMemcpyDeviceToDevice, b.stream) != cudaSuccess)
+        return false;
+    if (cudaMemsetAsync(b.d_stats, 0, sizeof(double)*6*S, b.stream) != cudaSuccess) return false;
+    dim3 grid(64, S);
+    k_stats_seg<<<grid, 256, 0, b.stream>>>(b.d_sorted, n, inv_temp, b.d_heads, b.d_stats);
+    // Top-`topk` of each stream only: src stride n, dst stride topk, height S.
+    bool ok = cudaMemcpy2DAsync(h_idx, sizeof(uint32_t)*topk, b.d_idx, sizeof(uint32_t)*(size_t)n,
+                                sizeof(uint32_t)*topk, S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
+           && cudaMemcpy2DAsync(h_val, sizeof(float)*topk, b.d_sorted, sizeof(float)*(size_t)n,
+                                sizeof(float)*topk, S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
+           && cudaMemcpyAsync(h_head, b.d_heads, sizeof(float)*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
+           && cudaMemcpyAsync(h_stats, b.d_stats, sizeof(double)*6*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess;
+    return ok && cudaStreamSynchronize(b.stream) == cudaSuccess;
 }

@@ -149,6 +149,8 @@ bool PoiMiner::init(int window_tokens, std::string& error, int n_streams,
     return true;
 }
 
+static std::mutex g_vdf_mtx;   // chiavdf global state is not thread-safe
+
 bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
     impl_->last_ctx.clear();   // force fresh rows on every stream's next window
     if (!p.valid || p.header_prefix.size() != 152) {
@@ -168,6 +170,7 @@ bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
     const std::string parent = p.header_prefix.substr(8, 64);
     auto parent_bytes = hex_to_bytes(parent);
     if (parent != parent_hash_hex_ || vdf_hex_.empty()) {
+        std::lock_guard<std::mutex> vlk(g_vdf_mtx);   // serialize chiavdf
         const auto prev = parent_bytes;
         // Tick count is the VDF's difficulty; the chain reads it from the proof.
         // Kept modest here — raising it costs wall-clock per window.
@@ -240,11 +243,11 @@ bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
 }
 
 #ifdef POW_GPU_SORT_ENABLED
-extern "C" bool pow_gpu_sort_and_stats_batched(
-        const float* const* h_logits, int S, int n, float inv_temp, int snap_bf16,
+extern "C" bool pow_gpu_sort_and_stats_batched_k(
+        const float* const* h_logits, int S, int n, int topk, float inv_temp, int snap_bf16,
         uint32_t* h_idx, float* h_val, float* h_head, double* h_stats);
 extern "C" void pow_gpu_inject_presorted(const uint32_t* idx, const float* val,
-                                          const double* stats, float head);
+                                          const double* stats, float head, int count);
 extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 #endif
 
@@ -257,7 +260,7 @@ void PoiMiner::prepare_batch(const std::vector<const float*>& logits, int n_voca
     impl_->batch_val.resize(static_cast<size_t>(S) * n_vocab);
     impl_->batch_head.resize(S);
     impl_->batch_stats.resize(static_cast<size_t>(S) * 6);
-    if (pow_gpu_sort_and_stats_batched(logits.data(), S, n_vocab, 1.0f, /*snap_bf16=*/1,
+    if (pow_gpu_sort_and_stats_batched_k(logits.data(), S, n_vocab, n_vocab, 1.0f, /*snap_bf16=*/1,
                                        impl_->batch_idx.data(), impl_->batch_val.data(),
                                        impl_->batch_head.data(), impl_->batch_stats.data())) {
         impl_->batch_n_vocab = n_vocab;
@@ -283,7 +286,7 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
                 impl_->batch_idx.data() + (size_t)seq_id * impl_->batch_n_vocab,
                 impl_->batch_val.data() + (size_t)seq_id * impl_->batch_n_vocab,
                 impl_->batch_stats.data() + (size_t)seq_id * 6,
-                impl_->batch_head[seq_id]);
+                impl_->batch_head[seq_id], impl_->batch_n_vocab);
         }
 #endif
         auto lc = impl_->last_ctx.find(seq_id);
@@ -429,6 +432,7 @@ struct SamplerPool::Impl {
     int n_streams = 0;
     int groups = 1;
     int cuda_device = 0;
+    int dbg_dev = 0;
     std::vector<std::unique_ptr<PoiMiner>> miners;   // one per group
     std::vector<std::pair<int,int>>        range;     // [lo,hi) global streams per group
 
@@ -447,6 +451,9 @@ struct SamplerPool::Impl {
     int                                         in_nvocab = 0;
     const std::vector<std::vector<int64_t>>*    in_ctx = nullptr;
     std::vector<int>*                           out_tokens = nullptr;
+    std::vector<uint32_t> sort_idx; std::vector<float> sort_val;
+    std::vector<float> sort_head; std::vector<double> sort_stats;
+    int sort_stride = 0; bool sort_ok = false;
 
     ~Impl() {
         {
@@ -477,15 +484,13 @@ struct SamplerPool::Impl {
             lk.unlock();
 
             bool ok = true;
-            // One segmented GPU sort for this group's streams, then per-stream
-            // sampling — all on THIS worker thread, so the pow_gpu thread-local
-            // scratch and injection slot are naturally private to the group.
-            std::vector<const float*> gl;
-            gl.reserve(hi - lo);
-            for (int s = lo; s < hi; ++s) gl.push_back((*logits)[s]);
-            miners[g]->prepare_batch(gl, nvoc);
             for (int s = lo; s < hi && ok; ++s) {
                 const int local = s - lo;
+                if (sort_ok)
+                    pow_gpu_inject_presorted(sort_idx.data() + (size_t)s * sort_stride,
+                                             sort_val.data() + (size_t)s * sort_stride,
+                                             sort_stats.data() + (size_t)s * 6,
+                                             sort_head[s], sort_stride);
                 const int tok = miners[g]->on_logits(local, (*logits)[s], nvoc,
                                                      (*ctx)[s], 1.0f, 50, 1.0f);
                 if (tok < 0) ok = false; else (*out)[s] = tok;
@@ -507,6 +512,7 @@ SamplerPool::~SamplerPool() = default;
 bool SamplerPool::init(int n_streams, int groups, int base_egress_port,
                        int cuda_device, std::string& error) {
     impl_->cuda_device = cuda_device;
+    impl_->dbg_dev = cuda_device;
     impl_->n_streams = n_streams;
     impl_->groups    = std::max(1, std::min(groups, n_streams));
     const int G = impl_->groups;
@@ -545,6 +551,19 @@ std::string SamplerPool::job_id() const {
 bool SamplerPool::sample_step(const std::vector<const float*>& logits, int n_vocab,
                               const std::vector<std::vector<int64_t>>& ctx,
                               std::vector<int>& out_tokens) {
+    {
+        const int S = impl_->n_streams;
+        const int K = std::min(2048, n_vocab);   // CPU tail reads only top-k
+        impl_->sort_idx.resize((size_t)S * K);
+        impl_->sort_val.resize((size_t)S * K);
+        impl_->sort_head.resize(S);
+        impl_->sort_stats.resize((size_t)S * 6);
+        impl_->sort_stride = K;
+        impl_->sort_ok = pow_gpu_sort_and_stats_batched_k(
+            logits.data(), S, n_vocab, K, 1.0f, 1,
+            impl_->sort_idx.data(), impl_->sort_val.data(),
+            impl_->sort_head.data(), impl_->sort_stats.data());
+    }
     {
         std::lock_guard<std::mutex> lk(impl_->mtx);
         impl_->in_logits  = &logits;
