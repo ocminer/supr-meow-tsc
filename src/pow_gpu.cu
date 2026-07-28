@@ -417,13 +417,15 @@ thread_local BatchScratch g_batch;
 
 // Thread-local injection: the sampler's patched sort block consumes ONE
 // pre-sorted result instead of launching, then the slot auto-clears.
-struct Injected { const uint32_t* idx = nullptr; const double* stats = nullptr; float head = 0.0f; };
+struct Injected { const uint32_t* idx = nullptr; const float* val = nullptr;
+                  const double* stats = nullptr; float head = 0.0f; };
 thread_local Injected g_inj;
 }  // namespace
 
 extern "C" bool pow_gpu_sort_and_stats_batched(
         const float* const* h_logits, int S, int n, float inv_temp, int snap_bf16,
-        uint32_t* h_idx /* [S*n] */, float* h_head /* [S] */, double* h_stats /* [S*6] */) {
+        uint32_t* h_idx /* [S*n] */, float* h_val /* [S*n] */,
+        float* h_head /* [S] */, double* h_stats /* [S*6] */) {
     if (S < 1 || n < 1) return false;
     if (!g_batch.ensure(S, n)) return false;
     auto& b = g_batch;
@@ -444,18 +446,25 @@ extern "C" bool pow_gpu_sort_and_stats_batched(
     dim3 grid(64, S);
     k_stats_seg<<<grid, 256, 0, b.stream>>>(b.d_sorted, n, inv_temp, b.d_heads, b.d_stats);
     bool ok = cudaMemcpyAsync(h_idx, b.d_idx, sizeof(uint32_t)*total, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
+           // Sorted VALUES ride back too: filling pretemp_desc_ from these is
+           // two linear reads; gathering working_logits[idx[r]] on the host is
+           // 151,936 random reads per token — the exact cache-miss storm the
+           // per-stream kernel's fused gather was built to avoid.
+           && cudaMemcpyAsync(h_val, b.d_sorted, sizeof(float)*total, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
            && cudaMemcpyAsync(h_head, b.d_heads, sizeof(float)*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
            && cudaMemcpyAsync(h_stats, b.d_stats, sizeof(double)*6*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess;
     return ok && cudaStreamSynchronize(b.stream) == cudaSuccess;
 }
 
-extern "C" void pow_gpu_inject_presorted(const uint32_t* idx, const double* stats, float head) {
-    g_inj.idx = idx; g_inj.stats = stats; g_inj.head = head;
+extern "C" void pow_gpu_inject_presorted(const uint32_t* idx, const float* val,
+                                          const double* stats, float head) {
+    g_inj.idx = idx; g_inj.val = val; g_inj.stats = stats; g_inj.head = head;
 }
-extern "C" bool pow_gpu_take_presorted(const uint32_t** idx, const double** stats, float* head) {
+extern "C" bool pow_gpu_take_presorted(const uint32_t** idx, const float** val,
+                                       const double** stats, float* head) {
     if (!g_inj.idx) return false;
-    *idx = g_inj.idx; *stats = g_inj.stats; *head = g_inj.head;
-    g_inj.idx = nullptr; g_inj.stats = nullptr;
+    *idx = g_inj.idx; *val = g_inj.val; *stats = g_inj.stats; *head = g_inj.head;
+    g_inj.idx = nullptr; g_inj.val = nullptr; g_inj.stats = nullptr;
     return true;
 }
 

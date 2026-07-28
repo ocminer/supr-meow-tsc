@@ -74,6 +74,7 @@ struct PoiMiner::Impl {
                                                       // between two drains
     // Batched presort output, one slice per stream (idx: n_vocab each).
     std::vector<uint32_t> batch_idx;
+    std::vector<float>    batch_val;
     std::vector<float>    batch_head;
     std::vector<double>   batch_stats;
     int                   batch_n_vocab = 0;
@@ -238,8 +239,9 @@ bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
 #ifdef POW_GPU_SORT_ENABLED
 extern "C" bool pow_gpu_sort_and_stats_batched(
         const float* const* h_logits, int S, int n, float inv_temp, int snap_bf16,
-        uint32_t* h_idx, float* h_head, double* h_stats);
-extern "C" void pow_gpu_inject_presorted(const uint32_t* idx, const double* stats, float head);
+        uint32_t* h_idx, float* h_val, float* h_head, double* h_stats);
+extern "C" void pow_gpu_inject_presorted(const uint32_t* idx, const float* val,
+                                          const double* stats, float head);
 #endif
 
 void PoiMiner::prepare_batch(const std::vector<const float*>& logits, int n_vocab) {
@@ -248,11 +250,12 @@ void PoiMiner::prepare_batch(const std::vector<const float*>& logits, int n_voca
     const int S = static_cast<int>(logits.size());
     if (S < 1) return;
     impl_->batch_idx.resize(static_cast<size_t>(S) * n_vocab);
+    impl_->batch_val.resize(static_cast<size_t>(S) * n_vocab);
     impl_->batch_head.resize(S);
     impl_->batch_stats.resize(static_cast<size_t>(S) * 6);
     if (pow_gpu_sort_and_stats_batched(logits.data(), S, n_vocab, 1.0f, /*snap_bf16=*/1,
-                                       impl_->batch_idx.data(), impl_->batch_head.data(),
-                                       impl_->batch_stats.data())) {
+                                       impl_->batch_idx.data(), impl_->batch_val.data(),
+                                       impl_->batch_head.data(), impl_->batch_stats.data())) {
         impl_->batch_n_vocab = n_vocab;
         impl_->batch_ready = true;
     }
@@ -274,6 +277,7 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
             seq_id >= 0 && (size_t)(seq_id + 1) * impl_->batch_n_vocab <= impl_->batch_idx.size()) {
             pow_gpu_inject_presorted(
                 impl_->batch_idx.data() + (size_t)seq_id * impl_->batch_n_vocab,
+                impl_->batch_val.data() + (size_t)seq_id * impl_->batch_n_vocab,
                 impl_->batch_stats.data() + (size_t)seq_id * 6,
                 impl_->batch_head[seq_id]);
         }

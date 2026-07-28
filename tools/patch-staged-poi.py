@@ -49,7 +49,7 @@ PATCHES = [
         "extern \"C\" bool pow_gpu_available(void);\n"
         "extern \"C\" bool pow_gpu_sort_and_stats(const float* h_vals, int n, float inv_temp,\n"
         "                                       uint32_t* h_sorted_idx, float* h_sorted_vals, double* h_stats);\n"
-        "extern \"C\" bool pow_gpu_take_presorted(const uint32_t** idx, const double** stats, float* head);\n"
+        "extern \"C\" bool pow_gpu_take_presorted(const uint32_t** idx, const float** val, const double** stats, float* head);\n"
         "#endif\n"
         "\n"
         "// Vectorized FP16 snapping function\n",
@@ -85,13 +85,15 @@ PATCHES = [
             // logits in one segmented launch; consume that result instead of
             // launching a per-stream chain. The injected order is produced by
             // the same key transform, so bit-exactness is unchanged.
-            const uint32_t* inj_idx = nullptr; const double* inj_stats = nullptr; float inj_head = 0.0f;
-            if (pow_gpu_take_presorted(&inj_idx, &inj_stats, &inj_head)) {
+            const uint32_t* inj_idx = nullptr; const float* inj_val = nullptr;
+            const double* inj_stats = nullptr; float inj_head = 0.0f;
+            if (pow_gpu_take_presorted(&inj_idx, &inj_val, &inj_stats, &inj_head)) {
                 gpu_sort_val_.assign(1, inj_head);
-                for (int r = 0; r < n_vocab; ++r) {
-                    const uint32_t tid = inj_idx[r];
-                    pretemp_desc_[r] = { working_logits[tid], static_cast<int>(tid) };
-                }
+                // Two LINEAR reads: inj_val[r] is bit-identical to
+                // working_logits[inj_idx[r]] (same snap formula on both sides),
+                // so the 151,936 random host reads of the gather are gone.
+                for (int r = 0; r < n_vocab; ++r)
+                    pretemp_desc_[r] = { inj_val[r], static_cast<int>(inj_idx[r]) };
                 for (int k = 0; k < 6; ++k) gpu_stats_[k] = inj_stats[k];
                 sorted_on_gpu = true;
                 gpu_stats_valid_ = true;
