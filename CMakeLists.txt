@@ -152,7 +152,7 @@ target_compile_definitions(meow_poi PUBLIC POW_V3_HAVE_ARGON2)
 target_sources(meow_poi PRIVATE ${CMAKE_SOURCE_DIR}/src/pow_gpu.cu)
 target_compile_definitions(meow_poi PUBLIC POW_GPU_SORT_ENABLED)
 set_source_files_properties(${CMAKE_SOURCE_DIR}/src/pow_gpu.cu PROPERTIES
-  COMPILE_OPTIONS "--expt-relaxed-constexpr")
+  COMPILE_OPTIONS "--expt-relaxed-constexpr;-Xcompiler=-mavx2")
 set_target_properties(meow_poi PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------

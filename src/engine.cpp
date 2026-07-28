@@ -347,11 +347,13 @@ int InferenceEngine::generate_windows_stepwise(int device_slot,
         if (llama_decode(in.ctx, nb) != 0) { llama_batch_free(nb); error = "decode failed mid-window"; return -1; }
         t_decode += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     }
-    { static int prof = 0;
-      if (prof++ < 6)
-          std::fprintf(stderr, "[prof] window batch: sample=%.2fs decode=%.2fs (per step: %.1f/%.1f ms)\n",
-                       t_sample, t_decode,
-                       1000.0*t_sample/cfg_.window_tokens, 1000.0*t_decode/cfg_.window_tokens); }
+    // One line per completed window batch (~every 5-15 s): per-step phase cost
+    // and the implied throughput. Direct measurement — immune to the job-churn
+    // noise that plagues delta-counting the windows counter.
+    { const double per_step_ms = 1000.0 * (t_sample + t_decode) / cfg_.window_tokens;
+      std::fprintf(stderr, "[prof] batch S=%d: sample=%.1f decode=%.1f ms/step -> %.2f windows/s\n",
+                   S, 1000.0*t_sample/cfg_.window_tokens, 1000.0*t_decode/cfg_.window_tokens,
+                   per_step_ms > 0 ? 1000.0 * S / (256.0 * per_step_ms) : 0.0); }
     llama_batch_free(nb);
     return S;
 }
