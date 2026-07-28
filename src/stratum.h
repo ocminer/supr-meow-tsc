@@ -47,6 +47,7 @@ struct PoolJob {
     uint32_t    nbits = 0;
     uint64_t    height = 0;
     uint64_t    expires_at = 0;
+    uint64_t    request_id = 0;  // work unit the proof must commit to
     bool        clean = false;   // true ⇒ parent changed, abandon in-flight work
     bool        valid = false;
 };

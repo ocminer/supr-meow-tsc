@@ -195,6 +195,10 @@ void StratumClient::handle_line(const std::string& line) {
             j.height        = p[4].is_number() ? p[4].get<uint64_t>() : 0;
             j.expires_at    = p[5].is_number() ? p[5].get<uint64_t>() : 0;
             j.clean         = p[6].is_boolean() ? p[6].get<bool>() : true;
+            // Appended field: the pool's work-unit id. The proof commits to it
+            // and bcore rejects a block whose proof names a different unit.
+            j.request_id    = p.size() > 7 && p[7].is_number()
+                                ? p[7].get<uint64_t>() : 0;
             {
                 std::lock_guard<std::mutex> lk(mtx_);
                 j.share_target = share_target_;

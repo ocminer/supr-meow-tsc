@@ -380,6 +380,7 @@ int main(int argc, char** argv) {
                 p.model_difficulty = m.difficulty;
                 p.normalizer       = m.normalizer;
                 p.job_id           = j.job_id;
+                p.request_id       = j.request_id;
                 p.valid            = true;
                 std::string perr;
                 if (!poi.set_job(p, perr)) {

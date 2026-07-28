@@ -11,6 +11,20 @@ import sys
 PATCHES = [
     (
         "pow_utils.cpp",
+        # adjusted_bits is the SHARE-mode threshold the verifier gates on, but
+        # upstream derives it from `target` — the block target — so a sub-block
+        # share is judged against a threshold it can never meet. The proof's
+        # `target` must stay the block target (bcore validates solutions with
+        # it), so the share threshold travels here instead.
+        "                auto target_bytes = hex_to_bytes(target_it->second);\n",
+        "                auto thr_it = is_solution ? target_it\n"
+        "                                          : seq_pow_params.find(\"share_target\");\n"
+        "                if (thr_it == seq_pow_params.end() || thr_it->second.empty())\n"
+        "                    thr_it = target_it;\n"
+        "                auto target_bytes = hex_to_bytes(thr_it->second);\n",
+    ),
+    (
+        "pow_utils.cpp",
         # proof.fbs documents `timestamp` as a UNIX timestamp, and both
         # validation.fbs and blockheader.fbs narrow it to uint32 seconds. But
         # system_clock::time_since_epoch().count() is NANOSECONDS on libstdc++,

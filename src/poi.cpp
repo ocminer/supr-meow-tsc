@@ -146,15 +146,12 @@ bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
     }
 
     std::unordered_map<std::string, std::string> params = {
-        // The proof's own target is what the validator replays against, and a
-        // sub-block share can never meet the BLOCK target — the verifier aborts
-        // at "header hash does not meet target" BEFORE the sampling replay, so
-        // the pool learns nothing about authenticity. Declaring the share target
-        // makes the replay actually run for every credited share. A block-level
-        // hash also satisfies the (easier) share target, so blocks still verify;
-        // block-tier is decided by the pool against the real target and by
-        // bcore against the chain, never by this field.
-        {"target",            p.share_target},
+        // The BLOCK target: bcore validates a real solution against this, and a
+        // proof declaring anything else is rejected (quick_verify_failed).
+        // Share-mode verification does not use it — the share threshold travels
+        // separately in adjusted_bits and reaches the verifier as
+        // target_override_hex. See tools/patch-staged-poi.py.
+        {"target",            p.block_target},
         {"share_target",      p.share_target},
         {"header_prefix",     p.header_prefix},
         // The proof serializer reads this with .at(), so it is mandatory. It is
