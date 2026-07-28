@@ -10,6 +10,9 @@
 #include <mutex>
 #include <deque>
 #include <cstring>
+#include <thread>
+#include <condition_variable>
+#include <utility>
 #include <stdexcept>
 #include <cstdio>
 #include <unordered_map>
@@ -242,6 +245,7 @@ extern "C" bool pow_gpu_sort_and_stats_batched(
         uint32_t* h_idx, float* h_val, float* h_head, double* h_stats);
 extern "C" void pow_gpu_inject_presorted(const uint32_t* idx, const float* val,
                                           const double* stats, float head);
+extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 #endif
 
 void PoiMiner::prepare_batch(const std::vector<const float*>& logits, int n_vocab) {
@@ -414,6 +418,156 @@ std::unique_ptr<PoiShare> PoiMiner::take_share() {
     auto s = std::move(impl_->pending_q.front());
     impl_->pending_q.pop_front();
     return s;
+}
+
+
+
+// ===========================================================================
+// SamplerPool — parallel per-stream sampler tail across K coordinators.
+// ===========================================================================
+struct SamplerPool::Impl {
+    int n_streams = 0;
+    int groups = 1;
+    int cuda_device = 0;
+    std::vector<std::unique_ptr<PoiMiner>> miners;   // one per group
+    std::vector<std::pair<int,int>>        range;     // [lo,hi) global streams per group
+
+    // Per-step handoff. The mining thread publishes the step inputs, bumps the
+    // generation, and waits for every group to report the same generation done.
+    std::vector<std::thread>  threads;
+    std::mutex                mtx;
+    std::condition_variable   cv_go, cv_done;
+    uint64_t                  gen = 0;                 // step generation
+    std::vector<uint64_t>     done;                    // per-group last gen finished
+    bool                      stop = false;
+    bool                      step_ok = true;
+
+    // Inputs valid for the current generation (owned by the mining thread).
+    const std::vector<const float*>*            in_logits = nullptr;
+    int                                         in_nvocab = 0;
+    const std::vector<std::vector<int64_t>>*    in_ctx = nullptr;
+    std::vector<int>*                           out_tokens = nullptr;
+
+    ~Impl() {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            stop = true;
+            ++gen;
+        }
+        cv_go.notify_all();
+        for (auto& t : threads) if (t.joinable()) t.join();
+    }
+
+    void worker(int g) {
+        // Bind THIS worker thread to the group's GPU: CUDA context is
+        // per host thread, so a worker left on the default device would
+        // run its sort kernels on GPU 0 regardless of which card decoded.
+        pow_gpu_bind_device(cuda_device);
+        uint64_t seen = 0;
+        for (;;) {
+            std::unique_lock<std::mutex> lk(mtx);
+            cv_go.wait(lk, [&]{ return gen != seen || stop; });
+            if (stop) return;
+            seen = gen;
+            const auto lo = range[g].first, hi = range[g].second;
+            const auto* logits = in_logits;
+            const int   nvoc   = in_nvocab;
+            const auto* ctx     = in_ctx;
+            auto*       out     = out_tokens;
+            lk.unlock();
+
+            bool ok = true;
+            // One segmented GPU sort for this group's streams, then per-stream
+            // sampling — all on THIS worker thread, so the pow_gpu thread-local
+            // scratch and injection slot are naturally private to the group.
+            std::vector<const float*> gl;
+            gl.reserve(hi - lo);
+            for (int s = lo; s < hi; ++s) gl.push_back((*logits)[s]);
+            miners[g]->prepare_batch(gl, nvoc);
+            for (int s = lo; s < hi && ok; ++s) {
+                const int local = s - lo;
+                const int tok = miners[g]->on_logits(local, (*logits)[s], nvoc,
+                                                     (*ctx)[s], 1.0f, 50, 1.0f);
+                if (tok < 0) ok = false; else (*out)[s] = tok;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk2(mtx);
+                if (!ok) step_ok = false;
+                done[g] = seen;
+            }
+            cv_done.notify_one();
+        }
+    }
+};
+
+SamplerPool::SamplerPool() : impl_(std::make_unique<Impl>()) {}
+SamplerPool::~SamplerPool() = default;
+
+bool SamplerPool::init(int n_streams, int groups, int base_egress_port,
+                       int cuda_device, std::string& error) {
+    impl_->cuda_device = cuda_device;
+    impl_->n_streams = n_streams;
+    impl_->groups    = std::max(1, std::min(groups, n_streams));
+    const int G = impl_->groups;
+    impl_->done.assign(G, 0);
+    // Contiguous, balanced split of streams across groups.
+    int lo = 0;
+    for (int g = 0; g < G; ++g) {
+        const int cnt = (n_streams - lo) / (G - g);
+        impl_->range.emplace_back(lo, lo + cnt);
+        auto m = std::make_unique<PoiMiner>();
+        // Each group is its OWN sampler over `cnt` local streams; ports (and so
+        // nonce partitions) are unique per group.
+        if (!m->init(256, error, cnt, base_egress_port + g)) return false;
+        impl_->miners.push_back(std::move(m));
+        lo += cnt;
+    }
+    for (int g = 0; g < G; ++g)
+        impl_->threads.emplace_back([this, g]{ impl_->worker(g); });
+    return true;
+}
+
+bool SamplerPool::set_job(const PoiJobParams& p, std::string& error) {
+    // Fan the job out to every group. Each group's local seq ids are 0..cnt-1,
+    // so the same params apply; the job_id/request_id are identical.
+    for (auto& m : impl_->miners) if (!m->set_job(p, error)) return false;
+    return true;
+}
+
+bool SamplerPool::ready() const {
+    return !impl_->miners.empty() && impl_->miners[0]->ready();
+}
+std::string SamplerPool::job_id() const {
+    return impl_->miners.empty() ? std::string() : impl_->miners[0]->job_id();
+}
+
+bool SamplerPool::sample_step(const std::vector<const float*>& logits, int n_vocab,
+                              const std::vector<std::vector<int64_t>>& ctx,
+                              std::vector<int>& out_tokens) {
+    {
+        std::lock_guard<std::mutex> lk(impl_->mtx);
+        impl_->in_logits  = &logits;
+        impl_->in_nvocab  = n_vocab;
+        impl_->in_ctx     = &ctx;
+        impl_->out_tokens = &out_tokens;
+        impl_->step_ok    = true;
+        ++impl_->gen;
+    }
+    impl_->cv_go.notify_all();
+    const uint64_t g = impl_->gen;
+    std::unique_lock<std::mutex> lk(impl_->mtx);
+    impl_->cv_done.wait(lk, [&]{
+        for (int i = 0; i < impl_->groups; ++i) if (impl_->done[i] != g) return false;
+        return true;
+    });
+    return impl_->step_ok;
+}
+
+std::unique_ptr<PoiShare> SamplerPool::take_share() {
+    for (auto& m : impl_->miners)
+        if (auto s = m->take_share()) return s;
+    return nullptr;
 }
 
 }  // namespace meow

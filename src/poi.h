@@ -93,4 +93,36 @@ private:
     uint64_t    nonce_seq_ = 0;     // pool dedup key, one per emitted share      // to detect the start of a new window
 };
 
+// A pool of PoiMiner coordinators that samples one decode step for ALL streams
+// in parallel. The engine keeps ONE llama context per device and decodes the
+// whole batch single-threaded (that is what serialized when we tried multiple
+// contexts); only the per-token sampler tail — the actual wall once the sort
+// moved to the GPU — is split across `groups` worker threads, each owning its
+// own coordinator (separate scratch → no data race), egress port and nonce
+// partition. Streams are assigned round-robin-contiguously to groups.
+class SamplerPool {
+public:
+    SamplerPool();
+    ~SamplerPool();
+
+    bool init(int n_streams, int groups, int base_egress_port,
+              int cuda_device, std::string& error);
+    bool set_job(const PoiJobParams& p, std::string& error);   // fans out to all
+    bool ready() const;
+    std::string job_id() const;
+
+    // Called once per decode step by the mining thread: fills out_tokens[s] for
+    // every stream, running each group's streams on its own thread.
+    bool sample_step(const std::vector<const float*>& logits, int n_vocab,
+                     const std::vector<std::vector<int64_t>>& ctx,
+                     std::vector<int>& out_tokens);
+
+    // Drains one finished share across all groups (nullptr if none pending).
+    std::unique_ptr<PoiShare> take_share();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 }  // namespace meow

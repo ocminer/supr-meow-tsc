@@ -104,6 +104,20 @@ public:
                                  const BatchChooser& chooser, std::string& error,
                                  const BatchPrepare& prepare = nullptr);
 
+    // Like the above but the sampler decides ALL streams' tokens for a step in
+    // one call — which is what lets a caller run the per-stream sampler tail in
+    // PARALLEL. `step` receives every stream's logits and running context and
+    // must fill `out_tokens` (one per stream). The decode itself stays
+    // single-threaded on this device (batched), so nothing in llama is shared
+    // across threads.
+    using StepSampler = std::function<bool(const std::vector<const float*>& logits,
+                                           int n_vocab,
+                                           const std::vector<std::vector<int64_t>>& ctx,
+                                           std::vector<int>& out_tokens)>;
+    int generate_windows_stepwise(int device_slot,
+                                  const std::vector<std::string>& prompts,
+                                  const StepSampler& step, std::string& error);
+
     // Throughput measurement across every loaded device, used by --benchmark.
     std::vector<DeviceEngineStats> benchmark(int windows_per_device, std::string& error);
 

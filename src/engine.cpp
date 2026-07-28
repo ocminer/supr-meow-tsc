@@ -262,6 +262,90 @@ int InferenceEngine::generate_windows_batched(int device_slot,
     return S;
 }
 
+int InferenceEngine::generate_windows_stepwise(int device_slot,
+                                              const std::vector<std::string>& prompts,
+                                              const StepSampler& step,
+                                              std::string& error) {
+    if (device_slot < 0 || device_slot >= static_cast<int>(instances_.size())) {
+        error = "invalid device slot"; return -1;
+    }
+    Instance& in = *instances_[device_slot];
+    const llama_vocab* vocab = llama_model_get_vocab(in.model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    const int S = static_cast<int>(prompts.size());
+    if (S < 1 || S > cfg_.slots_per_device) { error = "bad stream count"; return -1; }
+
+    // Tokenize every stream's prompt.
+    std::vector<std::vector<llama_token>> toks(S);
+    for (int s = 0; s < S; ++s) {
+        std::vector<llama_token> t(prompts[s].size() + 8);
+        int n = llama_tokenize(vocab, prompts[s].c_str(), (int32_t)prompts[s].size(),
+                               t.data(), (int32_t)t.size(), true, false);
+        if (n < 0) { t.resize(-n);
+            n = llama_tokenize(vocab, prompts[s].c_str(), (int32_t)prompts[s].size(),
+                               t.data(), (int32_t)t.size(), true, false); }
+        if (n <= 0) { error = "tokenization failed"; return -1; }
+        t.resize(n); toks[s] = std::move(t);
+    }
+
+    llama_memory_clear(llama_get_memory(in.ctx), true);
+
+    // Prompt pass: all streams in one batch, one logits row per stream (its
+    // last prompt token).
+    int total_prompt = 0; for (auto& t : toks) total_prompt += (int)t.size();
+    llama_batch pb = llama_batch_init(total_prompt, 0, S);
+    std::vector<int32_t> last_row(S, -1);
+    for (int s = 0; s < S; ++s) {
+        for (size_t i = 0; i < toks[s].size(); ++i) {
+            const int r = pb.n_tokens++;
+            pb.token[r] = toks[s][i];
+            pb.pos[r]   = (llama_pos)i;
+            pb.n_seq_id[r] = 1;
+            pb.seq_id[r][0] = (llama_seq_id)s;
+            pb.logits[r] = (i + 1 == toks[s].size());
+            if (pb.logits[r]) last_row[s] = r;
+        }
+    }
+    const int prc = llama_decode(in.ctx, pb);
+    llama_batch_free(pb);
+    if (prc != 0) { error = "prompt decode failed"; return -1; }
+
+    // Per-stream running context (prompt + generated so far).
+    std::vector<std::vector<int64_t>> ctxv(S);
+    for (int s = 0; s < S; ++s) {
+        ctxv[s].reserve(toks[s].size() + cfg_.window_tokens);
+        for (llama_token t : toks[s]) ctxv[s].push_back((int64_t)t);
+    }
+
+    llama_batch nb = llama_batch_init(S, 0, S);
+    for (int step_i = 0; step_i < cfg_.window_tokens; ++step_i) {
+        nb.n_tokens = 0;
+        std::vector<const float*> all_logits(S, nullptr);
+        for (int s = 0; s < S; ++s) {
+            all_logits[s] = llama_get_logits_ith(in.ctx, last_row[s]);
+            if (!all_logits[s]) { llama_batch_free(nb); error = "no logits returned"; return -1; }
+        }
+        std::vector<int> chosen(S, -1);
+        if (!step(all_logits, n_vocab, ctxv, chosen)) {
+            llama_batch_free(nb); error = "sampler step failed"; return -1;
+        }
+        for (int s = 0; s < S; ++s) {
+            if (chosen[s] < 0) { llama_batch_free(nb); error = "sampler aborted a window"; return -1; }
+            ctxv[s].push_back((int64_t)chosen[s]);
+            const int r = nb.n_tokens++;
+            nb.token[r] = (llama_token)chosen[s];
+            nb.pos[r]   = (llama_pos)(toks[s].size() + step_i);
+            nb.n_seq_id[r] = 1;
+            nb.seq_id[r][0] = (llama_seq_id)s;
+            nb.logits[r] = true;
+            last_row[s] = r;
+        }
+        if (llama_decode(in.ctx, nb) != 0) { llama_batch_free(nb); error = "decode failed mid-window"; return -1; }
+    }
+    llama_batch_free(nb);
+    return S;
+}
+
 std::vector<DeviceEngineStats> InferenceEngine::benchmark(int windows_per_device, std::string& error) {
     std::vector<DeviceEngineStats> out;
     for (size_t i = 0; i < instances_.size(); ++i) {

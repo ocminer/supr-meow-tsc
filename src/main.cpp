@@ -51,6 +51,7 @@ struct Options {
     bool        vdf_test     = false;
     int         slots = 8;
     int         workers = 1;   // independent contexts per GPU (--workers)
+    int         groups  = 8;   // parallel sampler threads per GPU (--groups)
     std::vector<std::string> pools;   // repeated -o = failover order
     meow::DeviceTuning tuning;   // --cclock/--mclock/--pl/--fan/--lock-core
 };
@@ -128,6 +129,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--vdf-test")        o.vdf_test = true;
         else if (a == "--slots")           { if (!need_value(i, argc, "--slots")) return false; o.slots = std::atoi(argv[++i]); }
         else if (a == "--workers")         { if (!need_value(i, argc, "--workers")) return false; o.workers = std::atoi(argv[++i]); }
+        else if (a == "--groups")          { if (!need_value(i, argc, "--groups")) return false; o.groups = std::atoi(argv[++i]); }
         else if (a == "--no-color")        o.no_color = true;
         else if (eq("-o", "--pool"))       { if (!need_value(i, argc, "-o")) return false; o.pool = argv[++i]; o.pools.push_back(o.pool); }
         else if (eq("-u", "--user"))       { if (!need_value(i, argc, "-u")) return false; o.user = argv[++i]; }
@@ -357,24 +359,26 @@ int main(int argc, char** argv) {
         }
 
         const int n_streams = std::max(1, o.slots);
+        const int n_groups  = std::max(1, std::min(o.groups, n_streams));
 
-        // One sampler instance per WORKER context, initialised SEQUENTIALLY:
-        // the proof egress writer reads its port from the environment during
-        // init, so the ports must be set one at a time and be unique — they
-        // also key the per-instance nonce partition.
+        // One SamplerPool per worker context (one llama context per device).
+        // Each pool runs the per-stream sampler tail across n_groups threads,
+        // each its own coordinator — this is what uses the idle cores. Egress
+        // ports are partitioned so no two coordinators collide (they also key
+        // the nonce partition): worker w, group g -> 47021 + w*64 + g.
         const int n_workers = engine.worker_count();
-        std::vector<std::unique_ptr<meow::PoiMiner>> miners;
+        std::vector<std::unique_ptr<meow::SamplerPool>> pools;
         for (int w = 0; w < n_workers; ++w) {
-            auto m = std::make_unique<meow::PoiMiner>();
-            if (!m->init(256, eerr, n_streams, 47021 + w)) {
+            auto sp = std::make_unique<meow::SamplerPool>();
+            if (!sp->init(n_streams, n_groups, 47021 + w * 64, engine.worker_device(w), eerr)) {
                 std::fprintf(stderr, "error: %s\n", eerr.c_str());
                 client.stop();
                 return 1;
             }
-            miners.push_back(std::move(m));
+            pools.push_back(std::move(sp));
         }
-        std::printf("  proof-of-inference ready — %d worker context(s) across %zu device(s)\n\n",
-                    n_workers, engine.config().devices.size());
+        std::printf("  proof-of-inference ready — %d context(s) x %d sampler group(s) across %zu device(s)\n\n",
+                    n_workers, n_groups, engine.config().devices.size());
 
         std::atomic<uint64_t> windows{0}, shares{0};
         std::mutex submit_mx;                    // one stratum socket, N miners
@@ -382,7 +386,7 @@ int main(int argc, char** argv) {
         const uint64_t prompt_salt = std::random_device{}();
 
         auto mine_device = [&](int worker) {
-            meow::PoiMiner& poi = *miners[worker];
+            meow::SamplerPool& pool = *pools[worker];
             pow_gpu_bind_device(engine.worker_device(worker));
             uint64_t my_windows = 0;
             while (!g_stop) {
@@ -393,7 +397,7 @@ int main(int argc, char** argv) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     continue;
                 }
-                if (!poi.ready() || poi.job_id() != j.job_id) {
+                if (!pool.ready() || pool.job_id() != j.job_id) {
                     meow::PoiJobParams p;
                     p.header_prefix    = j.header_prefix;
                     p.block_target     = j.block_target;
@@ -405,7 +409,7 @@ int main(int argc, char** argv) {
                     p.request_id       = j.request_id;
                     p.valid            = true;
                     std::string perr;
-                    if (!poi.set_job(p, perr)) {
+                    if (!pool.set_job(p, perr)) {
                         std::fprintf(stderr, "  job rejected: %s\n", perr.c_str());
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                         continue;
@@ -420,14 +424,12 @@ int main(int argc, char** argv) {
                         std::to_string(my_windows) + "-" + std::to_string(st) + "]");
 
                 std::string gerr;
-                const int n = engine.generate_windows_batched(worker, prompts,
-                    [&](int stream, const float* logits, int n_vocab,
-                        const std::vector<int64_t>& ctx) -> int {
-                        return poi.on_logits(stream, logits, n_vocab, ctx, 1.0f, 50, 1.0f);
-                    }, gerr,
-                    [&](const std::vector<const float*>& all, int n_vocab) {
-                        poi.prepare_batch(all, n_vocab);
-                    });
+                const int n = engine.generate_windows_stepwise(worker, prompts,
+                    [&](const std::vector<const float*>& all, int n_vocab,
+                        const std::vector<std::vector<int64_t>>& ctx,
+                        std::vector<int>& out) -> bool {
+                        return pool.sample_step(all, n_vocab, ctx, out);
+                    }, gerr);
                 if (n < 0) {
                     std::fprintf(stderr, "  window failed (worker %d): %s\n", worker, gerr.c_str());
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -436,7 +438,7 @@ int main(int argc, char** argv) {
                 my_windows += n;
                 windows += n;
 
-                while (auto sh = poi.take_share()) {
+                while (auto sh = pool.take_share()) {
                     std::lock_guard<std::mutex> lk(submit_mx);
                     client.submit(sh->job_id, sh->nonce, sh->proof_b64, sh->achieved_hex, sh->vdf_tick);
                     ++shares;
