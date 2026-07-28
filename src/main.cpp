@@ -13,6 +13,7 @@
 #include "engine.h"
 #include "vdf.h"
 #include "poi.h"
+#include <random>
 #include <mutex>
 
 #include <atomic>
@@ -359,6 +360,7 @@ int main(int argc, char** argv) {
 
 
         uint64_t windows = 0, shares = 0;
+        const uint64_t prompt_salt = std::random_device{}();
         const auto t_start = std::chrono::steady_clock::now();
 
         while (!g_stop) {
@@ -387,10 +389,20 @@ int main(int argc, char** argv) {
                 }
             }
 
+            // Every window MUST use a different prompt. The v3 admission grind
+            // folds the prompt into its preimage and its commitment, so an
+            // identical prompt yields an identical nonce, an identical
+            // transcript and a byte-identical proof — which the pool rejects as
+            // a duplicate share. The salt is random per run and includes the
+            // device, so two rigs (or two restarts) never grind the same window.
+            const std::string prompt =
+                "Explain distributed consensus in detail. [" +
+                std::to_string(prompt_salt) + "-" + std::to_string(windows) + "]";
+
             // One window. The sampler chooses every token and records the
             // transcript; the engine advances on the sampler's choice.
             std::string gerr;
-            const int n = engine.generate_window(0, "Explain distributed consensus in detail.",
+            const int n = engine.generate_window(0, prompt,
                 [&](const float* logits, int n_vocab, const std::vector<int64_t>& ctx) -> int {
                     return poi.on_logits(0, logits, n_vocab, ctx, 1.0f, 50, 1.0f);
                 }, gerr);

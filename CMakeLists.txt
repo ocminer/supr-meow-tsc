@@ -125,7 +125,12 @@ add_custom_command(
           ${MEOW_POW_DIR}/pow_zmq_writer_helpers.h
           ${MEOW_POI_STAGE}
   COMMAND ${CMAKE_COMMAND} -E copy_if_different ${MEOW_FB_HEADERS} ${MEOW_POI_STAGE}
-  DEPENDS ${MEOW_FB_HEADERS} ${MEOW_POW_DIR}/pow_utils.cpp ${MEOW_POW_DIR}/pow_v3.cpp
+  # Fixes for upstream defects are applied to the STAGED copy, never to
+  # vendor/, so the submodule stays a clean checkout. See the script for what
+  # each patch fixes; it fails the build if a target has disappeared.
+  COMMAND ${CMAKE_COMMAND} -E env python3
+          ${CMAKE_SOURCE_DIR}/tools/patch-staged-poi.py ${MEOW_POI_STAGE}
+  DEPENDS ${CMAKE_SOURCE_DIR}/tools/patch-staged-poi.py ${MEOW_FB_HEADERS} ${MEOW_POW_DIR}/pow_utils.cpp ${MEOW_POW_DIR}/pow_v3.cpp
   COMMENT "Staging proof-of-inference sources with regenerated schemas")
 
 add_library(meow_poi STATIC ${MEOW_POI_STAGED})

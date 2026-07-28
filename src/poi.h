@@ -78,7 +78,8 @@ private:
     const char* stage_ = "";       // which coordinator call is in flight
     size_t      last_ctx_ = 0;
     size_t      prompt_len_ = 0;    // context size at the window's first token
-    int         window_tokens_ = 256;      // to detect the start of a new window
+    int         window_tokens_ = 256;
+    uint64_t    nonce_seq_ = 0;     // pool dedup key, one per emitted share      // to detect the start of a new window
 };
 
 }  // namespace meow

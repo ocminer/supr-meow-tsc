@@ -233,6 +233,11 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
             const auto* data = static_cast<const uint8_t*>(zmq_msg_data(&msg));
             auto share = std::make_unique<PoiShare>();
             share->job_id       = impl_->job.job_id;
+            // The pool dedups on (job, nonce) and rejects a repeat outright.
+            // Blocks are submitted from the proof alone, so this value carries
+            // no consensus meaning — it only has to be unique per job. Leaving
+            // it at 0 makes every share after the first a "duplicate".
+            share->nonce        = ++nonce_seq_;
             share->proof_b64    = base64(data, static_cast<size_t>(n));
             share->vdf_tick     = vdf_tick_;
             share->achieved_hex = bytes_to_hex(r.digest.data(), r.digest.size());
