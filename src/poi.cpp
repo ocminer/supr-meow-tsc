@@ -85,6 +85,12 @@ bool PoiMiner::init(int window_tokens, std::string& error) {
     // Both processes must agree on the proof version or the sampler aborts on
     // its first solution check; here there is only one process, so set it.
     ::setenv("POW_PROOF_VERSION", "3", 1);
+    // Left at "off" DELIBERATELY. Turning it on makes the step-0 digest
+    // disagree with the verifier's recomputation, i.e. this validator does not
+    // fold an admission nonce into the hash. Nonce-less costs the
+    // [B_FLOOR, B_FREE) admission band, which is a throughput matter, not a
+    // validity one — and it is what this chain actually verifies against.
+    ::setenv("POW_V3_ADMISSION_MODE", "off", 1);
     ::setenv("POW_EGRESS_MODE", "broker", 1);      // broker mode emits shares AND solutions
     ::setenv("POW_PROXY_ENABLE", "false", 1);      // ...and carries pow_blob_hash
     ::setenv("ZMQ_PUSH_HOST", "127.0.0.1", 1);
@@ -140,7 +146,15 @@ bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
     }
 
     std::unordered_map<std::string, std::string> params = {
-        {"target",            p.block_target},
+        // The proof's own target is what the validator replays against, and a
+        // sub-block share can never meet the BLOCK target — the verifier aborts
+        // at "header hash does not meet target" BEFORE the sampling replay, so
+        // the pool learns nothing about authenticity. Declaring the share target
+        // makes the replay actually run for every credited share. A block-level
+        // hash also satisfies the (easier) share target, so blocks still verify;
+        // block-tier is decided by the pool against the real target and by
+        // bcore against the chain, never by this field.
+        {"target",            p.share_target},
         {"share_target",      p.share_target},
         {"header_prefix",     p.header_prefix},
         // The proof serializer reads this with .at(), so it is mandatory. It is
@@ -202,6 +216,14 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
             // the proof writer without request_id/difficulty and the window dies
             // at the very last step — after all 256 tokens were already spent.
             impl_->coord.update_pow_params_for_sequence(seq_id, impl_->params);
+            // Seeds BOTH the proof's prompt_tokens field and the v3 pre-window
+            // archive. Without it the proof declares an EMPTY prompt: it still
+            // serializes and passes VDF and block-level checks, then kills the
+            // verifier's replay (`window_tokens[i, -0:] = ctx[-0:]`) — and that
+            // engine answers a crash with silence, so the pool only ever sees a
+            // gateway timeout.
+            impl_->coord.set_prompt_tokens(seq_id,
+                std::vector<int32_t>(context.begin(), context.end()));
             prompt_len_ = context.size();
         }
         last_ctx_ = context.size();
@@ -222,6 +244,15 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
         if (steps >= static_cast<size_t>(window_tokens_)) {
             stage_ = "check_solutions";
             impl_->coord.check_solutions({seq_id});
+            // Retire the sequence so the NEXT window starts from step 0. A
+            // sequence that already owns a row keeps it, and its step counter
+            // just keeps climbing (16128, 16384, …) — the proof then records
+            // absolute step indices while the verifier replays 0..255, so every
+            // u-value disagrees. Only the step-0 digest matched, because
+            // check_solutions() forces step 0 for that one.
+            stage_ = "cleanup_sequence";
+            impl_->coord.cleanup_sequence(seq_id);
+            last_ctx_ = SIZE_MAX;
         }
 
         // Drain the in-process egress. Non-blocking: if nothing closed, mining
