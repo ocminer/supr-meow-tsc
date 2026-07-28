@@ -31,11 +31,24 @@ struct EngineConfig {
     std::string       model_path;
     std::vector<int>  devices;              // CUDA ordinals, from -d
     int               slots_per_device = 8; // concurrent windows per GPU
+    // Independent worker CONTEXTS per device. Each is its own KV cache, its
+    // own mining thread, and its own sampler coordinator (separate scratch =
+    // no data race), so N workers use N CPU cores for the per-token sampler
+    // tail — the real wall once the sort moved to the GPU — and keep the card
+    // fed while any one worker is on its CPU tail. They share the model weights
+    // (loaded once per device), so the VRAM cost is only extra KV cache.
+    int               workers_per_device = 1;
     int               window_tokens    = 256;
     // HARD RULE: ctx per slot must exceed prompt + window, or generation stops
     // one token short of a full window and the miner emits NOTHING while
     // looking perfectly healthy. Learned the hard way; kept as a guard rail.
-    int               ctx_per_slot     = 2048;
+    //
+    // Sized JUST above one window (prompt ~24 + 256 window). A mining context
+    // is cleared every window and never grows, so a large ctx only bloats the
+    // KV cache — which both slows attention and caps how many slots fit in
+    // VRAM. 384 keeps margin while shrinking KV ~5x vs the old 2048, which is
+    // what lets the batch scale past ~48 slots.
+    int               ctx_per_slot     = 384;
     int               threads          = 0;  // 0 = auto
 };
 
@@ -97,6 +110,10 @@ public:
     int  n_vocab() const;
     bool loaded() const { return !instances_.empty(); }
     const EngineConfig& config() const { return cfg_; }
+    // Total worker contexts = devices * workers_per_device. main() runs one
+    // mining thread per worker; device_slot in the calls below is a WORKER id.
+    int  worker_count() const { return static_cast<int>(instances_.size()); }
+    int  worker_device(int w) const;
 
 private:
     struct Instance;                      // one model+context set, per device

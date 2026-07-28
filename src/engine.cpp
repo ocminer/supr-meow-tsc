@@ -10,15 +10,20 @@
 namespace meow {
 
 struct InferenceEngine::Instance {
-    int             device = -1;
-    llama_model*    model  = nullptr;
-    llama_context*  ctx    = nullptr;
+    int             device      = -1;
+    llama_model*    model       = nullptr;   // shared; owned by owns_model==true
+    llama_context*  ctx         = nullptr;
+    bool            owns_model  = false;      // only the first worker frees it
 
     ~Instance() {
         if (ctx)   llama_free(ctx);
-        if (model) llama_model_free(model);
+        if (owns_model && model) llama_model_free(model);
     }
 };
+
+int InferenceEngine::worker_device(int w) const {
+    return (w >= 0 && w < (int)instances_.size()) ? instances_[w]->device : -1;
+}
 
 InferenceEngine::InferenceEngine() = default;
 
@@ -62,10 +67,8 @@ bool InferenceEngine::load(const EngineConfig& cfg, std::string& error,
         if (level == GGML_LOG_LEVEL_ERROR && text) std::fprintf(stderr, "  [llama] %s", text);
     }, nullptr);
 
+    const int W = std::max(1, cfg.workers_per_device);
     for (int dev : cfg.devices) {
-        auto inst = std::make_unique<Instance>();
-        inst->device = dev;
-
         llama_model_params mp = llama_model_default_params();
         mp.n_gpu_layers = 999;                       // the whole model on the GPU
         mp.main_gpu     = dev;
@@ -73,33 +76,43 @@ bool InferenceEngine::load(const EngineConfig& cfg, std::string& error,
         mp.use_mmap     = true;
 
         if (progress) progress("loading model on GPU " + std::to_string(dev));
-        inst->model = llama_model_load_from_file(cfg.model_path.c_str(), mp);
-        if (!inst->model) {
+        llama_model* model = llama_model_load_from_file(cfg.model_path.c_str(), mp);
+        if (!model) {
             error = "failed to load model '" + cfg.model_path + "' on GPU " + std::to_string(dev) +
                     " — check the path, and that the file is a bf16 GGUF of the registered model";
             return false;
         }
 
-        llama_context_params cp = llama_context_default_params();
-        cp.n_ctx     = static_cast<uint32_t>(cfg.ctx_per_slot * cfg.slots_per_device);
-        cp.n_batch   = 2048;
-        cp.n_ubatch  = 512;
-        cp.n_seq_max = static_cast<uint32_t>(cfg.slots_per_device);
-        cp.n_threads = cfg.threads > 0 ? cfg.threads : 8;
-        cp.n_threads_batch = cp.n_threads;
+        for (int w = 0; w < W; ++w) {
+            auto inst = std::make_unique<Instance>();
+            inst->device     = dev;
+            inst->model      = model;
+            inst->owns_model = (w == 0);   // one owner frees the shared weights
 
-        inst->ctx = llama_init_from_model(inst->model, cp);
-        if (!inst->ctx) {
-            error = "failed to create context on GPU " + std::to_string(dev) +
-                    " (try fewer slots or a smaller --ctx)";
-            return false;
+            llama_context_params cp = llama_context_default_params();
+            cp.n_ctx     = static_cast<uint32_t>(cfg.ctx_per_slot * cfg.slots_per_device);
+            // The prompt pass submits every stream's prompt in ONE batch, so
+            // n_batch must cover slots * prompt_len or llama_decode fails and
+            // the miner produces nothing. Sized generously from the slot count.
+            cp.n_batch   = std::max(2048u, static_cast<uint32_t>(cfg.slots_per_device) * 64u);
+            cp.n_ubatch  = 512;
+            cp.n_seq_max = static_cast<uint32_t>(cfg.slots_per_device);
+            cp.n_threads = cfg.threads > 0 ? cfg.threads : 8;
+            cp.n_threads_batch = cp.n_threads;
+
+            inst->ctx = llama_init_from_model(inst->model, cp);
+            if (!inst->ctx) {
+                error = "failed to create context " + std::to_string(w) + " on GPU " +
+                        std::to_string(dev) + " (try fewer slots/workers or a smaller ctx)";
+                return false;
+            }
+            instances_.push_back(std::move(inst));
         }
         if (progress) {
-            progress("GPU " + std::to_string(dev) + " ready — " +
-                     std::to_string(cfg.slots_per_device) + " slots x " +
+            progress("GPU " + std::to_string(dev) + " ready — " + std::to_string(W) +
+                     " workers x " + std::to_string(cfg.slots_per_device) + " slots x " +
                      std::to_string(cfg.ctx_per_slot) + " ctx");
         }
-        instances_.push_back(std::move(inst));
     }
     return true;
 }

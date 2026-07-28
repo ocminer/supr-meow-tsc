@@ -50,6 +50,7 @@ struct Options {
     bool        benchmark    = false;
     bool        vdf_test     = false;
     int         slots = 8;
+    int         workers = 1;   // independent contexts per GPU (--workers)
     std::vector<std::string> pools;   // repeated -o = failover order
     meow::DeviceTuning tuning;   // --cclock/--mclock/--pl/--fan/--lock-core
 };
@@ -126,6 +127,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--benchmark")       o.benchmark = true;
         else if (a == "--vdf-test")        o.vdf_test = true;
         else if (a == "--slots")           { if (!need_value(i, argc, "--slots")) return false; o.slots = std::atoi(argv[++i]); }
+        else if (a == "--workers")         { if (!need_value(i, argc, "--workers")) return false; o.workers = std::atoi(argv[++i]); }
         else if (a == "--no-color")        o.no_color = true;
         else if (eq("-o", "--pool"))       { if (!need_value(i, argc, "-o")) return false; o.pool = argv[++i]; o.pools.push_back(o.pool); }
         else if (eq("-u", "--user"))       { if (!need_value(i, argc, "-u")) return false; o.user = argv[++i]; }
@@ -247,6 +249,7 @@ int main(int argc, char** argv) {
         meow::EngineConfig ec;
         ec.model_path       = o.model_path;
         ec.slots_per_device = o.slots;
+        ec.workers_per_device = std::max(1, o.workers);
         for (const auto& d : dm.devices()) ec.devices.push_back(d.index);
 
         meow::InferenceEngine engine;
@@ -355,30 +358,32 @@ int main(int argc, char** argv) {
 
         const int n_streams = std::max(1, o.slots);
 
-        // One sampler instance per device, initialised SEQUENTIALLY: the proof
-        // egress writer reads its port from the environment during init, so
-        // the ports must be set one at a time.
-        const size_t n_dev = engine.config().devices.size();
+        // One sampler instance per WORKER context, initialised SEQUENTIALLY:
+        // the proof egress writer reads its port from the environment during
+        // init, so the ports must be set one at a time and be unique — they
+        // also key the per-instance nonce partition.
+        const int n_workers = engine.worker_count();
         std::vector<std::unique_ptr<meow::PoiMiner>> miners;
-        for (size_t d = 0; d < n_dev; ++d) {
+        for (int w = 0; w < n_workers; ++w) {
             auto m = std::make_unique<meow::PoiMiner>();
-            if (!m->init(256, eerr, n_streams, 47021 + static_cast<int>(d))) {
+            if (!m->init(256, eerr, n_streams, 47021 + w)) {
                 std::fprintf(stderr, "error: %s\n", eerr.c_str());
                 client.stop();
                 return 1;
             }
             miners.push_back(std::move(m));
         }
-        std::printf("  proof-of-inference ready on %zu device(s)\n\n", n_dev);
+        std::printf("  proof-of-inference ready — %d worker context(s) across %zu device(s)\n\n",
+                    n_workers, engine.config().devices.size());
 
         std::atomic<uint64_t> windows{0}, shares{0};
         std::mutex submit_mx;                    // one stratum socket, N miners
         const auto t_start = std::chrono::steady_clock::now();
         const uint64_t prompt_salt = std::random_device{}();
 
-        auto mine_device = [&](int slot) {
-            meow::PoiMiner& poi = *miners[slot];
-            pow_gpu_bind_device(engine.config().devices[slot]);
+        auto mine_device = [&](int worker) {
+            meow::PoiMiner& poi = *miners[worker];
+            pow_gpu_bind_device(engine.worker_device(worker));
             uint64_t my_windows = 0;
             while (!g_stop) {
                 meow::PoolJob   j;
@@ -411,11 +416,11 @@ int main(int argc, char** argv) {
                 prompts.reserve(n_streams);
                 for (int st = 0; st < n_streams; ++st)
                     prompts.push_back("Explain distributed consensus in detail. [" +
-                        std::to_string(prompt_salt) + "-" + std::to_string(slot) + "-" +
+                        std::to_string(prompt_salt) + "-" + std::to_string(worker) + "-" +
                         std::to_string(my_windows) + "-" + std::to_string(st) + "]");
 
                 std::string gerr;
-                const int n = engine.generate_windows_batched(slot, prompts,
+                const int n = engine.generate_windows_batched(worker, prompts,
                     [&](int stream, const float* logits, int n_vocab,
                         const std::vector<int64_t>& ctx) -> int {
                         return poi.on_logits(stream, logits, n_vocab, ctx, 1.0f, 50, 1.0f);
@@ -424,7 +429,7 @@ int main(int argc, char** argv) {
                         poi.prepare_batch(all, n_vocab);
                     });
                 if (n < 0) {
-                    std::fprintf(stderr, "  window failed (gpu %d): %s\n", slot, gerr.c_str());
+                    std::fprintf(stderr, "  window failed (worker %d): %s\n", worker, gerr.c_str());
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
                     continue;
                 }
@@ -440,8 +445,8 @@ int main(int argc, char** argv) {
         };
 
         std::vector<std::thread> workers;
-        for (size_t d = 0; d < n_dev; ++d)
-            workers.emplace_back(mine_device, static_cast<int>(d));
+        for (int w = 0; w < n_workers; ++w)
+            workers.emplace_back(mine_device, w);
 
         while (!g_stop) {
             std::this_thread::sleep_for(std::chrono::seconds(20));
