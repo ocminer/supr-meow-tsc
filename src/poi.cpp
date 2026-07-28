@@ -8,6 +8,7 @@
 
 #include <cstring>
 #include <mutex>
+#include <deque>
 #include <stdexcept>
 #include <cstdio>
 #include <unordered_map>
@@ -66,13 +67,16 @@ struct PoiMiner::Impl {
     void*  zmq_pull = nullptr;
     PoiJobParams job;
     std::unordered_map<std::string, std::string> params;   // re-registered per window
+    std::unordered_map<int, size_t> last_ctx;    // per sequence: last context size
+    std::unordered_map<int, size_t> prompt_len;  // per sequence: window prompt length
+    std::deque<std::unique_ptr<PoiShare>> pending_q;  // several streams can emit
+                                                      // between two drains
     // req_id → job_id for recent jobs. A proof emitted at the last token of a
     // window is drained on the NEXT on_logits call — which can already be in a
     // new job. Labelling it with the CURRENT job made the pool submit it
     // against the wrong work unit ("req_id mismatch: rpc=15 flatbuffer=14").
     // The proof names its own unit (MiningResponse.req_id); label by that.
     std::unordered_map<uint64_t, std::string> job_by_req;
-    std::unique_ptr<PoiShare> pending;
     std::mutex mtx;
 
     ~Impl() {
@@ -84,7 +88,8 @@ struct PoiMiner::Impl {
 PoiMiner::PoiMiner() : impl_(std::make_unique<Impl>()) {}
 PoiMiner::~PoiMiner() = default;
 
-bool PoiMiner::init(int window_tokens, std::string& error) {
+bool PoiMiner::init(int window_tokens, std::string& error, int n_streams) {
+    n_streams_ = std::max(1, n_streams);
     window_tokens_ = window_tokens;
     if (window_tokens != 256) {
         error = "window must be 256 tokens to match the chain's PoW window";
@@ -126,7 +131,7 @@ bool PoiMiner::init(int window_tokens, std::string& error) {
 }
 
 bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
-    last_ctx_ = SIZE_MAX;   // force a fresh row on the next window
+    impl_->last_ctx.clear();   // force fresh rows on every stream's next window
     if (!p.valid || p.header_prefix.size() != 152) {
         error = "invalid job (header_prefix must be 152 hex chars)";
         return false;
@@ -194,7 +199,8 @@ bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
         // "No PoW params registered for sequence N" if that row is absent —
         // the global call alone does not create it.
         impl_->coord.update_pow_params(params);
-        impl_->coord.update_pow_params_for_sequence(0, params);
+        for (int sq = 0; sq < n_streams_; ++sq)
+            impl_->coord.update_pow_params_for_sequence(sq, params);
         impl_->params = params;
     } catch (const std::exception& e) {
         error = std::string("update_pow_params failed: ") + e.what();
@@ -221,27 +227,22 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
         // A window starts when the context stops growing — the engine is back
         // to prompt-only. The coordinator needs a row allocated from those exact
         // prompt tokens, and it must be reallocated per window, not once per job.
-        if (context.size() <= last_ctx_) {
+        auto lc = impl_->last_ctx.find(seq_id);
+        if (lc == impl_->last_ctx.end() || context.size() <= lc->second) {
             std::unordered_map<int, std::vector<int64_t>> prompts{{seq_id, context}};
             impl_->coord.ensure_sequences({seq_id}, prompts);
             // ensure_sequences() ERASES this sequence's PoW params, so they must
-            // be re-registered for every window. Registering once per job leaves
-            // the proof writer without request_id/difficulty and the window dies
-            // at the very last step — after all 256 tokens were already spent.
+            // be re-registered for every window; set_prompt_tokens seeds both
+            // the proof's prompt_tokens and the v3 pre-window archive (an empty
+            // prompt crashes the verifier's replay with a silent timeout).
             impl_->coord.update_pow_params_for_sequence(seq_id, impl_->params);
-            // Seeds BOTH the proof's prompt_tokens field and the v3 pre-window
-            // archive. Without it the proof declares an EMPTY prompt: it still
-            // serializes and passes VDF and block-level checks, then kills the
-            // verifier's replay (`window_tokens[i, -0:] = ctx[-0:]`) — and that
-            // engine answers a crash with silence, so the pool only ever sees a
-            // gateway timeout.
             impl_->coord.set_prompt_tokens(seq_id,
                 std::vector<int32_t>(context.begin(), context.end()));
-            prompt_len_ = context.size();
+            impl_->prompt_len[seq_id] = context.size();
         }
-        last_ctx_ = context.size();
+        impl_->last_ctx[seq_id] = context.size();
         // Steps completed once this token is recorded.
-        const size_t steps = context.size() - prompt_len_ + 1;
+        const size_t steps = context.size() - impl_->prompt_len[seq_id] + 1;
 
         // Labelled individually: "unordered_map::at" from any of the three is
         // indistinguishable otherwise, and they fail for different reasons.
@@ -277,7 +278,7 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
             // check_solutions() forces step 0 for that one.
             stage_ = "cleanup_sequence";
             impl_->coord.cleanup_sequence(seq_id);
-            last_ctx_ = SIZE_MAX;
+            impl_->last_ctx.erase(seq_id);
         }
 
         // Drain the in-process egress. Non-blocking: if nothing closed, mining
@@ -336,7 +337,7 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
             if (share->achieved_hex.empty()) { zmq_msg_close(&msg); return static_cast<int>(r.token_id); }
             {
                 std::lock_guard<std::mutex> lk(impl_->mtx);
-                impl_->pending = std::move(share);
+                impl_->pending_q.push_back(std::move(share));
             }
         }
         zmq_msg_close(&msg);
@@ -354,7 +355,10 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
 
 std::unique_ptr<PoiShare> PoiMiner::take_share() {
     std::lock_guard<std::mutex> lk(impl_->mtx);
-    return std::move(impl_->pending);
+    if (impl_->pending_q.empty()) return nullptr;
+    auto s = std::move(impl_->pending_q.front());
+    impl_->pending_q.pop_front();
+    return s;
 }
 
 }  // namespace meow

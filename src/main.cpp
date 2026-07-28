@@ -350,8 +350,9 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        const int n_streams = std::max(1, o.slots);
         meow::PoiMiner poi;
-        if (!poi.init(256, eerr)) {
+        if (!poi.init(256, eerr, n_streams)) {
             std::fprintf(stderr, "error: %s\n", eerr.c_str());
             client.stop();
             return 1;
@@ -390,31 +391,34 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // Every window MUST use a different prompt. The v3 admission grind
-            // folds the prompt into its preimage and its commitment, so an
-            // identical prompt yields an identical nonce, an identical
-            // transcript and a byte-identical proof — which the pool rejects as
-            // a duplicate share. The salt is random per run and includes the
-            // device, so two rigs (or two restarts) never grind the same window.
-            const std::string prompt =
-                "Explain distributed consensus in detail. [" +
-                std::to_string(prompt_salt) + "-" + std::to_string(windows) + "]";
+            // Every window MUST use a different prompt per STREAM: the v3
+            // admission grind folds the prompt into its preimage and its
+            // commitment, so identical prompts yield identical transcripts —
+            // rejected as duplicates. Salt is random per run; stream and
+            // window index keep every window unique across rigs and restarts.
+            std::vector<std::string> prompts;
+            prompts.reserve(n_streams);
+            for (int st = 0; st < n_streams; ++st)
+                prompts.push_back("Explain distributed consensus in detail. [" +
+                    std::to_string(prompt_salt) + "-" + std::to_string(windows) +
+                    "-" + std::to_string(st) + "]");
 
-            // One window. The sampler chooses every token and records the
-            // transcript; the engine advances on the sampler's choice.
+            // One batched pass: N windows in lock-step on device 0, one decode
+            // per step for all streams. The sampler runs per stream per step.
             std::string gerr;
-            const int n = engine.generate_window(0, prompt,
-                [&](const float* logits, int n_vocab, const std::vector<int64_t>& ctx) -> int {
-                    return poi.on_logits(0, logits, n_vocab, ctx, 1.0f, 50, 1.0f);
+            const int n = engine.generate_windows_batched(0, prompts,
+                [&](int stream, const float* logits, int n_vocab,
+                    const std::vector<int64_t>& ctx) -> int {
+                    return poi.on_logits(stream, logits, n_vocab, ctx, 1.0f, 50, 1.0f);
                 }, gerr);
             if (n < 0) {
                 std::fprintf(stderr, "  window failed: %s\n", gerr.c_str());
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 continue;
             }
-            ++windows;
+            windows += n;
 
-            if (auto sh = poi.take_share()) {
+            while (auto sh = poi.take_share()) {
                 client.submit(sh->job_id, sh->nonce, sh->proof_b64, sh->achieved_hex, sh->vdf_tick);
                 ++shares;
             }

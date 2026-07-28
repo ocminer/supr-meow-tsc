@@ -74,6 +74,18 @@ public:
     int generate_window(int device_slot, const std::string& prompt,
                         const TokenChooser& chooser, std::string& error);
 
+    // Batched variant: N windows advance in lock-step on ONE device — one
+    // llama_decode carries one token per stream, so the GPU amortises its
+    // launch and weight-read cost across streams instead of idling between
+    // single-token decodes. The chooser additionally receives the stream id,
+    // which is the sampler's sequence id.
+    using BatchChooser = std::function<int(int stream, const float* logits, int n_vocab,
+                                           const std::vector<int64_t>& context)>;
+    // Returns windows completed (== streams on success), -1 on error.
+    int generate_windows_batched(int device_slot,
+                                 const std::vector<std::string>& prompts,
+                                 const BatchChooser& chooser, std::string& error);
+
     // Throughput measurement across every loaded device, used by --benchmark.
     std::vector<DeviceEngineStats> benchmark(int windows_per_device, std::string& error);
 

@@ -48,7 +48,9 @@ public:
     ~PoiMiner();
 
     // window_tokens must match the chain's PoW window (256).
-    bool init(int window_tokens, std::string& error);
+    // n_streams = concurrent windows (engine slots); each stream is a
+    // sampler sequence with its own params row and window state.
+    bool init(int window_tokens, std::string& error, int n_streams = 1);
 
     // Install a new job. Recomputes the VDF for the new parent when the parent
     // changed — the VDF is bound to it, so a stale one invalidates every proof.
@@ -76,8 +78,7 @@ private:
     uint64_t    vdf_tick_ = 0;
     std::string parent_hash_hex_;   // to detect a parent change
     const char* stage_ = "";       // which coordinator call is in flight
-    size_t      last_ctx_ = 0;
-    size_t      prompt_len_ = 0;    // context size at the window's first token
+    int         n_streams_ = 1;
     int         window_tokens_ = 256;
     uint64_t    nonce_seq_ = 0;     // pool dedup key, one per emitted share      // to detect the start of a new window
 };

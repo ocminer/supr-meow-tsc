@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.18)
 project(supr-meow-tsc LANGUAGES C CXX)
+# CUDA joins the party for the GPU-native sampler pipeline (src/pow_gpu.cu):
+# the PoI sampler's full-vocabulary sort + rank-bucket stats run as a fused
+# CUB kernel instead of a ~10 ms/token host sort — the difference between the
+# GPU idling behind the CPU and the GPU being the bottleneck (as it should be).
+enable_language(CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -142,6 +147,12 @@ target_link_libraries(meow_poi PUBLIC ${ARGON2_LIBRARY} ${ZMQ_LIBRARY} OpenSSL::
 # "a v3 miner without Argon2 would silently forfeit every admission-band
 # window"). Define it wherever argon2 is linked.
 target_compile_definitions(meow_poi PUBLIC POW_V3_HAVE_ARGON2)
+# GPU sampler pipeline. POW_GPU_SORT=0 at runtime forces the CPU path; the
+# CPU code remains intact as the fallback for both safety and non-CUDA builds.
+target_sources(meow_poi PRIVATE ${CMAKE_SOURCE_DIR}/src/pow_gpu.cu)
+target_compile_definitions(meow_poi PUBLIC POW_GPU_SORT_ENABLED)
+set_source_files_properties(${CMAKE_SOURCE_DIR}/src/pow_gpu.cu PROPERTIES
+  COMPILE_OPTIONS "--expt-relaxed-constexpr")
 set_target_properties(meow_poi PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
