@@ -3,6 +3,7 @@
 #include <openssl/sha.h>
 
 #include <cstring>
+#include <cstdlib>
 
 namespace meow {
 
@@ -26,6 +27,28 @@ bool canary_parse_seed(const std::string& hex, std::vector<uint8_t>& out) {
 
 std::vector<int32_t> canary_derive_prompt(const std::vector<uint8_t>& seed32,
                                           uint32_t w, int32_t n_vocab) {
+    // EXPERIMENT (POW_CANARY_SUPPORT=N): narrow the sampled support to the
+    // first N token ids. Qwen BPE assigns ids in roughly merge/frequency
+    // order, so a low modulus approximates "the N most frequent tokens"
+    // without any table to pin or version. Full-vocab soup (the spec as
+    // written) yields rare multilingual/emoji tokens, which drives the
+    // model into a low-entropy continuation and trips the chain's reuse
+    // guard — measured ~10x the honest reject rate. 0/unset = spec §3.
+    static const int32_t support = [](){
+        const char* e = std::getenv("POW_CANARY_SUPPORT");
+        return e ? std::atoi(e) : 0;
+    }();
+    // POW_CANARY_OFFSET=M skips the first M ids. Qwen's first 256 are raw
+    // BYTE tokens (invalid UTF-8 on their own): at support 8192 that is 3.1%
+    // per draw but 1-(1-.031)^32 = 63% of 32-token prompts containing at
+    // least one — a majority-of-prompts effect, not a 3% one.
+    static const int32_t offset = [](){
+        const char* e = std::getenv("POW_CANARY_OFFSET");
+        return e ? std::atoi(e) : 0;
+    }();
+    const int32_t cap = (support > 0 && support < n_vocab) ? support : n_vocab;
+    const int32_t lo  = (offset > 0 && offset < cap) ? offset : 0;
+    const int32_t mod = cap - lo;
     std::vector<int32_t> toks;
     toks.reserve(32);
     uint8_t msg[32 + 4 + 4];
@@ -41,7 +64,7 @@ std::vector<int32_t> canary_derive_prompt(const std::vector<uint8_t>& seed32,
         // LE_U64(d[0:8]) mod n_vocab
         uint64_t v = 0;
         for (int b = 7; b >= 0; --b) v = (v << 8) | d[b];
-        toks.push_back(static_cast<int32_t>(v % static_cast<uint64_t>(n_vocab)));
+        toks.push_back(lo + static_cast<int32_t>(v % static_cast<uint64_t>(mod)));
     }
     return toks;
 }
