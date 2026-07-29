@@ -162,7 +162,7 @@ bool PoiMiner::init(int window_tokens, std::string& error, int n_streams,
 }
 
 static std::mutex g_vdf_mtx;   // chiavdf global state is not thread-safe
-static thread_local double g_prof_sort = 0.0, g_prof_wait = 0.0;
+static thread_local double g_prof_wait = 0.0;
 static thread_local uint64_t g_prof_n = 0;
 
 bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
@@ -263,6 +263,9 @@ extern "C" bool pow_gpu_sort_and_stats_batched_k(
 extern "C" void pow_gpu_inject_presorted(const uint32_t* idx, const float* val,
                                           const double* stats, float head, int count);
 extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
+extern "C" bool pow_gpu_register_host_range(const void* p, size_t bytes);
+#else
+static inline bool pow_gpu_register_host_range(const void*, size_t) { return false; }
 #endif
 
 void PoiMiner::prepare_batch(const std::vector<const float*>& logits, int n_vocab) {
@@ -471,6 +474,7 @@ struct SamplerPool::Impl {
     float* sort_head = nullptr; double* sort_stats = nullptr;
     size_t sort_cap = 0; int sort_S = 0;
     int sort_stride = 0; bool sort_ok = false;
+    bool reg_done = false;   // llama logits block page-locked (once)
     void free_sort_bufs() {
         pow_gpu_host_free(sort_idx);  pow_gpu_host_free(sort_val);
         pow_gpu_host_free(sort_head); pow_gpu_host_free(sort_stats);
@@ -519,14 +523,31 @@ struct SamplerPool::Impl {
             auto*       out     = out_tokens;
             lk.unlock();
 
+            // Per-group sort: THIS group's slice of the logits (contiguous in
+            // llama's buffer) is narrowed, shipped and sorted HERE, on this
+            // thread's own scratch/stream — so group A's tail runs while group
+            // B's H2D+sort is still in flight, and the 0.5 ms AVX2 narrowing
+            // parallelizes across all groups for free. The former central
+            // sort serialized the whole step: sort(48) THEN all tails.
             bool ok = true;
+            bool gsort = false;
+            const int K = sort_stride;
+#ifdef POW_GPU_SORT_ENABLED
+            if (sort_ok && K > 0)
+                gsort = pow_gpu_sort_and_stats_batched_k(
+                    logits->data() + lo, hi - lo, nvoc, K, 1.0f, 1,
+                    sort_idx  + (size_t)lo * K,
+                    sort_val  + (size_t)lo * K,
+                    sort_head + lo,
+                    sort_stats + (size_t)lo * 6);
+#endif
             for (int s = lo; s < hi && ok; ++s) {
                 const int local = s - lo;
-                if (sort_ok)
-                    pow_gpu_inject_presorted(sort_idx + (size_t)s * sort_stride,
-                                             sort_val + (size_t)s * sort_stride,
+                if (gsort)
+                    pow_gpu_inject_presorted(sort_idx + (size_t)s * K,
+                                             sort_val + (size_t)s * K,
                                              sort_stats + (size_t)s * 6,
-                                             sort_head[s], sort_stride);
+                                             sort_head[s], K);
                 const int tok = miners[g]->on_logits(local, (*logits)[s], nvoc,
                                                      (*ctx)[s], 1.0f, 50, 1.0f);
                 if (tok < 0) ok = false; else (*out)[s] = tok;
@@ -592,12 +613,20 @@ bool SamplerPool::sample_step(const std::vector<const float*>& logits, int n_voc
         const int K = std::min(2048, n_vocab);   // CPU tail reads only top-k
         impl_->sort_stride = K;
         if (!impl_->ensure_sort_bufs(S, K)) { impl_->sort_ok = false; return false; }
-        const auto ts0 = std::chrono::steady_clock::now();
-        impl_->sort_ok = pow_gpu_sort_and_stats_batched_k(
-            logits.data(), S, n_vocab, K, 1.0f, 1,
-            impl_->sort_idx, impl_->sort_val,
-            impl_->sort_head, impl_->sort_stats);
-        g_prof_sort += std::chrono::duration<double>(std::chrono::steady_clock::now() - ts0).count();
+        // sort_ok now means "receive buffers ready"; the sort itself moved
+        // into the worker groups (each sorts its own slice — see worker()).
+        impl_->sort_ok = true;
+        // ONCE: page-lock llama's whole logits block so every group's slice
+        // copy is straight DMA. Done here (not per worker) because 12 threads
+        // registering overlapping slices of one buffer race and lose.
+        if (!impl_->reg_done) {
+            bool contig = true;
+            for (int s = 1; s < S; ++s)
+                if (logits[s] != logits[0] + (size_t)s * n_vocab) { contig = false; break; }
+            if (contig)
+                pow_gpu_register_host_range(logits[0], sizeof(float) * (size_t)S * n_vocab);
+            impl_->reg_done = true;
+        }
     }
     {
         std::lock_guard<std::mutex> lk(impl_->mtx);
@@ -618,8 +647,10 @@ bool SamplerPool::sample_step(const std::vector<const float*>& logits, int n_voc
     });
     g_prof_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count();
     if (++g_prof_n % 512 == 0) {
-        std::fprintf(stderr, "[prof2] sort=%.1f ms/step  wait(tail)=%.1f ms/step\n",
-                     1000.0 * g_prof_sort / g_prof_n, 1000.0 * g_prof_wait / g_prof_n);
+        // Since the per-group restructure the wait covers each group's
+        // narrow+H2D+sort AND its tail (they pipeline against each other).
+        std::fprintf(stderr, "[prof2] wait(sort+tail)=%.1f ms/step\n",
+                     1000.0 * g_prof_wait / g_prof_n);
         std::fflush(stderr);
     }
     return impl_->step_ok;

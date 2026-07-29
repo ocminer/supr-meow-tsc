@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <thread>
 #include <cstdlib>
+#include <mutex>
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
@@ -534,6 +535,39 @@ extern "C" bool pow_gpu_bind_device(int cuda_ordinal) {
     return cudaSetDevice(cuda_ordinal) == cudaSuccess;
 }
 
+// Process-global pinned registration of the (single) llama logits buffer.
+// With per-group sorting, 12 worker threads DMA from slices of the SAME
+// buffer; the per-thread cudaHostRegister below would race — one thread wins,
+// the rest see AlreadyRegistered, mark themselves failed and fall back to a
+// pointless staging memcpy forever. The pool registers the full range ONCE up
+// front; threads whose source lies inside it skip registration entirely.
+namespace {
+std::mutex     g_hostreg_mtx;
+const uint8_t* g_hostreg_base = nullptr;
+size_t         g_hostreg_size = 0;
+}
+extern "C" bool pow_gpu_register_host_range(const void* p, size_t bytes) {
+    std::lock_guard<std::mutex> lk(g_hostreg_mtx);
+    if (g_hostreg_base == static_cast<const uint8_t*>(p) && g_hostreg_size >= bytes) return true;
+    if (g_hostreg_base) {
+        cudaHostUnregister(const_cast<uint8_t*>(g_hostreg_base));
+        g_hostreg_base = nullptr; g_hostreg_size = 0;
+    }
+    if (cudaHostRegister(const_cast<void*>(p), bytes, cudaHostRegisterPortable) == cudaSuccess) {
+        g_hostreg_base = static_cast<const uint8_t*>(p); g_hostreg_size = bytes;
+        std::fprintf(stderr, "[pow-gpu] logits page-locked globally (%zu MB) — DMA H2D\n", bytes >> 20);
+        std::fflush(stderr);
+        return true;
+    }
+    cudaGetLastError();
+    return false;
+}
+static bool pow_gpu_host_range_covered(const void* p, size_t bytes) {
+    std::lock_guard<std::mutex> lk(g_hostreg_mtx);
+    const auto* q = static_cast<const uint8_t*>(p);
+    return g_hostreg_base && q >= g_hostreg_base && q + bytes <= g_hostreg_base + g_hostreg_size;
+}
+
 // Truncated-copy variant under debug: identical sort/stats, but only the top
 // `topk` ranks of idx+val ride back to the host (the CPU tail reads no further
 // when GPU stats are valid). This is the version that hung in the miner.
@@ -582,11 +616,16 @@ extern "C" bool pow_gpu_sort_and_stats_batched_k(
         static thread_local const void* reg_base = nullptr;
         static thread_local size_t      reg_size = 0;
         static thread_local int         reg_state = 0;   // 0=untried 1=ok -1=failed
+        // Slice already inside the globally registered llama buffer? Then it
+        // is DMA-ready — no per-thread registration, no staging fallback.
+        const bool glob_reg = pow_gpu_host_range_covered(h_logits[0], sizeof(float)*(size_t)total);
+        if (glob_reg) reg_state = 1;
         // Try registration ONCE. The failed branch used to re-fire every step
         // (reg_base stays null, so `reg_base != h_logits[0]` was always true):
         // 1687 retries, each walking 29 MB of pages inside the driver before
         // failing — the hidden ~9 ms/step that no GPU event could see.
-        if (reg_state == 0 || (reg_state > 0 && reg_base != (const void*)h_logits[0])) {
+        if (!glob_reg &&
+            (reg_state == 0 || (reg_state > 0 && reg_base != (const void*)h_logits[0]))) {
             if (reg_base) { cudaHostUnregister(const_cast<void*>(reg_base)); reg_base = nullptr; }
             const cudaError_t rc = cudaHostRegister(const_cast<float*>(h_logits[0]),
                                                     sizeof(float)*(size_t)total,
