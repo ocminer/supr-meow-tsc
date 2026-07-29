@@ -518,6 +518,66 @@ PATCHES = [
         "        pretemp_desc_.resize(n_vocab);\n"
         "        for (int i = 0; i < n_vocab; ++i) pretemp_desc_[i] = { working_logits[i], i };\n",
     ),
+    (
+        "pow_utils.cpp",
+        # PROFILE-DIRECTED (perf round 2, post-pipelining): 10.9% of process
+        # time was memset — these three zero-fills are DEAD STORES. Every path
+        # fully overwrites before any read: logits_ in step 2's scale/copy,
+        # probs_ in every branch of step 7 (fill+set, or every-element write),
+        # cdf_ in both branches of step 8. keep_ zeroing STAYS — the dense
+        # top-k branch writes only the survivors' 1s and relies on it.
+        "    } else {\n"
+        "        std::fill(logits_.begin(), logits_.begin() + n_vocab, 0.0f);\n"
+        "        std::fill(probs_.begin(),  probs_.begin()  + n_vocab, 0.0f);\n"
+        "        std::fill(cdf_.begin(),    cdf_.begin()    + n_vocab, 0.0f);\n"
+        "        pretemp_desc_.clear();\n"
+        "        keep_.assign(n_vocab, 0u);\n"
+        "    }\n",
+        "    } else {\n"
+        "        // logits_/probs_/cdf_ zero-fills removed: dead stores — every\n"
+        "        // path fully overwrites them before any read (perf: 10.9%).\n"
+        "        pretemp_desc_.clear();\n"
+        "        keep_.assign(n_vocab, 0u);\n"
+        "    }\n",
+    ),
+    (
+        "pow_utils.cpp",
+        # PROFILE-DIRECTED (perf round 2): 9.9% memmove — snapped_logits was a
+        # per-token 600 KB LOCAL vector: allocate, copy raw, snap in place =
+        # 2.4 MB of traffic plus an alloc/free per token. Fuse to ONE
+        # read-raw/write-snapped pass into a member scratch buffer (1.2 MB,
+        # no allocation). Same snap formula, bit-identical values.
+        "    std::vector<float> snapped_logits;\n"
+        "    const float* working_logits = raw_logits;\n"
+        "    \n"
+        "    if (compute_precision != \"fp32\" && !compute_precision.empty()) {\n"
+        "        snapped_logits.assign(raw_logits, raw_logits + n_vocab);\n"
+        "        snap_logits_to_precision_inplace(snapped_logits.data(), n_vocab, compute_precision);\n"
+        "        working_logits = snapped_logits.data();\n"
+        "    }    \n",
+        "    const float* working_logits = raw_logits;\n"
+        "    if (compute_precision == \"bf16\") {\n"
+        "        if ((int)snapped_scratch_.size() < n_vocab) snapped_scratch_.resize(n_vocab);\n"
+        "        const uint32_t* sin  = reinterpret_cast<const uint32_t*>(raw_logits);\n"
+        "        uint32_t*       sout = reinterpret_cast<uint32_t*>(snapped_scratch_.data());\n"
+        "        for (int i = 0; i < n_vocab; ++i) {\n"
+        "            const uint32_t x = sin[i];\n"
+        "            sout[i] = (x + (0x00007FFFu + ((x >> 16) & 1u))) & 0xFFFF0000u;\n"
+        "        }\n"
+        "        working_logits = snapped_scratch_.data();\n"
+        "    } else if (compute_precision != \"fp32\" && !compute_precision.empty()) {\n"
+        "        if ((int)snapped_scratch_.size() < n_vocab) snapped_scratch_.resize(n_vocab);\n"
+        "        std::copy(raw_logits, raw_logits + n_vocab, snapped_scratch_.begin());\n"
+        "        snap_logits_to_precision_inplace(snapped_scratch_.data(), n_vocab, compute_precision);\n"
+        "        working_logits = snapped_scratch_.data();\n"
+        "    }\n",
+    ),
+    (
+        "pow_utils.h",
+        "    bool                  gpu_stats_valid_ = false;",
+        "    bool                  gpu_stats_valid_ = false;\n"
+        "    std::vector<float>    snapped_scratch_;  // fused snap output (member: no per-token alloc)",
+    ),
 ]
 
 def main(stage_dir: str) -> int:
