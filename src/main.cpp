@@ -430,10 +430,11 @@ int main(int argc, char** argv) {
 
                 std::string gerr;
                 const int n = engine.generate_windows_stepwise(worker, prompts,
-                    [&](const std::vector<const float*>& all, int n_vocab,
+                    [&](const std::vector<const float*>& all, const float* dev,
+                        int n_vocab,
                         const std::vector<std::vector<int64_t>>& ctx,
                         std::vector<int>& out) -> bool {
-                        return pool.sample_step(all, n_vocab, ctx, out);
+                        return pool.sample_step(all, dev, n_vocab, ctx, out);
                     }, gerr);
                 if (n < 0) {
                     std::fprintf(stderr, "  window failed (worker %d): %s\n", worker, gerr.c_str());

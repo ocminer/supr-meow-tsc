@@ -1,0 +1,102 @@
+diff --git a/include/llama.h b/include/llama.h
+index a84d56a..75e33cd 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -977,6 +977,17 @@ extern "C" {
+     // returns NULL for invalid ids.
+     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+ 
++    // supr-meow-tsc GPU-resident-logits extension (additive, default-off).
++    // Skip the device->host logits copy on subsequent decodes; the caller
++    // consumes logits directly on the device. While enabled, the host
++    // llama_get_logits*() contents are STALE for those decodes.
++    LLAMA_API void llama_set_skip_logits_copy(struct llama_context * ctx, bool skip);
++    // Device data pointer of the last decode's logits output tensor, or NULL
++    // when unavailable (multi-ubatch batch, no output rows). Rows are in
++    // output order, n_vocab floats each. Valid only until the next
++    // llama_decode on this context. Synchronizes the context first.
++    LLAMA_API void * llama_get_logits_device(struct llama_context * ctx, int32_t * n_outputs);
++
+     // Get all output token embeddings.
+     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
+     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index d050604..c5c4afd 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1630,8 +1630,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             t_embd = res->get_embd_pooled();
+         }
+ 
++        // supr-meow-tsc: expose the device-side logits of a SINGLE-ubatch
++        // decode. A second ubatch invalidates — only the last ubatch's
++        // tensor would survive, which is not the whole batch.
++        if (n_outputs_prev == 0) {
++            t_logits_dev  = (t_logits && n_outputs > 0) ? t_logits->data : nullptr;
++            n_outputs_dev = (t_logits && n_outputs > 0) ? (int32_t) n_outputs : 0;
++        } else {
++            t_logits_dev  = nullptr;
++            n_outputs_dev = 0;
++        }
++
+         // extract logits
+-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
++        if (logits.data && t_logits && n_outputs > 0 && !skip_logits_copy && needs_raw_logits(ubatch, sampling.samplers)) {
+             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+             GGML_ASSERT(backend_res != nullptr);
+             GGML_ASSERT(logits.data != nullptr);
+@@ -2965,6 +2976,28 @@ float * llama_get_logits(llama_context * ctx) {
+     return ctx->get_logits();
+ }
+ 
++// supr-meow-tsc GPU-resident logits (see llama.h)
++void llama_context::set_skip_logits_copy(bool value) {
++    skip_logits_copy = value;
++}
++
++void * llama_context::get_logits_device(int32_t * n_out) {
++    if (n_out) {
++        *n_out = n_outputs_dev;
++    }
++    return n_outputs_dev > 0 ? t_logits_dev : nullptr;
++}
++
++void llama_set_skip_logits_copy(llama_context * ctx, bool skip) {
++    ctx->set_skip_logits_copy(skip);
++}
++
++void * llama_get_logits_device(llama_context * ctx, int32_t * n_outputs) {
++    ctx->synchronize();
++
++    return ctx->get_logits_device(n_outputs);
++}
++
+ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index e0d0085..84de2de 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -102,6 +102,8 @@ struct llama_context {
+     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
+ 
+     void set_embeddings (bool value);
++    void set_skip_logits_copy(bool value);         // supr-meow-tsc
++    void * get_logits_device(int32_t * n_out);     // supr-meow-tsc
+     void set_causal_attn(bool value);
+     void set_warmup(bool value);
+ 
+@@ -300,6 +302,12 @@ private:
+ 
+     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
+ 
++    // supr-meow-tsc GPU-resident logits (see llama.h): optional skip of the
++    // logits D2H plus the device pointer of the last single-ubatch decode.
++    bool    skip_logits_copy = false;
++    void *  t_logits_dev     = nullptr;
++    int32_t n_outputs_dev    = 0;   // 0 => t_logits_dev invalid
++
+     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
+ 
+     struct swap_info {

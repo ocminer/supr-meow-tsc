@@ -110,7 +110,11 @@ public:
     // must fill `out_tokens` (one per stream). The decode itself stays
     // single-threaded on this device (batched), so nothing in llama is shared
     // across threads.
+    // `dev_logits` is non-null in GPU-resident-logits mode: the DEVICE base of
+    // llama's output tensor (S contiguous rows of n_vocab floats, stream
+    // order). The host `logits` pointers are then STALE and must not be read.
     using StepSampler = std::function<bool(const std::vector<const float*>& logits,
+                                           const float* dev_logits,
                                            int n_vocab,
                                            const std::vector<std::vector<int64_t>>& ctx,
                                            std::vector<int>& out_tokens)>;

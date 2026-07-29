@@ -362,6 +362,58 @@ __global__ void k_unpack_flat(const uint64_t* __restrict__ keys,
     }
 }
 
+// ---------------------------------------------------------------------------
+// GPU-resident-logits variants: the input is llama's own DEVICE output tensor
+// (read-only — the next decode reuses that memory, and nothing may write it).
+// The bf16 snap therefore happens IN REGISTERS, fused into pack and the
+// unpack gather. Bit-identical to snapping a copy first: same RNE formula,
+// and transform_val() of the snapped value gives the same key bits.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float snap_bf16_reg(float v) {
+    uint32_t x = __float_as_uint(v);
+    x = (x + (0x00007FFFu + ((x >> 16) & 1u))) & 0xFFFF0000u;
+    return __uint_as_float(x);
+}
+
+__global__ void k_pack_flat_snap(const float* __restrict__ vals, uint64_t* __restrict__ keys,
+                                 int n, int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        const uint64_t seg = static_cast<uint64_t>(i / n);
+        const uint64_t idx = static_cast<uint64_t>(i % n);
+        const float sv = snap_bf16_reg(vals[i]);
+        keys[i] = (seg << 50) | (static_cast<uint64_t>(transform_val(sv)) << 18) | idx;
+    }
+}
+
+__global__ void k_unpack_flat_snap(const uint64_t* __restrict__ keys,
+                                   const float*    __restrict__ vals,
+                                   uint32_t*       __restrict__ idx_out,
+                                   float*          __restrict__ val_out,
+                                   int n, int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        const int seg = static_cast<int>(keys[i] >> 50);
+        const uint32_t id = static_cast<uint32_t>(keys[i] & 0x3FFFFULL);
+        idx_out[i] = id;
+        val_out[i] = snap_bf16_reg(vals[static_cast<size_t>(seg) * n + id]);
+    }
+}
+
+// The 20 telemetry probes (reference: working_logits[i*(n/20)], snapped) —
+// gathered here because in device mode no host copy of the logits exists.
+__global__ void k_probes_snap(const float* __restrict__ vals, int S, int n,
+                              float* __restrict__ out /* [S][20] */) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;   // S*20 threads
+    if (i < S * 20) {
+        const int s = i / 20;
+        const int p = i % 20;
+        const int step = n / 20 > 0 ? n / 20 : 1;
+        const size_t idx = static_cast<size_t>(p) * step;
+        out[i] = (idx < (size_t)n) ? snap_bf16_reg(vals[(size_t)s * n + idx]) : 0.0f;
+    }
+}
+
 __global__ void k_unpack_seg(const uint64_t* __restrict__ keys,
                              const float*    __restrict__ vals,
                              uint32_t*       __restrict__ idx_out,
@@ -419,6 +471,7 @@ struct BatchScratch {
     float*    d_sorted = nullptr;
     float*    d_heads = nullptr;
     double*   d_stats = nullptr;
+    float*    d_probes = nullptr;   // [S][20] telemetry probes (device-logits mode)
     int*      d_offs = nullptr;
     void*     d_temp = nullptr;
     size_t    temp_bytes = 0;
@@ -438,6 +491,7 @@ struct BatchScratch {
                && cudaMalloc(&d_sorted, sizeof(float)*total) == cudaSuccess
                && cudaMalloc(&d_heads, sizeof(float)*S) == cudaSuccess
                && cudaMalloc(&d_stats, sizeof(double)*6*S) == cudaSuccess
+               && cudaMalloc(&d_probes, sizeof(float)*20*S) == cudaSuccess
                && cudaMalloc(&d_offs, sizeof(int)*(S+1)) == cudaSuccess
                && (stream || cudaStreamCreate(&stream) == cudaSuccess);
         if (ok) {
@@ -465,10 +519,10 @@ struct BatchScratch {
     }
     void release() {
         for (void* p : {(void*)d_vals,(void*)d_wire,(void*)d_keys_in,(void*)d_keys_out,(void*)d_idx,
-                        (void*)d_sorted,(void*)d_heads,(void*)d_stats,(void*)d_offs,(void*)d_temp})
+                        (void*)d_sorted,(void*)d_heads,(void*)d_stats,(void*)d_probes,(void*)d_offs,(void*)d_temp})
             if (p) cudaFree(p);
         d_vals=nullptr; d_wire=nullptr; d_keys_in=nullptr; d_keys_out=nullptr; d_idx=nullptr;
-        d_sorted=nullptr; d_heads=nullptr; d_stats=nullptr; d_offs=nullptr; d_temp=nullptr;
+        d_sorted=nullptr; d_heads=nullptr; d_stats=nullptr; d_probes=nullptr; d_offs=nullptr; d_temp=nullptr;
         temp_bytes=0; cap_total=0; cap_seg=0;
     }
 };
@@ -476,8 +530,11 @@ thread_local BatchScratch g_batch;
 
 // Thread-local injection: the sampler's patched sort block consumes ONE
 // pre-sorted result instead of launching, then the slot auto-clears.
+// `probes` is non-null only in device-logits mode: the sampler then has NO
+// valid host copy of the logits and must take telemetry probes from here.
 struct Injected { const uint32_t* idx = nullptr; const float* val = nullptr;
-                  const double* stats = nullptr; float head = 0.0f; int count = 0; };
+                  const double* stats = nullptr; float head = 0.0f; int count = 0;
+                  const float* probes = nullptr; int probe_n = 0; };
 thread_local Injected g_inj;
 thread_local double p_stage = 0, p_issue = 0, p_gpu = 0;
 thread_local uint64_t p_n = 0;
@@ -520,13 +577,84 @@ extern "C" bool pow_gpu_sort_and_stats_batched(
 extern "C" void pow_gpu_inject_presorted(const uint32_t* idx, const float* val,
                                           const double* stats, float head, int count) {
     g_inj.idx = idx; g_inj.val = val; g_inj.stats = stats; g_inj.head = head; g_inj.count = count;
+    g_inj.probes = nullptr; g_inj.probe_n = 0;
+}
+extern "C" void pow_gpu_inject_presorted2(const uint32_t* idx, const float* val,
+                                          const double* stats, float head, int count,
+                                          const float* probes, int probe_n) {
+    g_inj.idx = idx; g_inj.val = val; g_inj.stats = stats; g_inj.head = head; g_inj.count = count;
+    g_inj.probes = probes; g_inj.probe_n = probe_n;
+}
+// The sampler asks this BEFORE its host-side snap: with probes injected there
+// is no valid host logits array and the snap must be skipped entirely.
+extern "C" bool pow_gpu_peek_presorted_probes(void) {
+    return g_inj.idx != nullptr && g_inj.probes != nullptr;
 }
 extern "C" bool pow_gpu_take_presorted(const uint32_t** idx, const float** val,
                                        const double** stats, float* head, int* count) {
     if (!g_inj.idx) return false;
     *idx = g_inj.idx; *val = g_inj.val; *stats = g_inj.stats; *head = g_inj.head; *count = g_inj.count;
     g_inj.idx = nullptr; g_inj.val = nullptr; g_inj.stats = nullptr;
+    g_inj.probes = nullptr; g_inj.probe_n = 0;
     return true;
+}
+extern "C" bool pow_gpu_take_presorted2(const uint32_t** idx, const float** val,
+                                        const double** stats, float* head, int* count,
+                                        const float** probes, int* probe_n) {
+    if (!g_inj.idx) return false;
+    *idx = g_inj.idx; *val = g_inj.val; *stats = g_inj.stats; *head = g_inj.head; *count = g_inj.count;
+    *probes = g_inj.probes; *probe_n = g_inj.probe_n;
+    g_inj.idx = nullptr; g_inj.val = nullptr; g_inj.stats = nullptr;
+    g_inj.probes = nullptr; g_inj.probe_n = 0;
+    return true;
+}
+
+// True iff p is a CUDA device pointer (the engine verifies llama's tensor
+// really lives on the GPU before enabling device-logits mode).
+extern "C" bool pow_gpu_is_device_ptr(const void* p) {
+    cudaPointerAttributes attr{};
+    if (cudaPointerGetAttributes(&attr, p) != cudaSuccess) { cudaGetLastError(); return false; }
+    return attr.type == cudaMemoryTypeDevice;
+}
+
+// ==========================================================================
+// Device-input sort: identical outputs to pow_gpu_sort_and_stats_batched_k,
+// but the logits never touch the host — d_logits is llama's own output
+// tensor (S contiguous rows of n floats, read-only). No narrow, no H2D; the
+// bf16 snap runs in registers inside pack/unpack. Additionally returns the
+// 20 telemetry probes per stream, since no host copy exists to read them.
+// ==========================================================================
+extern "C" bool pow_gpu_sort_and_stats_device_k(
+        const float* d_logits, int S, int n, int topk, float inv_temp,
+        uint32_t* h_idx /* [S*topk] */, float* h_val /* [S*topk] */,
+        float* h_head /* [S] */, double* h_stats /* [S*6] */,
+        float* h_probes /* [S*20] */) {
+    if (!d_logits || S < 1 || n < 1) return false;
+    if (topk < 1 || topk > n) topk = n;
+    if (S > 64 || n > (1 << 18)) return false;   // flat combined-key limits
+    if (!g_batch.ensure(S, n)) return false;
+    auto& b = g_batch;
+    const int total = S * n;
+    const int T = 256, G = (total + T - 1) / T;
+    k_pack_flat_snap<<<G, T, 0, b.stream>>>(d_logits, b.d_keys_in, n, total);
+    cub::DeviceRadixSort::SortKeys(b.d_temp, b.temp_bytes, b.d_keys_in, b.d_keys_out,
+                                   total, 0, 56, b.stream);
+    k_unpack_flat_snap<<<G, T, 0, b.stream>>>(b.d_keys_out, d_logits, b.d_idx, b.d_sorted, n, total);
+    if (cudaMemcpy2DAsync(b.d_heads, sizeof(float), b.d_sorted, sizeof(float)*(size_t)n,
+                          sizeof(float), S, cudaMemcpyDeviceToDevice, b.stream) != cudaSuccess)
+        return false;
+    if (cudaMemsetAsync(b.d_stats, 0, sizeof(double)*6*S, b.stream) != cudaSuccess) return false;
+    dim3 grid(64, S);
+    k_stats_seg<<<grid, 256, 0, b.stream>>>(b.d_sorted, n, inv_temp, b.d_heads, b.d_stats);
+    k_probes_snap<<<(S*20 + 63)/64, 64, 0, b.stream>>>(d_logits, S, n, b.d_probes);
+    bool ok = cudaMemcpy2DAsync(h_idx, sizeof(uint32_t)*topk, b.d_idx, sizeof(uint32_t)*(size_t)n,
+                                sizeof(uint32_t)*topk, S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
+           && cudaMemcpy2DAsync(h_val, sizeof(float)*topk, b.d_sorted, sizeof(float)*(size_t)n,
+                                sizeof(float)*topk, S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
+           && cudaMemcpyAsync(h_head, b.d_heads, sizeof(float)*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
+           && cudaMemcpyAsync(h_stats, b.d_stats, sizeof(double)*6*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
+           && cudaMemcpyAsync(h_probes, b.d_probes, sizeof(float)*20*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess;
+    return ok && cudaStreamSynchronize(b.stream) == cudaSuccess && cudaGetLastError() == cudaSuccess;
 }
 
 // Bind the calling thread's CUDA context to a device — each mining thread

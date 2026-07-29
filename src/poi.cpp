@@ -262,6 +262,12 @@ extern "C" bool pow_gpu_sort_and_stats_batched_k(
         uint32_t* h_idx, float* h_val, float* h_head, double* h_stats);
 extern "C" void pow_gpu_inject_presorted(const uint32_t* idx, const float* val,
                                           const double* stats, float head, int count);
+extern "C" void pow_gpu_inject_presorted2(const uint32_t* idx, const float* val,
+                                          const double* stats, float head, int count,
+                                          const float* probes, int probe_n);
+extern "C" bool pow_gpu_sort_and_stats_device_k(
+        const float* d_logits, int S, int n, int topk, float inv_temp,
+        uint32_t* h_idx, float* h_val, float* h_head, double* h_stats, float* h_probes);
 extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 extern "C" bool pow_gpu_register_host_range(const void* p, size_t bytes);
 #else
@@ -465,6 +471,7 @@ struct SamplerPool::Impl {
 
     // Inputs valid for the current generation (owned by the mining thread).
     const std::vector<const float*>*            in_logits = nullptr;
+    const float*                                in_dev = nullptr;   // device base (GPU-resident mode)
     int                                         in_nvocab = 0;
     const std::vector<std::vector<int64_t>>*    in_ctx = nullptr;
     std::vector<int>*                           out_tokens = nullptr;
@@ -472,13 +479,16 @@ struct SamplerPool::Impl {
     // turned the "async" D2H into a 10.5 ms/step synchronous stall.
     uint32_t* sort_idx = nullptr; float* sort_val = nullptr;
     float* sort_head = nullptr; double* sort_stats = nullptr;
+    float* sort_probes = nullptr;   // [S][20] pinned (GPU-resident mode)
     size_t sort_cap = 0; int sort_S = 0;
     int sort_stride = 0; bool sort_ok = false;
     bool reg_done = false;   // llama logits block page-locked (once)
     void free_sort_bufs() {
         pow_gpu_host_free(sort_idx);  pow_gpu_host_free(sort_val);
         pow_gpu_host_free(sort_head); pow_gpu_host_free(sort_stats);
+        pow_gpu_host_free(sort_probes);
         sort_idx = nullptr; sort_val = nullptr; sort_head = nullptr; sort_stats = nullptr;
+        sort_probes = nullptr;
         sort_cap = 0; sort_S = 0;
     }
     bool ensure_sort_bufs(int S, int K) {
@@ -489,7 +499,8 @@ struct SamplerPool::Impl {
         sort_val   = (float*)   pow_gpu_host_alloc(sizeof(float) * need);
         sort_head  = (float*)   pow_gpu_host_alloc(sizeof(float) * (size_t)S);
         sort_stats = (double*)  pow_gpu_host_alloc(sizeof(double) * 6 * (size_t)S);
-        if (!sort_idx || !sort_val || !sort_head || !sort_stats) { free_sort_bufs(); return false; }
+        sort_probes= (float*)   pow_gpu_host_alloc(sizeof(float) * 20 * (size_t)S);
+        if (!sort_idx || !sort_val || !sort_head || !sort_stats || !sort_probes) { free_sort_bufs(); return false; }
         sort_cap = need; sort_S = S;
         return true;
     }
@@ -518,6 +529,7 @@ struct SamplerPool::Impl {
             seen = gen;
             const auto lo = range[g].first, hi = range[g].second;
             const auto* logits = in_logits;
+            const float* dev   = in_dev;
             const int   nvoc   = in_nvocab;
             const auto* ctx     = in_ctx;
             auto*       out     = out_tokens;
@@ -529,26 +541,50 @@ struct SamplerPool::Impl {
             // B's H2D+sort is still in flight, and the 0.5 ms AVX2 narrowing
             // parallelizes across all groups for free. The former central
             // sort serialized the whole step: sort(48) THEN all tails.
+            // GPU-resident mode (dev != null): the slice is read straight from
+            // llama's device tensor — no narrowing, no H2D at all.
             bool ok = true;
             bool gsort = false;
             const int K = sort_stride;
 #ifdef POW_GPU_SORT_ENABLED
-            if (sort_ok && K > 0)
-                gsort = pow_gpu_sort_and_stats_batched_k(
-                    logits->data() + lo, hi - lo, nvoc, K, 1.0f, 1,
-                    sort_idx  + (size_t)lo * K,
-                    sort_val  + (size_t)lo * K,
-                    sort_head + lo,
-                    sort_stats + (size_t)lo * 6);
+            if (sort_ok && K > 0) {
+                if (dev)
+                    gsort = pow_gpu_sort_and_stats_device_k(
+                        dev + (size_t)lo * nvoc, hi - lo, nvoc, K, 1.0f,
+                        sort_idx  + (size_t)lo * K,
+                        sort_val  + (size_t)lo * K,
+                        sort_head + lo,
+                        sort_stats + (size_t)lo * 6,
+                        sort_probes + (size_t)lo * 20);
+                else
+                    gsort = pow_gpu_sort_and_stats_batched_k(
+                        logits->data() + lo, hi - lo, nvoc, K, 1.0f, 1,
+                        sort_idx  + (size_t)lo * K,
+                        sort_val  + (size_t)lo * K,
+                        sort_head + lo,
+                        sort_stats + (size_t)lo * 6);
+            }
 #endif
+            if (dev && !gsort) {
+                // No host fallback exists in device mode — the host logits are
+                // stale. Fail the step (aborts the window batch) rather than
+                // sample garbage.
+                std::lock_guard<std::mutex> lk2(mtx);
+                step_ok = false;
+                done[g] = seen;
+                cv_done.notify_one();
+                continue;
+            }
             for (int s = lo; s < hi && ok; ++s) {
                 const int local = s - lo;
                 if (gsort)
-                    pow_gpu_inject_presorted(sort_idx + (size_t)s * K,
-                                             sort_val + (size_t)s * K,
-                                             sort_stats + (size_t)s * 6,
-                                             sort_head[s], K);
-                const int tok = miners[g]->on_logits(local, (*logits)[s], nvoc,
+                    pow_gpu_inject_presorted2(sort_idx + (size_t)s * K,
+                                              sort_val + (size_t)s * K,
+                                              sort_stats + (size_t)s * 6,
+                                              sort_head[s], K,
+                                              dev ? sort_probes + (size_t)s * 20 : nullptr,
+                                              dev ? 20 : 0);
+                const int tok = miners[g]->on_logits(local, dev ? nullptr : (*logits)[s], nvoc,
                                                      (*ctx)[s], 1.0f, 50, 1.0f);
                 if (tok < 0) ok = false; else (*out)[s] = tok;
             }
@@ -605,7 +641,8 @@ std::string SamplerPool::job_id() const {
     return impl_->miners.empty() ? std::string() : impl_->miners[0]->job_id();
 }
 
-bool SamplerPool::sample_step(const std::vector<const float*>& logits, int n_vocab,
+bool SamplerPool::sample_step(const std::vector<const float*>& logits,
+                              const float* dev_logits, int n_vocab,
                               const std::vector<std::vector<int64_t>>& ctx,
                               std::vector<int>& out_tokens) {
     {
@@ -616,10 +653,10 @@ bool SamplerPool::sample_step(const std::vector<const float*>& logits, int n_voc
         // sort_ok now means "receive buffers ready"; the sort itself moved
         // into the worker groups (each sorts its own slice — see worker()).
         impl_->sort_ok = true;
-        // ONCE: page-lock llama's whole logits block so every group's slice
-        // copy is straight DMA. Done here (not per worker) because 12 threads
-        // registering overlapping slices of one buffer race and lose.
-        if (!impl_->reg_done) {
+        // ONCE (host mode only): page-lock llama's whole logits block so every
+        // group's slice copy is straight DMA. Done here (not per worker)
+        // because 12 threads registering overlapping slices race and lose.
+        if (!dev_logits && !impl_->reg_done) {
             bool contig = true;
             for (int s = 1; s < S; ++s)
                 if (logits[s] != logits[0] + (size_t)s * n_vocab) { contig = false; break; }
@@ -631,6 +668,7 @@ bool SamplerPool::sample_step(const std::vector<const float*>& logits, int n_voc
     {
         std::lock_guard<std::mutex> lk(impl_->mtx);
         impl_->in_logits  = &logits;
+        impl_->in_dev     = dev_logits;
         impl_->in_nvocab  = n_vocab;
         impl_->in_ctx     = &ctx;
         impl_->out_tokens = &out_tokens;

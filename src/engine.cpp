@@ -4,8 +4,15 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+
+#ifdef POW_GPU_SORT_ENABLED
+extern "C" bool pow_gpu_is_device_ptr(const void* p);
+#else
+static inline bool pow_gpu_is_device_ptr(const void*) { return false; }
+#endif
 
 namespace meow {
 
@@ -319,17 +326,53 @@ int InferenceEngine::generate_windows_stepwise(int device_slot,
 
     llama_batch nb = llama_batch_init(S, 0, S);
     double t_sample = 0.0, t_decode = 0.0;   // per-window phase timers
+    // GPU-resident logits: from step 1 on, every consumed logits row comes
+    // from THIS window's generation decodes (S rows, one ubatch, stream
+    // order), so llama's device output tensor can be read directly and the
+    // 29 MB D2H + host narrowing + H2D disappear. Step 0 consumes the PROMPT
+    // pass logits (scattered rows, possibly multi-ubatch) and stays on the
+    // host path. Verified once per window; POW_GPU_DEVICE_LOGITS=0 disables.
+    static const bool want_dev_logits = [](){
+        const char* e = std::getenv("POW_GPU_DEVICE_LOGITS");
+        return !(e && *e == '0');
+    }();
+    bool dev_mode = false;   // becomes true once the device pointer verifies
     for (int step_i = 0; step_i < cfg_.window_tokens; ++step_i) {
         nb.n_tokens = 0;
         std::vector<const float*> all_logits(S, nullptr);
-        for (int s = 0; s < S; ++s) {
-            all_logits[s] = llama_get_logits_ith(in.ctx, last_row[s]);
-            if (!all_logits[s]) { llama_batch_free(nb); error = "no logits returned"; return -1; }
+        const float* dev_logits = nullptr;
+        if (want_dev_logits && step_i > 0) {
+            int32_t ndev = 0;
+            void* p = llama_get_logits_device(in.ctx, &ndev);   // synchronizes
+            if (p && ndev == S && (dev_mode || pow_gpu_is_device_ptr(p))) {
+                dev_logits = static_cast<const float*>(p);
+                if (!dev_mode) {
+                    dev_mode = true;
+                    llama_set_skip_logits_copy(in.ctx, true);
+                    static bool once = false;
+                    if (!once) { once = true;
+                        std::fprintf(stderr, "[engine] GPU-resident logits ACTIVE — llama D2H skipped from step 2 on\n"); }
+                }
+            } else if (dev_mode) {
+                // The pointer verified before but is gone now — the host copy
+                // was skipped, so there is nothing valid to fall back to.
+                llama_batch_free(nb);
+                llama_set_skip_logits_copy(in.ctx, false);
+                error = "device logits vanished mid-window"; return -1;
+            }
+        }
+        if (!dev_logits) {
+            for (int s = 0; s < S; ++s) {
+                all_logits[s] = llama_get_logits_ith(in.ctx, last_row[s]);
+                if (!all_logits[s]) { llama_batch_free(nb); error = "no logits returned"; return -1; }
+            }
         }
         const auto t0 = std::chrono::steady_clock::now();
         std::vector<int> chosen(S, -1);
-        if (!step(all_logits, n_vocab, ctxv, chosen)) {
-            llama_batch_free(nb); error = "sampler step failed"; return -1;
+        if (!step(all_logits, dev_logits, n_vocab, ctxv, chosen)) {
+            llama_batch_free(nb);
+            if (dev_mode) llama_set_skip_logits_copy(in.ctx, false);
+            error = "sampler step failed"; return -1;
         }
         t_sample += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         for (int s = 0; s < S; ++s) {
@@ -344,9 +387,16 @@ int InferenceEngine::generate_windows_stepwise(int device_slot,
             last_row[s] = r;
         }
         const auto t1 = std::chrono::steady_clock::now();
-        if (llama_decode(in.ctx, nb) != 0) { llama_batch_free(nb); error = "decode failed mid-window"; return -1; }
+        if (llama_decode(in.ctx, nb) != 0) {
+            llama_batch_free(nb);
+            if (dev_mode) llama_set_skip_logits_copy(in.ctx, false);
+            error = "decode failed mid-window"; return -1;
+        }
         t_decode += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     }
+    // Restore the D2H for the next window's prompt pass (its logits rows are
+    // consumed through the host path at step 0).
+    if (dev_mode) llama_set_skip_logits_copy(in.ctx, false);
     // One line per completed window batch (~every 5-15 s): per-step phase cost
     // and the implied throughput. Direct measurement — immune to the job-churn
     // noise that plagues delta-counting the windows counter.

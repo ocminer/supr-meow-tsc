@@ -578,6 +578,177 @@ PATCHES = [
         "    bool                  gpu_stats_valid_ = false;\n"
         "    std::vector<float>    snapped_scratch_;  // fused snap output (member: no per-token alloc)",
     ),
+    # ================= GPU-resident logits (device-logits mode) =============
+    # llama's D2H of the logits is skipped and the sampler consumes ONLY the
+    # injected sort results. The injection slot carries the 20 telemetry
+    # probes as the mode marker; every read of the (stale) host logits is
+    # gated off. Bit-exactness: survivor values and rank-0 argmax come from
+    # the sorted prefix, whose entries ARE the snapped working values.
+    (
+        "pow_utils.cpp",
+        "extern \"C\" bool pow_gpu_take_presorted(const uint32_t** idx, const float** val, const double** stats, float* head, int* count);\n",
+        "extern \"C\" bool pow_gpu_take_presorted(const uint32_t** idx, const float** val, const double** stats, float* head, int* count);\n"
+        "extern \"C\" bool pow_gpu_take_presorted2(const uint32_t** idx, const float** val, const double** stats, float* head, int* count, const float** probes, int* probe_n);\n"
+        "extern \"C\" bool pow_gpu_peek_presorted_probes(void);\n",
+    ),
+    (
+        "pow_utils.cpp",
+        "    const float* working_logits = raw_logits;\n"
+        "    if (compute_precision == \"bf16\") {\n",
+        "    const float* working_logits = raw_logits;\n"
+        "#ifdef POW_GPU_SORT_ENABLED\n"
+        "    // Device-logits mode: raw_logits is a STALE host pointer (llama's\n"
+        "    // D2H was skipped); snapping 152k stale floats would be garbage AND\n"
+        "    // wasted work. Probes present in the injection slot mark the mode.\n"
+        "    const bool dev_logits_mode = pow_gpu_peek_presorted_probes();\n"
+        "#else\n"
+        "    const bool dev_logits_mode = false;\n"
+        "#endif\n"
+        "    if (!dev_logits_mode && compute_precision == \"bf16\") {\n",
+    ),
+    (
+        "pow_utils.cpp",
+        "    } else if (compute_precision != \"fp32\" && !compute_precision.empty()) {\n",
+        "    } else if (!dev_logits_mode && compute_precision != \"fp32\" && !compute_precision.empty()) {\n",
+    ),
+    (
+        "pow_utils.cpp",
+        "            const uint32_t* inj_idx = nullptr; const float* inj_val = nullptr;\n"
+        "            const double* inj_stats = nullptr; float inj_head = 0.0f; int inj_count = 0;\n"
+        "            if (pow_gpu_take_presorted(&inj_idx, &inj_val, &inj_stats, &inj_head, &inj_count)) {\n",
+        "            const uint32_t* inj_idx = nullptr; const float* inj_val = nullptr;\n"
+        "            const double* inj_stats = nullptr; float inj_head = 0.0f; int inj_count = 0;\n"
+        "            const float* inj_probes = nullptr; int inj_probe_n = 0;\n"
+        "            if (pow_gpu_take_presorted2(&inj_idx, &inj_val, &inj_stats, &inj_head, &inj_count,\n"
+        "                                        &inj_probes, &inj_probe_n)) {\n"
+        "                if (inj_probes && inj_probe_n == 20) {\n"
+        "                    for (int k = 0; k < 20; ++k) gpu_probes_[k] = inj_probes[k];\n"
+        "                    gpu_probes_valid_ = true;\n"
+        "                }\n",
+    ),
+    (
+        "pow_utils.cpp",
+        "    bool sorted_on_gpu = false;   // pretemp_desc_ sized per branch below\n"
+        "    gpu_stats_valid_ = false;\n",
+        "    bool sorted_on_gpu = false;   // pretemp_desc_ sized per branch below\n"
+        "    gpu_stats_valid_ = false;\n"
+        "    gpu_probes_valid_ = false;\n",
+    ),
+    (
+        "pow_utils.cpp",
+        # In device mode a missing injection MUST abort (the CPU fallback
+        # would sort a stale host array and every share would be wrong).
+        "    if (!sorted_on_gpu) {\n"
+        "        pretemp_desc_.resize(n_vocab);\n",
+        "    if (!sorted_on_gpu) {\n"
+        "        if (dev_logits_mode)\n"
+        "            throw std::runtime_error(\"device-logits mode but injection missing — aborting window\");\n"
+        "        pretemp_desc_.resize(n_vocab);\n",
+    ),
+    (
+        "pow_utils.cpp",
+        # Step 2 writes logits_ from working_logits — stale in device mode,
+        # and its output is consumed only by paths that are gated off there
+        # (the fast path overwrites logits_ wholesale).
+        "    // ---------- 2) Temperature scaling ----------\n"
+        "    if (temperature != 1.0f) {\n",
+        "    // ---------- 2) Temperature scaling ----------\n"
+        "    if (gpu_probes_valid_) { /* device mode: logits_ is filled by the\n"
+        "        survivor fast path; the dense copy would read stale memory */ }\n"
+        "    else if (temperature != 1.0f) {\n",
+    ),
+    (
+        "pow_utils.cpp",
+        # Survivor VALUES from the sorted prefix (bit-identical to the host
+        # snapped values) — mandatory in device mode, equivalent in host mode.
+        "        surv_valid_ = false;\n"
+        "        surv_ids_.clear();\n"
+        "        for (int r = 0; r < kpos; ++r) {\n"
+        "            if (!(pretemp_desc_[r].first > kth_pre)) break;   // prefix ended\n"
+        "            surv_ids_.push_back(pretemp_desc_[r].second);\n"
+        "        }\n"
+        "        if (static_cast<int>(surv_ids_.size()) <= kpos) {\n"
+        "            // Sum/mask order must match the reference, which walks ascending\n"
+        "            // token id. Sorting <=50 ids is free next to a full pass.\n"
+        "            std::sort(surv_ids_.begin(), surv_ids_.end());\n"
+        "            std::fill(keep_.begin(), keep_.begin() + n_vocab, 0u);\n"
+        "            std::fill(logits_.begin(), logits_.begin() + n_vocab, ninf);\n"
+        "            const bool scaled = (temperature != 1.0f);\n"
+        "            const float invT  = scaled ? (1.0f / temperature) : 1.0f;\n"
+        "            for (int id : surv_ids_) {\n"
+        "                keep_[id]   = 1u;\n"
+        "                logits_[id] = scaled ? (working_logits[id] * invT) : working_logits[id];\n"
+        "            }\n"
+        "            survivors  = static_cast<int>(surv_ids_.size());\n"
+        "            surv_valid_ = true;\n",
+        "        surv_valid_ = false;\n"
+        "        surv_ids_.clear();\n"
+        "        surv_iv_.clear();\n"
+        "        for (int r = 0; r < kpos; ++r) {\n"
+        "            if (!(pretemp_desc_[r].first > kth_pre)) break;   // prefix ended\n"
+        "            surv_iv_.emplace_back(pretemp_desc_[r].second, pretemp_desc_[r].first);\n"
+        "        }\n"
+        "        if (static_cast<int>(surv_iv_.size()) <= kpos) {\n"
+        "            // Sum/mask order must match the reference, which walks ascending\n"
+        "            // token id. Sorting <=50 ids is free next to a full pass. The\n"
+        "            // survivor VALUES come from the sorted prefix itself — they ARE\n"
+        "            // the snapped working values, bit-identical — which is required\n"
+        "            // in device-logits mode where no host logits array exists.\n"
+        "            std::sort(surv_iv_.begin(), surv_iv_.end());\n"
+        "            std::fill(keep_.begin(), keep_.begin() + n_vocab, 0u);\n"
+        "            std::fill(logits_.begin(), logits_.begin() + n_vocab, ninf);\n"
+        "            const bool scaled = (temperature != 1.0f);\n"
+        "            const float invT  = scaled ? (1.0f / temperature) : 1.0f;\n"
+        "            for (const auto& iv : surv_iv_) {\n"
+        "                keep_[iv.first]   = 1u;\n"
+        "                logits_[iv.first] = scaled ? (iv.second * invT) : iv.second;\n"
+        "                surv_ids_.push_back(iv.first);\n"
+        "            }\n"
+        "            survivors  = static_cast<int>(surv_ids_.size());\n"
+        "            surv_valid_ = true;\n",
+    ),
+    (
+        "pow_utils.cpp",
+        # Rank 0 of the descending sort IS the reference argmax (highest
+        # value, lowest id on ties — the scan kept the first maximum), and it
+        # is available in every mode; the dense scan read working_logits,
+        # which is stale in device mode.
+        "            // pick the single global argmax in the effective precision domain\n"
+        "            int argmax = 0;\n"
+        "            float best = working_logits[0];\n"
+        "            for (int i = 1; i < n_vocab; ++i) {\n"
+        "                if (working_logits[i] > best || (working_logits[i] == best && i < argmax)) {\n"
+        "                    best = working_logits[i]; argmax = i;\n"
+        "                }\n"
+        "            }\n",
+        "            // Rank 0 of the desc sort == the reference argmax scan's pick\n"
+        "            // (highest value, lowest id among ties): the scan kept the\n"
+        "            // FIRST maximum. Valid in every mode incl. device-logits.\n"
+        "            const int   argmax = pretemp_desc_[0].second;\n"
+        "            const float best   = pretemp_desc_[0].first;\n",
+    ),
+    (
+        "pow_utils.cpp",
+        "            keep_[argmax] = 1u;\n"
+        "            logits_[argmax] = (temperature != 1.0f) ? (working_logits[argmax] / temperature)\n"
+        "                                                    : working_logits[argmax];\n",
+        "            keep_[argmax] = 1u;\n"
+        "            logits_[argmax] = (temperature != 1.0f) ? (best / temperature) : best;\n",
+    ),
+    (
+        "pow_utils.cpp",
+        "        result.topk_logits[50 + i]  = working_logits[probe_idx]; // effective pre-temp\n",
+        "        result.topk_logits[50 + i]  = gpu_probes_valid_ ? gpu_probes_[i]\n"
+        "                                    : working_logits[probe_idx]; // effective pre-temp\n",
+    ),
+    (
+        "pow_utils.h",
+        "    std::vector<float>    snapped_scratch_;  // fused snap output (member: no per-token alloc)",
+        "    std::vector<float>    snapped_scratch_;  // fused snap output (member: no per-token alloc)\n"
+        "    std::vector<std::pair<int32_t,float>> surv_iv_;  // survivor (id, snapped value)\n"
+        "    float                 gpu_probes_[20] = {};      // device-logits telemetry probes\n"
+        "    bool                  gpu_probes_valid_ = false;",
+    ),
 ]
 
 def main(stage_dir: str) -> int:

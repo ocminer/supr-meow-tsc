@@ -113,7 +113,10 @@ public:
 
     // Called once per decode step by the mining thread: fills out_tokens[s] for
     // every stream, running each group's streams on its own thread.
-    bool sample_step(const std::vector<const float*>& logits, int n_vocab,
+    // dev_logits non-null = GPU-resident mode: the DEVICE base of llama's
+    // output tensor; the host `logits` pointers are stale and never read.
+    bool sample_step(const std::vector<const float*>& logits,
+                     const float* dev_logits, int n_vocab,
                      const std::vector<std::vector<int64_t>>& ctx,
                      std::vector<int>& out_tokens);
 
