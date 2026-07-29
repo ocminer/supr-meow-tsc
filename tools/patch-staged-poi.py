@@ -374,6 +374,52 @@ PATCHES = [
     ),
     (
         "pow_utils.cpp",
+        # Logger::log OPENS the log file, formats localtime, writes with a
+        # flush and CLOSES it — on every call. record_complete_step logs at
+        # DEBUG once per token per stream, so 12 coordinators x 4 streams
+        # append to ONE shared ext4 inode ~5,000 times/s; the open/close
+        # syscalls serialize the whole sampler tail behind the file (found at
+        # 6.2 GB / 96M lines, all DEBUG spam). Drop DEBUG at the source;
+        # INFO/WARN/ERROR keep working exactly as before.
+        "void Logger::log(const std::string& message, const std::string& level) {\n"
+        "    try {\n",
+        "void Logger::log(const std::string& message, const std::string& level) {\n"
+        "    if (level == \"DEBUG\") return;   // per-token hot path — see patch note\n"
+        "    try {\n",
+    ),
+    (
+        "pow_utils.cpp",
+        # Streams round-robin inside a group, so active_pow_seq_id changes on
+        # EVERY sample_token_complete call and apply_pow_params re-parses the
+        # full param map per token: a map copy, hex_to_bytes over header/vdf/
+        # targets (the vdf alone is ~KB of hex, decoded byte by byte), ~8
+        # stoi/stof and 3 proof-writer setters. Every sequence of a group
+        # carries the SAME job params (set_job fans one map out), so switching
+        # is a no-op whenever the stored map equals what is already active —
+        # detect that with a map compare (identical strings, ~2 KB, <1 us)
+        # instead of re-applying. Bit-exact: the skipped work would have
+        # re-assigned the very same values.
+        "    auto it = seq_pow_params_map.find(seq_id);\n"
+        "    if (it == seq_pow_params_map.end()) {\n"
+        "        return false;\n"
+        "    }\n"
+        "    apply_pow_params(it->second);\n"
+        "    active_pow_seq_id = seq_id;\n"
+        "    return true;\n",
+        "    auto it = seq_pow_params_map.find(seq_id);\n"
+        "    if (it == seq_pow_params_map.end()) {\n"
+        "        return false;\n"
+        "    }\n"
+        "    if (it->second == current_pow_params) {\n"
+        "        active_pow_seq_id = seq_id;   // identical params already active\n"
+        "        return true;\n"
+        "    }\n"
+        "    apply_pow_params(it->second);\n"
+        "    active_pow_seq_id = seq_id;\n"
+        "    return true;\n",
+    ),
+    (
+        "pow_utils.cpp",
         # ---- tail 3/3: CDF as constant runs between survivors ----------------
         """    float cumulative = 0.0f;
     for (int i = 0; i < n_vocab; ++i) {
@@ -402,6 +448,75 @@ PATCHES = [
     }
     }
 """,
+    ),
+    (
+        "pow_utils.cpp",
+        # PROFILE-DIRECTED (perf, 2026-07-29): the survivor fast path's guard
+        # treated the COMMON case as degenerate. With strict '>' and no tie at
+        # the boundary, the qualifying prefix is exactly kpos elements, so
+        # surv_ids_.size() == kpos on ordinary tokens — and '<' sent them all
+        # down the dense 151,936-element reference loops (survivor scan +
+        # masked softmax + a serially-dependent CDF accumulate: ~30% of
+        # process time). size == kpos is bit-exactly representable by the fast
+        # path — survivors are the whole prefix, same values, same
+        # ascending-id accumulation — so admit it. Sorted-desc order
+        # guarantees nothing beyond rank kpos can exceed kth_pre, so the else
+        # branch becomes unreachable and is kept only as scaffolding.
+        "        if (static_cast<int>(surv_ids_.size()) < kpos) {\n",
+        "        if (static_cast<int>(surv_ids_.size()) <= kpos) {\n",
+    ),
+    (
+        "pow_utils.cpp",
+        # Companion to the guard fix: the no-survivor fallback (total tie of
+        # the whole prefix) sets exactly one survivor but used to leave
+        # surv_ids_ EMPTY while surv_valid_ stayed true — the survivor-only
+        # softmax/CDF would then emit all-zero probs. Latent before (that path
+        # needed a boundary tie AND survivors==0), reachable now; keep the
+        # survivor list consistent with keep_/logits_.
+        "            keep_[argmax] = 1u;\n"
+        "            logits_[argmax] = (temperature != 1.0f) ? (working_logits[argmax] / temperature)\n"
+        "                                                    : working_logits[argmax];\n"
+        "            survivors = 1;\n",
+        "            keep_[argmax] = 1u;\n"
+        "            logits_[argmax] = (temperature != 1.0f) ? (working_logits[argmax] / temperature)\n"
+        "                                                    : working_logits[argmax];\n"
+        "            survivors = 1;\n"
+        "            if (surv_valid_) surv_ids_.assign(1, argmax);   // keep fast-path state consistent\n",
+    ),
+    (
+        "pow_utils.cpp",
+        # PROFILE-DIRECTED (perf, 2026-07-29): resize(n_vocab) from the
+        # cleared state value-initializes 1.2 MB of pairs EVERY token (11.9%
+        # of process time as vector::_M_default_append), yet the injected path
+        # only writes/reads the top-`kcopy` (2048) ranks. Size the buffer in
+        # each branch instead; capacity is reserved once so no realloc occurs.
+        "    pretemp_desc_.resize(n_vocab);\n"
+        "    bool sorted_on_gpu = false;\n",
+        "    bool sorted_on_gpu = false;   // pretemp_desc_ sized per branch below\n",
+    ),
+    (
+        "pow_utils.cpp",
+        "                const int kcopy = (inj_count > 0 && inj_count < n_vocab) ? inj_count : n_vocab;\n"
+        "                for (int r = 0; r < kcopy; ++r)\n",
+        "                const int kcopy = (inj_count > 0 && inj_count < n_vocab) ? inj_count : n_vocab;\n"
+        "                pretemp_desc_.resize(kcopy);\n"
+        "                for (int r = 0; r < kcopy; ++r)\n",
+    ),
+    (
+        "pow_utils.cpp",
+        "            gpu_sort_idx_.resize(n_vocab);\n"
+        "            gpu_sort_val_.resize(n_vocab);\n",
+        "            pretemp_desc_.resize(n_vocab);\n"
+        "            gpu_sort_idx_.resize(n_vocab);\n"
+        "            gpu_sort_val_.resize(n_vocab);\n",
+    ),
+    (
+        "pow_utils.cpp",
+        "    if (!sorted_on_gpu) {\n"
+        "        for (int i = 0; i < n_vocab; ++i) pretemp_desc_[i] = { working_logits[i], i };\n",
+        "    if (!sorted_on_gpu) {\n"
+        "        pretemp_desc_.resize(n_vocab);\n"
+        "        for (int i = 0; i < n_vocab; ++i) pretemp_desc_[i] = { working_logits[i], i };\n",
     ),
 ]
 
