@@ -4,23 +4,19 @@ A self-contained GPU miner for **TensorCash (TSC)** — one binary, no Docker, n
 Python, no service install. Built for real rigs: drop it in a folder, point it
 at a pool, run it.
 
-**Version 0.1.0 — foundation.** Device selection, tuning and telemetry are
-complete and usable. **It does not mine yet.** The inference and
-proof-of-inference pipeline is being integrated; the binary tells you so and
-exits rather than printing a hashrate it is not producing. See *Status* below.
+**Version 0.2.0 — mining.** The full pipeline is in: embedded inference engine
+(llama.cpp/CUDA), GPU-offloaded proof-of-inference sampler with GPU-resident
+logits, chiavdf VDF, TSC Stratum client with failover, local JSON stats API,
+and a HiveOS integration package (`docs/hiveos/`).
 
 ---
 
-## Important: TensorCash is not a hash coin, and has no stratum
+## Important: TensorCash is not a hash coin
 
 TSC is **proof-of-inference**. A "share" is a cryptographic transcript proving a
 GPU ran a real forward pass of a chain-registered LLM (currently `Qwen3-8B` on
 mainnet, `Qwen3-0.6B` on testnet). The consequences for a miner:
 
-- **No `stratum+tcp://`.** Pools speak a WebSocket broker protocol
-  (`HELLO` / `ACK` / `MINE_REQUEST` / `MINE_SHARE` / `MINE_RESULT`). Use
-  `ws://` or `wss://`. Passing a `stratum+tcp://` URL is rejected with an
-  explanation rather than a confusing connection error.
 - **The model must be on disk and in VRAM.** ~1.5 GB for the testnet 0.6B model,
   ~16 GB for the mainnet 8B one. A 24 GB card is the practical mainnet minimum.
 - **Rates are PoI/s** (proofs per second), not hashes. Expect single or double
@@ -28,6 +24,9 @@ mainnet, `Qwen3-0.6B` on testnet). The consequences for a miner:
 - **bf16 is mandatory** — the proof declares its compute precision and the
   network's verifier checks it against the model checkpoint. Quantised weights
   would be faster and every proof would be rejected.
+- Pools speak **TSC Stratum** (`stratum+tcp://`, line-delimited JSON-RPC —
+  spec in `docs/STRATUM-TSC.md`). The upstream WebSocket broker dialect is a
+  different protocol; `ws://` URLs are rejected with an explanation.
 
 ## Usage
 
@@ -37,14 +36,16 @@ supr-meow-tsc -o <pool> -u <wallet>[.<worker>] [-p x] [options]
 
 | flag | meaning |
 |---|---|
-| `-o, --pool` | Pool URL — `ws://` or `wss://` |
+| `-o, --pool` | Pool URL — `stratum+tcp://host:port`; repeat for failover |
 | `-u, --user` | TSC address, optionally `.workername` (`tc1…`, testnet `tct1…`) |
 | `-p, --pass` | Accepted and ignored (TSC pools do not use it) |
 | `-d, --devices` | `-d 0` or `-d 0,1`; **omit to mine on every GPU** |
 | `--model` | Path to the chain-registered model (GGUF) |
+| `--slots` / `--groups` | Concurrent windows per GPU / sampler threads per GPU |
+| `--api-bind` | Local JSON stats API, default `127.0.0.1:21550` (`off` disables) — HiveOS reads this |
 | `--list-devices` | Print detected GPUs and exit |
 | `--dry-run` | Set up and show telemetry without mining |
-| `--log-interval` | Seconds between status lines (default 30) |
+| `--log-interval` | Seconds between full status reports (default 30) |
 
 Tuning (per selected device; omit any flag to leave the card alone):
 
@@ -95,14 +96,12 @@ Sample telemetry:
 | Telemetry: temp, fan, power, core/mem MHz, util, VRAM | **done** |
 | Tuning: core/mem offsets, locked clocks, power limit, fan | **done** |
 | Clean restore of fans/clocks on exit | **done** |
-| Inference engine (libllama + CUDA) | in progress |
-| Proof-of-inference sampler (+ CUDA offload) | in progress |
-| VDF, v3 Argon2id admission | in progress |
-| Pool client (WebSocket broker protocol) | in progress |
-
-The mining pieces already exist and run today as a two-process stack
-(`llama-server` + a Python broker proxy). This project folds them into one
-binary; that work is tracked in the suprnova TSC notes.
+| Inference engine (libllama + CUDA, GPU-resident logits) | **done** |
+| Proof-of-inference sampler (fused CUB sort/stats on GPU) | **done** |
+| VDF (chiavdf) | **done** |
+| Pool client (TSC Stratum, reconnect + failover) | **done** |
+| Local JSON stats API + HiveOS package (`docs/hiveos/`) | **done** |
+| v3 Argon2id admission grinding | optional band, not mined |
 
 ## Build
 

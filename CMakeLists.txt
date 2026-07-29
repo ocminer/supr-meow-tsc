@@ -193,6 +193,7 @@ add_executable(supr-meow-tsc
   src/stratum.cpp
   src/engine.cpp
   src/poi.cpp
+  src/api.cpp
 )
 target_include_directories(supr-meow-tsc PRIVATE
   ${MEOW_LLAMA_DIR}/include

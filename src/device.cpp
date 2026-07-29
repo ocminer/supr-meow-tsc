@@ -87,6 +87,7 @@ bool DeviceManager::init(const std::string& spec, std::string& error) {
         d.sm_major   = p.major;
         d.sm_minor   = p.minor;
         d.vram_total = p.totalGlobalMem;
+        d.pci_bus    = p.pciBusID;   // decimal — HiveOS bus_numbers wants this
 
         size_t freeb = 0, totalb = 0;
         if (cudaSetDevice(id) == cudaSuccess && cudaMemGetInfo(&freeb, &totalb) == cudaSuccess) {

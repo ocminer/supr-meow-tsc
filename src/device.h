@@ -30,6 +30,7 @@ struct DeviceInfo {
     int         sm_minor   = 0;
     size_t      vram_total = 0;       // bytes
     size_t      vram_free  = 0;
+    int         pci_bus    = -1;      // PCI bus number (decimal) — rig managers key on it
     bool        nvml_ok    = false;   // telemetry available for this card
 };
 

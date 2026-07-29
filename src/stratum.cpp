@@ -159,12 +159,16 @@ void StratumClient::handshake() {
 }
 
 void StratumClient::submit(const std::string& job_id, uint64_t nonce, const std::string& proof_b64,
-                           const std::string& achieved_hex, uint64_t vdf_tick) {
+                           const std::string& achieved_hex, uint64_t vdf_tick, int tag) {
     uint64_t id;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         id = next_id_++;
         stats_.submitted++;
+        pending_tags_.emplace_back(id, tag);
+        // Bounded: a pool that never answers must not grow this forever.
+        if (pending_tags_.size() > 4096)
+            pending_tags_.erase(pending_tags_.begin(), pending_tags_.begin() + 2048);
     }
     json m = {{"id", id}, {"method", "mining.submit"},
               {"params", json::array({user_, job_id, nonce, proof_b64, achieved_hex, vdf_tick})}};
@@ -269,13 +273,17 @@ void StratumClient::handle_line(const std::string& line) {
         else if (e.is_array() && e.size() >= 2) { code = e[0].get<int>(); msg = e[1].get<std::string>(); }
     }
     const bool ok = !has_err;
+    int tag = 0;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (ok) stats_.accepted++;
         else if (code == 21) stats_.stale++;   // stale is normal at block edges
         else stats_.rejected++;
+        for (auto it = pending_tags_.begin(); it != pending_tags_.end(); ++it) {
+            if (it->first == id) { tag = it->second; pending_tags_.erase(it); break; }
+        }
     }
-    if (cb_.on_submit_result) cb_.on_submit_result(ok, code, msg);
+    if (cb_.on_submit_result) cb_.on_submit_result(ok, code, msg, tag);
 }
 
 // ---------------------------------------------------------------- loop

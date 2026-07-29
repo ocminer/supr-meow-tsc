@@ -295,7 +295,9 @@ int InferenceEngine::generate_windows_stepwise(int device_slot,
         t.resize(n); toks[s] = std::move(t);
     }
 
+    const auto tp0 = std::chrono::steady_clock::now();
     llama_memory_clear(llama_get_memory(in.ctx), true);
+    const auto tp1 = std::chrono::steady_clock::now();
 
     // Prompt pass: all streams in one batch, one logits row per stream (its
     // last prompt token).
@@ -316,6 +318,18 @@ int InferenceEngine::generate_windows_stepwise(int device_slot,
     const int prc = llama_decode(in.ctx, pb);
     llama_batch_free(pb);
     if (prc != 0) { error = "prompt decode failed"; return -1; }
+    llama_synchronize(in.ctx);   // make the prompt pass visible to the timer
+    const auto tp2 = std::chrono::steady_clock::now();
+    {
+        static thread_local uint64_t pn = 0;
+        static thread_local double p_clear = 0, p_prompt = 0;
+        p_clear  += std::chrono::duration<double>(tp1 - tp0).count();
+        p_prompt += std::chrono::duration<double>(tp2 - tp1).count();
+        if (++pn % 8 == 0)
+            std::fprintf(stderr, "[prof-pre] clear=%.0fms prompt=%.0fms (%d tok, avg of %llu)\n",
+                         1000.0 * p_clear / pn, 1000.0 * p_prompt / pn, total_prompt,
+                         (unsigned long long)pn);
+    }
 
     // Per-stream running context (prompt + generated so far).
     std::vector<std::vector<int64_t>> ctxv(S);
@@ -401,7 +415,7 @@ int InferenceEngine::generate_windows_stepwise(int device_slot,
     // and the implied throughput. Direct measurement — immune to the job-churn
     // noise that plagues delta-counting the windows counter.
     { const double per_step_ms = 1000.0 * (t_sample + t_decode) / cfg_.window_tokens;
-      std::fprintf(stderr, "[prof] batch S=%d: sample=%.1f decode=%.1f ms/step -> %.2f windows/s\n",
+      std::fprintf(stderr, "[prof] batch S=%d: sample=%.1f decode-issue=%.1f ms/step -> %.2f windows/s LOOP-ONLY (see [prof-e2e])\n",
                    S, 1000.0*t_sample/cfg_.window_tokens, 1000.0*t_decode/cfg_.window_tokens,
                    per_step_ms > 0 ? 1000.0 * S / (256.0 * per_step_ms) : 0.0); }
     llama_batch_free(nb);

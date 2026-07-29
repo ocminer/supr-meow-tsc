@@ -56,7 +56,9 @@ struct StratumCallbacks {
     std::function<void(const PoolModel&)>  on_model;
     std::function<void(const std::string&)> on_target;      // 64-hex share target
     std::function<void(const PoolJob&)>    on_job;
-    std::function<void(bool, int, const std::string&)> on_submit_result;  // ok, code, message
+    // ok, code, message, tag — `tag` is whatever submit() was given for this
+    // share (the miner passes the GPU index, so results can be attributed).
+    std::function<void(bool, int, const std::string&, int)> on_submit_result;
     std::function<void(const std::string&)> on_log;         // human-readable status
 };
 
@@ -76,9 +78,10 @@ public:
     bool connected() const { return connected_.load(); }
 
     // Queue a share. Non-blocking: the network thread owns the socket, so a
-    // slow pool can never stall the mining loop.
+    // slow pool can never stall the mining loop. `tag` rides along and comes
+    // back in on_submit_result (the miner uses it for the GPU index).
     void submit(const std::string& job_id, uint64_t nonce, const std::string& proof_b64,
-                const std::string& achieved_hex, uint64_t vdf_tick);
+                const std::string& achieved_hex, uint64_t vdf_tick, int tag = 0);
 
     struct Stats {
         uint64_t accepted = 0, rejected = 0, stale = 0, submitted = 0;
@@ -111,6 +114,7 @@ private:
     std::string          share_target_;
     uint64_t             next_id_ = 1;
     std::vector<std::string> outq_;           // lines waiting for the socket
+    std::vector<std::pair<uint64_t,int>> pending_tags_;  // submit id -> tag
     Stats                stats_;
 };
 

@@ -749,6 +749,26 @@ PATCHES = [
         "    float                 gpu_probes_[20] = {};      // device-logits telemetry probes\n"
         "    bool                  gpu_probes_valid_ = false;",
     ),
+    (
+        "pow_utils.cpp",
+        # write_proof unconditionally wrote a .bin AND a full-transcript JSON
+        # (256x71 float matrices through ofstream<<) to disk for EVERY proof.
+        # At share-per-window targets that is two files + hundreds of ms of
+        # float formatting per share — measured as ~2 s of dead time per
+        # window batch, capping END-TO-END throughput at ~1/4 of the in-loop
+        # rate (19 vs 90 windows/s; found via the per-GPU windows counters,
+        # invisible to [prof] which times only the generation loop). The
+        # proof reaches the pool through the ZMQ egress; the disk copies are
+        # forensic artifacts. Off by default, POW_PROOF_SAVE=1 restores them.
+        "    // 4) Save proof files to output_dir\n"
+        "    try {\n",
+        "    // 4) Save proof files to output_dir — DEBUG ONLY (POW_PROOF_SAVE=1)\n"
+        "    static const bool save_proofs = [](){\n"
+        "        const char* e = std::getenv(\"POW_PROOF_SAVE\");\n"
+        "        return e && (*e == '1' || *e == 't' || *e == 'T');\n"
+        "    }();\n"
+        "    if (save_proofs) try {\n",
+    ),
 ]
 
 def main(stage_dir: str) -> int:
