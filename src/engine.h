@@ -124,6 +124,12 @@ public:
     int generate_windows_stepwise(int device_slot,
                                   const std::vector<std::string>& prompts,
                                   const StepSampler& step, std::string& error);
+    // Pre-tokenized variant (canary jobs): the ids are fed VERBATIM — no
+    // tokenizer, no BOS/EOS insertion. The pool derives these same ids from
+    // the job's prompt seed, which is what makes its references computable.
+    int generate_windows_stepwise_tok(int device_slot,
+                                  const std::vector<std::vector<int32_t>>& prompt_tokens,
+                                  const StepSampler& step, std::string& error);
 
     // Double-buffered variant: TWO window batches (A = seqs [0,S), B = seqs
     // [S,2S)) alternate on one context, so the GPU decodes batch B while the
@@ -136,6 +142,13 @@ public:
     int generate_windows_double(int device_slot,
                                 const std::vector<std::string>& prompts_a,
                                 const std::vector<std::string>& prompts_b,
+                                const StepSampler& step_a,
+                                const StepSampler& step_b,
+                                std::string& error);
+    // Pre-tokenized variant — see generate_windows_stepwise_tok.
+    int generate_windows_double_tok(int device_slot,
+                                const std::vector<std::vector<int32_t>>& toks_a,
+                                const std::vector<std::vector<int32_t>>& toks_b,
                                 const StepSampler& step_a,
                                 const StepSampler& step_b,
                                 std::string& error);

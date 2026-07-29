@@ -147,7 +147,11 @@ bool StratumClient::send_line(const std::string& s) {
 
 void StratumClient::handshake() {
     json sub = {{"id", 1}, {"method", "mining.subscribe"},
-                {"params", json::array({ua_, nullptr, json{{"protocol", "tsc/1.0"}}})}};
+                {"params", json::array({ua_, nullptr,
+                    json{{"protocol", "tsc/1.0"},
+                         // Capability: this miner derives prompts from
+                         // mining.notify field 9 (CANARY-JOBS-SPEC).
+                         {"prompt_seed", true}}})}};
     send_line(sub.dump());
     json auth = {{"id", 2}, {"method", "mining.authorize"},
                  {"params", json::array({user_, pass_})}};
@@ -203,6 +207,14 @@ void StratumClient::handle_line(const std::string& line) {
             // and bcore rejects a block whose proof names a different unit.
             j.request_id    = p.size() > 7 && p[7].is_number()
                                 ? p[7].get<uint64_t>() : 0;
+            // Field 9 (CANARY-JOBS-SPEC): per-job prompt seed, 64 hex chars.
+            // Malformed values are treated as absent — mining must not stop
+            // because a pool sent a bad seed; the miner just isn't compliant
+            // for that job (and the pool sees that via the prompt keys).
+            if (p.size() > 8 && p[8].is_string()) {
+                const std::string s = p[8].get<std::string>();
+                if (s.size() == 64) j.prompt_seed = s;
+            }
             {
                 std::lock_guard<std::mutex> lk(mtx_);
                 j.share_target = share_target_;

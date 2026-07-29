@@ -14,6 +14,8 @@
 #include "vdf.h"
 #include "poi.h"
 #include "api.h"
+#include "canary.h"
+#include <algorithm>
 #include "../vendor/nlohmann/json.hpp"
 #include <random>
 #include <atomic>
@@ -110,6 +112,8 @@ struct Options {
     bool        protocol_test = false;
     bool        benchmark    = false;
     bool        vdf_test     = false;
+    std::string vdf_vector;          // --vdf-vector <64-hex parent> -> print exact vdf bytes
+    std::string canary_test;         // --canary-test <seed64hex>:<w> -> print step-0 top-10
     int         slots = 8;
     int         workers = 1;   // independent contexts per GPU (--workers)
     int         groups  = 8;   // parallel sampler threads per GPU (--groups)
@@ -193,6 +197,8 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--protocol-test")   o.protocol_test = true;
         else if (a == "--benchmark")       o.benchmark = true;
         else if (a == "--vdf-test")        o.vdf_test = true;
+        else if (a == "--vdf-vector")      { if (!need_value(i, argc, "--vdf-vector")) return false; o.vdf_vector = argv[++i]; }
+        else if (a == "--canary-test")     { if (!need_value(i, argc, "--canary-test")) return false; o.canary_test = argv[++i]; }
         else if (a == "--slots")           { if (!need_value(i, argc, "--slots")) return false; o.slots = std::atoi(argv[++i]); }
         else if (a == "--workers")         { if (!need_value(i, argc, "--workers")) return false; o.workers = std::atoi(argv[++i]); }
         else if (a == "--groups")          { if (!need_value(i, argc, "--groups")) return false; o.groups = std::atoi(argv[++i]); }
@@ -314,6 +320,82 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("\n");
+    }
+
+    if (!o.vdf_vector.empty()) {
+        // Cross-implementation pinning vector (canary-jobs stage 2): given a
+        // parent hash, print the EXACT serialized VDF bytes this miner folds
+        // into every u-value at the normative tick (1000). Another chiavdf
+        // build must reproduce this byte-for-byte or transcript precompute
+        // is impossible — Wesolowski y is deterministic, but proof
+        // serialization is an implementation detail until pinned.
+        if (o.vdf_vector.size() != 64) {
+            std::fprintf(stderr, "error: --vdf-vector needs a 64-hex parent hash\n");
+            return 2;
+        }
+        std::vector<uint8_t> parent;
+        for (size_t i = 0; i + 1 < o.vdf_vector.size(); i += 2)
+            parent.push_back((uint8_t)std::stoul(o.vdf_vector.substr(i, 2), nullptr, 16));
+        const uint64_t tick = 1000;   // normative (CANARY-JOBS-SPEC §10)
+        const auto proof = meow::Vdf::prove(parent, tick);
+        if (proof.empty()) { std::fprintf(stderr, "error: VDF prove failed\n"); return 1; }
+        std::printf("parent  = %s\ntick    = %llu\nvdf_len = %zu bytes\nvdf     = %s\n",
+                    o.vdf_vector.c_str(), (unsigned long long)tick, proof.size(),
+                    meow::Vdf::to_hex(proof).c_str());
+        return 0;
+    }
+
+    if (!o.canary_test.empty()) {
+        // Validate the canary derivation + model + bf16 snap + tie-rule sort
+        // end-to-end against the spec's test vectors (§9 / §9.1): derive the
+        // prompt for (seed, w), run the prompt pass, print step-0 top-10.
+        const auto colon = o.canary_test.rfind(':');
+        if (colon == std::string::npos) {
+            std::fprintf(stderr, "error: --canary-test wants <seed64hex>:<w>\n"); return 2;
+        }
+        std::vector<uint8_t> seed;
+        if (!meow::canary_parse_seed(o.canary_test.substr(0, colon), seed)) {
+            std::fprintf(stderr, "error: bad seed hex\n"); return 2;
+        }
+        const uint32_t w = (uint32_t)std::strtoul(o.canary_test.c_str() + colon + 1, nullptr, 10);
+        meow::EngineConfig ec;
+        ec.model_path = o.model_path;
+        ec.slots_per_device = 1;
+        ec.devices.push_back(dm.devices()[0].index);
+        meow::InferenceEngine engine;
+        std::string eerr;
+        if (!engine.load(ec, eerr, nullptr)) { std::fprintf(stderr, "error: %s\n", eerr.c_str()); return 1; }
+        const auto toks = meow::canary_derive_prompt(seed, w, engine.n_vocab());
+        std::printf("w=%u tokens[0:8] = [", w);
+        for (int i = 0; i < 8; ++i) std::printf("%s%d", i ? ", " : "", toks[i]);
+        std::printf("]\n");
+        bool printed = false;
+        engine.generate_windows_stepwise_tok(0, {toks},
+            [&](const std::vector<const float*>& all, const float*, int n_vocab,
+                const std::vector<std::vector<int64_t>>&, std::vector<int>&) -> bool {
+                // Snap to bf16 and sort by the NORMATIVE rule (§4.1):
+                // descending value, ties by ascending token id.
+                std::vector<std::pair<float,int>> v(n_vocab);
+                for (int i = 0; i < n_vocab; ++i) {
+                    uint32_t x; std::memcpy(&x, &all[0][i], 4);
+                    x = (x + (0x00007FFFu + ((x >> 16) & 1u))) & 0xFFFF0000u;
+                    float sv; std::memcpy(&sv, &x, 4);
+                    v[i] = { sv, i };
+                }
+                std::partial_sort(v.begin(), v.begin() + 10, v.end(),
+                    [](const auto& a, const auto& b){
+                        if (a.first != b.first) return a.first > b.first;
+                        return a.second < b.second;
+                    });
+                std::printf("step0 idx[0:10] = [");
+                for (int i = 0; i < 10; ++i) std::printf("%s%d", i ? ", " : "", v[i].second);
+                std::printf("]\nstep0 val[0:10] = [");
+                for (int i = 0; i < 10; ++i) std::printf("%s%g", i ? ", " : "", v[i].first);
+                std::printf("]\n");
+                printed = true;
+                return false;   // one step is all we need — abort the window
+            }, eerr);
+        return printed ? 0 : 1;
     }
 
     if (o.vdf_test) {
@@ -555,6 +637,16 @@ int main(int argc, char** argv) {
         const auto t_start = std::chrono::steady_clock::now();
         const uint64_t prompt_salt = std::random_device{}();
 
+        // Canary jobs (CANARY-JOBS-SPEC): w is a DENSE counter over
+        // (session, seed) — ONE atomic across all streams and workers of this
+        // connection, reset when the job's seed changes. Density from 0 is
+        // what keeps the pool's precomputed range reachable; the single
+        // counter is what prevents (seed, w) reuse across streams.
+        std::atomic<uint32_t> canary_w{0};
+        std::mutex            canary_mx;
+        std::string           canary_seed_hex;   // seed the counter belongs to
+        static std::atomic<bool> canary_announced{false};
+
         // Dedicated submitter: base64/JSON-serializing ~120 KB proofs was
         // eating 0.7 s per window batch ON THE MINING THREAD. Shares are
         // handed off here and the GPU goes straight back to work.
@@ -611,6 +703,22 @@ int main(int argc, char** argv) {
                     }
                 }
 
+                // Seed-derived prompts when the job carries field 9; legacy
+                // salted strings otherwise (also the automatic behavior
+                // against pools that predate the canary spec).
+                std::vector<uint8_t> seed;
+                const bool seeded = !j.prompt_seed.empty() &&
+                                    meow::canary_parse_seed(j.prompt_seed, seed);
+                if (seeded) {
+                    std::lock_guard<std::mutex> lk(canary_mx);
+                    if (canary_seed_hex != j.prompt_seed) {
+                        canary_seed_hex = j.prompt_seed;
+                        canary_w.store(0);          // dense from 0 per (session, seed)
+                    }
+                    if (!canary_announced.exchange(true))
+                        std::printf("[%s] %sprompt-seed mode ACTIVE%s — prompts derived per CANARY-JOBS-SPEC\n",
+                                    timestamp_now().c_str(), C_C(), C_0());
+                }
                 auto make_prompts = [&](const char* tag) {
                     std::vector<std::string> prompts;
                     prompts.reserve(n_streams);
@@ -620,36 +728,43 @@ int main(int argc, char** argv) {
                             std::to_string(my_windows) + "-" + std::to_string(st) + "]");
                     return prompts;
                 };
+                auto make_tok_prompts = [&]() {
+                    std::vector<std::vector<int32_t>> tp;
+                    tp.reserve(n_streams);
+                    for (int st = 0; st < n_streams; ++st)
+                        tp.push_back(meow::canary_derive_prompt(
+                            seed, canary_w.fetch_add(1), engine.n_vocab()));
+                    return tp;
+                };
 
                 std::string gerr;
                 const auto tb0 = std::chrono::steady_clock::now();
                 int n = -1;
+                auto samp_a = [&](const std::vector<const float*>& all, const float* dev,
+                                  int n_vocab, const std::vector<std::vector<int64_t>>& ctx,
+                                  std::vector<int>& out) -> bool {
+                    return pool.sample_step(all, dev, n_vocab, ctx, out);
+                };
+                auto samp_b = [&](const std::vector<const float*>& all, const float* dev,
+                                  int n_vocab, const std::vector<std::vector<int64_t>>& ctx,
+                                  std::vector<int>& out) -> bool {
+                    return poolB->sample_step(all, dev, n_vocab, ctx, out);
+                };
                 if (double_ok) {
-                    n = engine.generate_windows_double(worker,
-                        make_prompts("A"), make_prompts("B"),
-                        [&](const std::vector<const float*>& all, const float* dev,
-                            int n_vocab, const std::vector<std::vector<int64_t>>& ctx,
-                            std::vector<int>& out) -> bool {
-                            return pool.sample_step(all, dev, n_vocab, ctx, out);
-                        },
-                        [&](const std::vector<const float*>& all, const float* dev,
-                            int n_vocab, const std::vector<std::vector<int64_t>>& ctx,
-                            std::vector<int>& out) -> bool {
-                            return poolB->sample_step(all, dev, n_vocab, ctx, out);
-                        }, gerr);
+                    n = seeded
+                        ? engine.generate_windows_double_tok(worker,
+                              make_tok_prompts(), make_tok_prompts(), samp_a, samp_b, gerr)
+                        : engine.generate_windows_double(worker,
+                              make_prompts("A"), make_prompts("B"), samp_a, samp_b, gerr);
                     if (n == -2) {
                         double_ok = false;
                         std::fprintf(stderr, "  device logits unavailable — single-batch fallback\n");
                         continue;
                     }
                 } else {
-                    n = engine.generate_windows_stepwise(worker, make_prompts("-"),
-                        [&](const std::vector<const float*>& all, const float* dev,
-                            int n_vocab,
-                            const std::vector<std::vector<int64_t>>& ctx,
-                            std::vector<int>& out) -> bool {
-                            return pool.sample_step(all, dev, n_vocab, ctx, out);
-                        }, gerr);
+                    n = seeded
+                        ? engine.generate_windows_stepwise_tok(worker, make_tok_prompts(), samp_a, gerr)
+                        : engine.generate_windows_stepwise(worker, make_prompts("-"), samp_a, gerr);
                 }
                 const auto tb1 = std::chrono::steady_clock::now();
                 if (n < 0) {

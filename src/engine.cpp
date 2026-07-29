@@ -297,27 +297,41 @@ int InferenceEngine::generate_windows_stepwise(int device_slot,
                                               const std::vector<std::string>& prompts,
                                               const StepSampler& step,
                                               std::string& error) {
+    // String prompts: tokenize, then run the token-input variant.
+    if (device_slot < 0 || device_slot >= static_cast<int>(instances_.size())) {
+        error = "invalid device slot"; return -1;
+    }
+    Instance& tin = *instances_[device_slot];
+    const llama_vocab* tvocab = llama_model_get_vocab(tin.model);
+    std::vector<std::vector<int32_t>> ptoks(prompts.size());
+    for (size_t s = 0; s < prompts.size(); ++s) {
+        std::vector<llama_token> t(prompts[s].size() + 8);
+        int n = llama_tokenize(tvocab, prompts[s].c_str(), (int32_t)prompts[s].size(),
+                               t.data(), (int32_t)t.size(), true, false);
+        if (n < 0) { t.resize(-n);
+            n = llama_tokenize(tvocab, prompts[s].c_str(), (int32_t)prompts[s].size(),
+                               t.data(), (int32_t)t.size(), true, false); }
+        if (n <= 0) { error = "tokenization failed"; return -1; }
+        ptoks[s].assign(t.begin(), t.begin() + n);
+    }
+    return generate_windows_stepwise_tok(device_slot, ptoks, step, error);
+}
+
+int InferenceEngine::generate_windows_stepwise_tok(int device_slot,
+                                              const std::vector<std::vector<int32_t>>& toks,
+                                              const StepSampler& step,
+                                              std::string& error) {
     if (device_slot < 0 || device_slot >= static_cast<int>(instances_.size())) {
         error = "invalid device slot"; return -1;
     }
     Instance& in = *instances_[device_slot];
     const llama_vocab* vocab = llama_model_get_vocab(in.model);
     const int n_vocab = llama_vocab_n_tokens(vocab);
-    const int S = static_cast<int>(prompts.size());
+    (void)vocab;
+    const int S = static_cast<int>(toks.size());
     if (S < 1 || S > cfg_.slots_per_device) { error = "bad stream count"; return -1; }
-
-    // Tokenize every stream's prompt.
-    std::vector<std::vector<llama_token>> toks(S);
-    for (int s = 0; s < S; ++s) {
-        std::vector<llama_token> t(prompts[s].size() + 8);
-        int n = llama_tokenize(vocab, prompts[s].c_str(), (int32_t)prompts[s].size(),
-                               t.data(), (int32_t)t.size(), true, false);
-        if (n < 0) { t.resize(-n);
-            n = llama_tokenize(vocab, prompts[s].c_str(), (int32_t)prompts[s].size(),
-                               t.data(), (int32_t)t.size(), true, false); }
-        if (n <= 0) { error = "tokenization failed"; return -1; }
-        t.resize(n); toks[s] = std::move(t);
-    }
+    for (int s = 0; s < S; ++s)
+        if (toks[s].empty()) { error = "empty prompt"; return -1; }
 
     const auto tp0 = std::chrono::steady_clock::now();
     llama_memory_clear(llama_get_memory(in.ctx), true);
@@ -452,6 +466,40 @@ int InferenceEngine::generate_windows_double(int device_slot,
                                              const StepSampler& step_a,
                                              const StepSampler& step_b,
                                              std::string& error) {
+    // String prompts: tokenize, then run the token-input variant.
+    if (device_slot < 0 || device_slot >= static_cast<int>(instances_.size())) {
+        error = "invalid device slot"; return -1;
+    }
+    Instance& tin = *instances_[device_slot];
+    const llama_vocab* tvocab = llama_model_get_vocab(tin.model);
+    auto tok_all = [&](const std::vector<std::string>& prompts,
+                       std::vector<std::vector<int32_t>>& out) -> bool {
+        out.resize(prompts.size());
+        for (size_t s = 0; s < prompts.size(); ++s) {
+            std::vector<llama_token> t(prompts[s].size() + 8);
+            int n = llama_tokenize(tvocab, prompts[s].c_str(), (int32_t)prompts[s].size(),
+                                   t.data(), (int32_t)t.size(), true, false);
+            if (n < 0) { t.resize(-n);
+                n = llama_tokenize(tvocab, prompts[s].c_str(), (int32_t)prompts[s].size(),
+                                   t.data(), (int32_t)t.size(), true, false); }
+            if (n <= 0) return false;
+            out[s].assign(t.begin(), t.begin() + n);
+        }
+        return true;
+    };
+    std::vector<std::vector<int32_t>> ta, tb;
+    if (!tok_all(prompts_a, ta) || !tok_all(prompts_b, tb)) {
+        error = "tokenization failed"; return -1;
+    }
+    return generate_windows_double_tok(device_slot, ta, tb, step_a, step_b, error);
+}
+
+int InferenceEngine::generate_windows_double_tok(int device_slot,
+                                             const std::vector<std::vector<int32_t>>& toks_a,
+                                             const std::vector<std::vector<int32_t>>& toks_b,
+                                             const StepSampler& step_a,
+                                             const StepSampler& step_b,
+                                             std::string& error) {
     if (!cfg_.double_buffer) { error = "engine not loaded with double_buffer"; return -1; }
     if (device_slot < 0 || device_slot >= static_cast<int>(instances_.size())) {
         error = "invalid device slot"; return -1;
@@ -462,9 +510,12 @@ int InferenceEngine::generate_windows_double(int device_slot,
     llama_context* CB = in.ctx_b;   // batch B — sequences 0..S-1 on ITS context
     const llama_vocab* vocab = llama_model_get_vocab(in.model);
     const int n_vocab = llama_vocab_n_tokens(vocab);
-    const int S = static_cast<int>(prompts_a.size());
+    (void)vocab;
+    const int S = static_cast<int>(toks_a.size());
     if (S < 1 || S > cfg_.slots_per_device ||
-        prompts_b.size() != static_cast<size_t>(S)) { error = "bad stream count"; return -1; }
+        toks_b.size() != static_cast<size_t>(S)) { error = "bad stream count"; return -1; }
+    for (int s = 0; s < S; ++s)
+        if (toks_a[s].empty() || toks_b[s].empty()) { error = "empty prompt"; return -1; }
 
     // Private logits buffers: llama's output tensor is REUSED by the next
     // decode, so batch A's logits are copied out before batch B's decode is
@@ -476,26 +527,6 @@ int InferenceEngine::generate_windows_double(int device_slot,
         in.dbuf[1] = pow_gpu_device_alloc(need);
         in.dbuf_bytes = (in.dbuf[0] && in.dbuf[1]) ? need : 0;
         if (!in.dbuf_bytes) { error = "cannot allocate double-buffer logits copies"; return -2; }
-    }
-
-    auto tokenize_all = [&](const std::vector<std::string>& prompts,
-                            std::vector<std::vector<llama_token>>& toks) -> bool {
-        toks.resize(S);
-        for (int s = 0; s < S; ++s) {
-            std::vector<llama_token> t(prompts[s].size() + 8);
-            int n = llama_tokenize(vocab, prompts[s].c_str(), (int32_t)prompts[s].size(),
-                                   t.data(), (int32_t)t.size(), true, false);
-            if (n < 0) { t.resize(-n);
-                n = llama_tokenize(vocab, prompts[s].c_str(), (int32_t)prompts[s].size(),
-                                   t.data(), (int32_t)t.size(), true, false); }
-            if (n <= 0) return false;
-            t.resize(n); toks[s] = std::move(t);
-        }
-        return true;
-    };
-    std::vector<std::vector<llama_token>> toks_a, toks_b;
-    if (!tokenize_all(prompts_a, toks_a) || !tokenize_all(prompts_b, toks_b)) {
-        error = "tokenization failed"; return -1;
     }
 
     llama_memory_clear(llama_get_memory(CA), true);

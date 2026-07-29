@@ -48,6 +48,10 @@ struct PoolJob {
     uint64_t    height = 0;
     uint64_t    expires_at = 0;
     uint64_t    request_id = 0;  // work unit the proof must commit to
+    // CANARY-JOBS-SPEC field 9: 64-hex prompt seed, per job. When present,
+    // window prompts MUST be derived from it (see canary.h); when absent the
+    // miner falls back to its legacy self-salted prompts.
+    std::string prompt_seed;
     bool        clean = false;   // true ⇒ parent changed, abandon in-flight work
     bool        valid = false;
 };
