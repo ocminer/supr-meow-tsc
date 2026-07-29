@@ -29,6 +29,13 @@ struct PoiJobParams {
     uint64_t    normalizer       = 1000000;
     uint64_t    request_id       = 0;
     std::string job_id;
+    // CANARY-JOBS-SPEC §19 (pool-issued VDF): when the pool supplies the
+    // Wesolowski proof with the job, the miner uses it VERBATIM instead of
+    // proving locally. This is what lets the pool precompute canary
+    // transcripts (it knows every u-preimage input), and it removes miner
+    // discretion over `tick` — which nothing on-chain bounds today.
+    std::string pool_vdf;             // hex; empty = prove locally (legacy)
+    uint64_t    pool_vdf_tick = 0;    // 0 with a non-empty pool_vdf = normative 1000
     bool        valid = false;
 };
 

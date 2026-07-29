@@ -616,6 +616,14 @@ int main(int argc, char** argv) {
         };
         cb.on_job = [&](const meow::PoolJob& j) {
             { std::lock_guard<std::mutex> lk(jm); cur_job = j; job_dirty = true; }
+            if (!j.pool_vdf.empty()) {
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true))
+                    std::printf("[%s] %spool-issued VDF ACTIVE%s — using the job's proof "
+                                "(tick %llu), not proving locally\n",
+                                timestamp_now().c_str(), C_C(), C_0(),
+                                (unsigned long long)(j.pool_vdf_tick ? j.pool_vdf_tick : 1000));
+            }
             std::printf("[%s] new job %s  height %llu  %s\n",
                         timestamp_now().c_str(), j.job_id.c_str(),
                         (unsigned long long)j.height,
@@ -804,6 +812,8 @@ int main(int argc, char** argv) {
                     p.normalizer       = m.normalizer;
                     p.job_id           = j.job_id;
                     p.request_id       = j.request_id;
+                    p.pool_vdf         = j.pool_vdf;        // §19, empty = prove locally
+                    p.pool_vdf_tick    = j.pool_vdf_tick;
                     p.valid            = true;
                     std::string perr;
                     if (!pool.set_job(p, perr) || (poolB && !poolB->set_job(p, perr))) {

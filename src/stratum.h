@@ -52,6 +52,10 @@ struct PoolJob {
     // window prompts MUST be derived from it (see canary.h); when absent the
     // miner falls back to its legacy self-salted prompts.
     std::string prompt_seed;
+    // §19 field 10/11: pool-issued Wesolowski proof over the parent hash and
+    // (optionally) its tick. Empty ⇒ the miner proves locally, as before.
+    std::string pool_vdf;
+    uint64_t    pool_vdf_tick = 0;
     bool        clean = false;   // true ⇒ parent changed, abandon in-flight work
     bool        valid = false;
 };

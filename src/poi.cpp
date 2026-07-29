@@ -183,7 +183,17 @@ bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
     // order keeps consensus and share verification in agreement.
     const std::string parent = p.header_prefix.substr(8, 64);
     auto parent_bytes = hex_to_bytes(parent);
-    if (parent != parent_hash_hex_ || vdf_hex_.empty()) {
+    if (!p.pool_vdf.empty()) {
+        // §19 pool-issued VDF: use it verbatim. The pool computed it over
+        // this parent at a tick it chose, so it knows every input to every
+        // u-preimage — the precondition for precomputing canary transcripts.
+        // No local prove, no chiavdf lock, no miner say over `tick`.
+        if (p.pool_vdf != vdf_hex_ || parent != parent_hash_hex_) {
+            vdf_hex_         = p.pool_vdf;
+            vdf_tick_        = p.pool_vdf_tick ? p.pool_vdf_tick : 1000;   // normative default
+            parent_hash_hex_ = parent;
+        }
+    } else if (parent != parent_hash_hex_ || vdf_hex_.empty()) {
         std::lock_guard<std::mutex> vlk(g_vdf_mtx);   // serialize chiavdf
         const auto prev = parent_bytes;
         // Tick count is the VDF's difficulty; the chain reads it from the proof.

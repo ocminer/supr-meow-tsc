@@ -149,9 +149,11 @@ void StratumClient::handshake() {
     json sub = {{"id", 1}, {"method", "mining.subscribe"},
                 {"params", json::array({ua_, nullptr,
                     json{{"protocol", "tsc/1.0"},
-                         // Capability: this miner derives prompts from
-                         // mining.notify field 9 (CANARY-JOBS-SPEC).
-                         {"prompt_seed", true}}})}};
+                         // Capabilities (CANARY-JOBS-SPEC): derive prompts
+                         // from notify field 9; accept a pool-issued VDF in
+                         // field 10 instead of proving locally (§19).
+                         {"prompt_seed", true},
+                         {"pool_vdf", true}}})}};
     send_line(sub.dump());
     json auth = {{"id", 2}, {"method", "mining.authorize"},
                  {"params", json::array({user_, pass_})}};
@@ -215,6 +217,18 @@ void StratumClient::handle_line(const std::string& line) {
                 const std::string s = p[8].get<std::string>();
                 if (s.size() == 64) j.prompt_seed = s;
             }
+            // Field 10 (§19): pool-issued VDF hex; field 11: its tick
+            // (absent ⇒ the normative 1000). A malformed VDF is treated as
+            // absent — the miner then proves locally and simply is not
+            // canary-precomputable for that job, which the pool can see.
+            if (p.size() > 9 && p[9].is_string()) {
+                const std::string v = p[9].get<std::string>();
+                if (!v.empty() && v.size() % 2 == 0 &&
+                    v.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos)
+                    j.pool_vdf = v;
+            }
+            if (p.size() > 10 && p[10].is_number_unsigned())
+                j.pool_vdf_tick = p[10].get<uint64_t>();
             {
                 std::lock_guard<std::mutex> lk(mtx_);
                 j.share_target = share_target_;
