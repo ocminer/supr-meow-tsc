@@ -908,6 +908,24 @@ extern "C" bool pow_gpu_sort_and_stats_batched_k(
     return ok;
 }
 
+// Device-buffer helpers for the engine's double-buffered decode: batch A's
+// logits are copied OUT of llama's (reused) output tensor before batch B's
+// decode is issued. Host-ordered: the copy is synchronized before the next
+// llama_decode call, so llama's kernels can never overwrite data still being
+// read. 29 MB D2D on a 5090 is ~40 us — noise next to a 3.8 ms decode.
+extern "C" void* pow_gpu_device_alloc(size_t bytes) {
+    void* p = nullptr;
+    if (cudaMalloc(&p, bytes) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+    return p;
+}
+extern "C" void pow_gpu_device_free(void* p) { if (p) cudaFree(p); }
+extern "C" bool pow_gpu_d2d_copy_sync(void* dst, const void* src, size_t bytes) {
+    static thread_local cudaStream_t s = nullptr;
+    if (!s && cudaStreamCreate(&s) != cudaSuccess) { cudaGetLastError(); return false; }
+    return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s) == cudaSuccess
+        && cudaStreamSynchronize(s) == cudaSuccess;
+}
+
 // Pinned host allocation for the sampler's receive buffers. An "async" D2H
 // into pageable memory is synchronous in effect — the driver stages it and
 // blocks; with a PITCHED 2D copy it degrades to row-by-row staging, which

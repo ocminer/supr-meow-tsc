@@ -10,8 +10,14 @@
 
 #ifdef POW_GPU_SORT_ENABLED
 extern "C" bool pow_gpu_is_device_ptr(const void* p);
+extern "C" void* pow_gpu_device_alloc(size_t bytes);
+extern "C" void  pow_gpu_device_free(void* p);
+extern "C" bool  pow_gpu_d2d_copy_sync(void* dst, const void* src, size_t bytes);
 #else
 static inline bool pow_gpu_is_device_ptr(const void*) { return false; }
+static inline void* pow_gpu_device_alloc(size_t) { return nullptr; }
+static inline void  pow_gpu_device_free(void*) {}
+static inline bool  pow_gpu_d2d_copy_sync(void*, const void*, size_t) { return false; }
 #endif
 
 namespace meow {
@@ -20,9 +26,19 @@ struct InferenceEngine::Instance {
     int             device      = -1;
     llama_model*    model       = nullptr;   // shared; owned by owns_model==true
     llama_context*  ctx         = nullptr;
+    // Second context for the double-buffered decode: each batch keeps a
+    // STABLE sequence set on its own context, so llama's graph reuse
+    // survives — alternating seq-id sets on ONE context forced a graph
+    // rebuild every decode (measured: ~2x decode cost, a net LOSS).
+    llama_context*  ctx_b       = nullptr;
     bool            owns_model  = false;      // only the first worker frees it
+    void*           dbuf[2]     = {nullptr, nullptr};   // double-buffer logits copies
+    size_t          dbuf_bytes  = 0;
 
     ~Instance() {
+        pow_gpu_device_free(dbuf[0]);
+        pow_gpu_device_free(dbuf[1]);
+        if (ctx_b) llama_free(ctx_b);
         if (ctx)   llama_free(ctx);
         if (owns_model && model) llama_model_free(model);
     }
@@ -112,6 +128,14 @@ bool InferenceEngine::load(const EngineConfig& cfg, std::string& error,
                 error = "failed to create context " + std::to_string(w) + " on GPU " +
                         std::to_string(dev) + " (try fewer slots/workers or a smaller ctx)";
                 return false;
+            }
+            if (cfg.double_buffer) {
+                inst->ctx_b = llama_init_from_model(inst->model, cp);
+                if (!inst->ctx_b) {
+                    error = "failed to create the double-buffer context on GPU " +
+                            std::to_string(dev) + " (try fewer slots or a smaller ctx)";
+                    return false;
+                }
             }
             instances_.push_back(std::move(inst));
         }
@@ -420,6 +444,201 @@ int InferenceEngine::generate_windows_stepwise(int device_slot,
                    per_step_ms > 0 ? 1000.0 * S / (256.0 * per_step_ms) : 0.0); }
     llama_batch_free(nb);
     return S;
+}
+
+int InferenceEngine::generate_windows_double(int device_slot,
+                                             const std::vector<std::string>& prompts_a,
+                                             const std::vector<std::string>& prompts_b,
+                                             const StepSampler& step_a,
+                                             const StepSampler& step_b,
+                                             std::string& error) {
+    if (!cfg_.double_buffer) { error = "engine not loaded with double_buffer"; return -1; }
+    if (device_slot < 0 || device_slot >= static_cast<int>(instances_.size())) {
+        error = "invalid device slot"; return -1;
+    }
+    Instance& in = *instances_[device_slot];
+    if (!in.ctx_b) { error = "no double-buffer context"; return -2; }
+    llama_context* CA = in.ctx;     // batch A — sequences 0..S-1 on ITS context
+    llama_context* CB = in.ctx_b;   // batch B — sequences 0..S-1 on ITS context
+    const llama_vocab* vocab = llama_model_get_vocab(in.model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    const int S = static_cast<int>(prompts_a.size());
+    if (S < 1 || S > cfg_.slots_per_device ||
+        prompts_b.size() != static_cast<size_t>(S)) { error = "bad stream count"; return -1; }
+
+    // Private logits buffers: llama's output tensor is REUSED by the next
+    // decode, so batch A's logits are copied out before batch B's decode is
+    // issued (and vice versa). Host-ordered sync makes the copy race-free.
+    const size_t need = sizeof(float) * static_cast<size_t>(S) * n_vocab;
+    if (in.dbuf_bytes < need) {
+        pow_gpu_device_free(in.dbuf[0]); pow_gpu_device_free(in.dbuf[1]);
+        in.dbuf[0] = pow_gpu_device_alloc(need);
+        in.dbuf[1] = pow_gpu_device_alloc(need);
+        in.dbuf_bytes = (in.dbuf[0] && in.dbuf[1]) ? need : 0;
+        if (!in.dbuf_bytes) { error = "cannot allocate double-buffer logits copies"; return -2; }
+    }
+
+    auto tokenize_all = [&](const std::vector<std::string>& prompts,
+                            std::vector<std::vector<llama_token>>& toks) -> bool {
+        toks.resize(S);
+        for (int s = 0; s < S; ++s) {
+            std::vector<llama_token> t(prompts[s].size() + 8);
+            int n = llama_tokenize(vocab, prompts[s].c_str(), (int32_t)prompts[s].size(),
+                                   t.data(), (int32_t)t.size(), true, false);
+            if (n < 0) { t.resize(-n);
+                n = llama_tokenize(vocab, prompts[s].c_str(), (int32_t)prompts[s].size(),
+                                   t.data(), (int32_t)t.size(), true, false); }
+            if (n <= 0) return false;
+            t.resize(n); toks[s] = std::move(t);
+        }
+        return true;
+    };
+    std::vector<std::vector<llama_token>> toks_a, toks_b;
+    if (!tokenize_all(prompts_a, toks_a) || !tokenize_all(prompts_b, toks_b)) {
+        error = "tokenization failed"; return -1;
+    }
+
+    llama_memory_clear(llama_get_memory(CA), true);
+    llama_memory_clear(llama_get_memory(CB), true);
+    llama_set_skip_logits_copy(CA, false);   // prompt passes use host logits
+    llama_set_skip_logits_copy(CB, false);
+
+    // Prompt pass for one batch ON ITS OWN CONTEXT; host logits are consumed
+    // IMMEDIATELY (step 0 sampled here) since the next decode on that context
+    // overwrites the shared host output buffer.
+    std::vector<std::vector<int64_t>> ctx_a(S), ctx_b(S);
+    std::vector<int> tok_a(S, -1), tok_b(S, -1);
+    auto prompt_and_step0 = [&](llama_context* C,
+                                const std::vector<std::vector<llama_token>>& toks,
+                                const StepSampler& step,
+                                std::vector<std::vector<int64_t>>& ctxv,
+                                std::vector<int>& first_tok) -> bool {
+        int total = 0; for (auto& t : toks) total += (int)t.size();
+        llama_batch pb = llama_batch_init(total, 0, S);
+        std::vector<int32_t> last_row(S, -1);
+        for (int s = 0; s < S; ++s) {
+            for (size_t i = 0; i < toks[s].size(); ++i) {
+                const int r = pb.n_tokens++;
+                pb.token[r] = toks[s][i];
+                pb.pos[r]   = (llama_pos)i;
+                pb.n_seq_id[r] = 1;
+                pb.seq_id[r][0] = (llama_seq_id)s;
+                pb.logits[r] = (i + 1 == toks[s].size());
+                if (pb.logits[r]) last_row[s] = r;
+            }
+        }
+        const int prc = llama_decode(C, pb);
+        llama_batch_free(pb);
+        if (prc != 0) { error = "prompt decode failed"; return false; }
+        for (int s = 0; s < S; ++s) {
+            ctxv[s].clear();
+            ctxv[s].reserve(toks[s].size() + cfg_.window_tokens);
+            for (llama_token t : toks[s]) ctxv[s].push_back((int64_t)t);
+        }
+        std::vector<const float*> all(S, nullptr);
+        for (int s = 0; s < S; ++s) {
+            all[s] = llama_get_logits_ith(C, last_row[s]);
+            if (!all[s]) { error = "no logits returned"; return false; }
+        }
+        if (!step(all, nullptr, n_vocab, ctxv, first_tok)) { error = "sampler step failed"; return false; }
+        for (int s = 0; s < S; ++s) {
+            if (first_tok[s] < 0) { error = "sampler aborted a window"; return false; }
+            ctxv[s].push_back((int64_t)first_tok[s]);
+        }
+        return true;
+    };
+    if (!prompt_and_step0(CA, toks_a, step_a, ctx_a, tok_a)) return -1;
+    if (!prompt_and_step0(CB, toks_b, step_b, ctx_b, tok_b)) return -1;
+
+    // Generation decode of one batch's current tokens (async, on its context).
+    llama_batch nb = llama_batch_init(S, 0, S);
+    auto issue_decode = [&](llama_context* C, const std::vector<int>& toks_now, int step_i,
+                            const std::vector<std::vector<llama_token>>& ptoks) -> bool {
+        nb.n_tokens = 0;
+        for (int s = 0; s < S; ++s) {
+            const int r = nb.n_tokens++;
+            nb.token[r] = (llama_token)toks_now[s];
+            nb.pos[r]   = (llama_pos)(ptoks[s].size() + step_i);
+            nb.n_seq_id[r] = 1;
+            nb.seq_id[r][0] = (llama_seq_id)s;
+            nb.logits[r] = true;
+        }
+        return llama_decode(C, nb) == 0;
+    };
+
+    // Sync a context's pending decode, copy its logits to a private buffer.
+    auto sync_and_copy = [&](llama_context* C, int which) -> const float* {
+        int32_t ndev = 0;
+        void* p = llama_get_logits_device(C, &ndev);   // synchronizes C
+        if (!p || ndev != S) return nullptr;
+        if (!pow_gpu_d2d_copy_sync(in.dbuf[which], p, need)) return nullptr;
+        return static_cast<const float*>(in.dbuf[which]);
+    };
+
+    const auto t0 = std::chrono::steady_clock::now();
+    // First generation decode of A; from here on host copies are skipped.
+    llama_set_skip_logits_copy(CA, true);
+    llama_set_skip_logits_copy(CB, true);
+    bool ok = issue_decode(CA, tok_a, 0, toks_a);
+    std::vector<const float*> dummy(S, nullptr);
+    std::vector<int> next_a(S, -1), next_b(S, -1);
+    bool first = true;
+
+    for (int step_i = 1; step_i < cfg_.window_tokens && ok; ++step_i) {
+        // --- A(step_i): sync CA, copy out, then B's decode fills the pipe.
+        const float* da = sync_and_copy(CA, 0);
+        if (!da) {
+            if (first) {   // device path genuinely unavailable — clean fallback
+                llama_set_skip_logits_copy(CA, false);
+                llama_set_skip_logits_copy(CB, false);
+                llama_batch_free(nb);
+                return -2;
+            }
+            ok = false; break;
+        }
+        first = false;
+        ok = issue_decode(CB, tok_b, step_i - 1, toks_b);
+        if (!ok) break;
+        if (!step_a(dummy, da, n_vocab, ctx_a, next_a)) { ok = false; break; }
+        for (int s = 0; s < S; ++s) {
+            if (next_a[s] < 0) { ok = false; break; }
+            ctx_a[s].push_back((int64_t)next_a[s]);
+        }
+        if (!ok) break;
+        tok_a.swap(next_a);
+
+        // --- B(step_i-1): sync CB, copy out, then A's next decode fills the pipe.
+        const float* db = sync_and_copy(CB, 1);
+        if (!db) { ok = false; break; }
+        ok = issue_decode(CA, tok_a, step_i, toks_a);
+        if (!ok) break;
+        if (!step_b(dummy, db, n_vocab, ctx_b, next_b)) { ok = false; break; }
+        for (int s = 0; s < S; ++s) {
+            if (next_b[s] < 0) { ok = false; break; }
+            ctx_b[s].push_back((int64_t)next_b[s]);
+        }
+        if (!ok) break;
+        tok_b.swap(next_b);
+    }
+
+    // Both batches sampled steps 0..255 (B lags A only inside an iteration).
+    // The last issued decode — A's step-255 token — is waste; drain both
+    // contexts so the next call starts quiet.
+    if (ok) { llama_synchronize(CA); llama_synchronize(CB); }
+    llama_set_skip_logits_copy(CA, false);
+    llama_set_skip_logits_copy(CB, false);
+    llama_batch_free(nb);
+    if (!ok) { if (error.empty()) error = "double-buffered window failed"; return -1; }
+
+    const double secs = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    static thread_local uint64_t dn = 0;
+    static thread_local double dacc = 0;
+    dacc += secs; ++dn;
+    if (dn % 4 == 0)
+        std::fprintf(stderr, "[prof-dbl] loop=%.2fs for 2x%d windows (%.1f w/s in-loop)\n",
+                     dacc / dn, S, 2.0 * S * dn / dacc);
+    return 2 * S;
 }
 
 std::vector<DeviceEngineStats> InferenceEngine::benchmark(int windows_per_device, std::string& error) {

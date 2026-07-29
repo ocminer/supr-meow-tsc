@@ -481,9 +481,18 @@ int main(int argc, char** argv) {
         }
 
         // ---- real mining -------------------------------------------------
+        // Double-buffered decode is the default: two window batches alternate
+        // so the GPU never drains between sample steps. MEOW_DOUBLE_BUFFER=0
+        // reverts to the single-batch path (also the automatic fallback when
+        // GPU-resident logits are unavailable).
+        const bool want_double = [](){
+            const char* e = std::getenv("MEOW_DOUBLE_BUFFER");
+            return !(e && *e == '0');
+        }();
         meow::EngineConfig ec;
         ec.model_path       = o.model_path;
         ec.slots_per_device = o.slots;
+        ec.double_buffer    = want_double;
         for (const auto& d : dm.devices()) ec.devices.push_back(d.index);
 
         meow::InferenceEngine engine;
@@ -516,7 +525,8 @@ int main(int argc, char** argv) {
         // range, e.g. GPU 0 at 47021 and GPU 1 at 48021, so the two processes'
         // loopback egress and nonce partitions never overlap.
         const int n_workers = engine.worker_count();
-        std::vector<std::unique_ptr<meow::SamplerPool>> pools;
+        std::vector<std::unique_ptr<meow::SamplerPool>> pools;    // batch A
+        std::vector<std::unique_ptr<meow::SamplerPool>> pools_b;  // batch B (double-buffer)
         for (int w = 0; w < n_workers; ++w) {
             auto sp = std::make_unique<meow::SamplerPool>();
             if (!sp->init(n_streams, n_groups, o.egress_base + w * 64, engine.worker_device(w), eerr)) {
@@ -525,6 +535,18 @@ int main(int argc, char** argv) {
                 return 1;
             }
             pools.push_back(std::move(sp));
+            if (want_double) {
+                // Its own coordinators, egress ports and nonce partition —
+                // batch B is a fully independent set of windows.
+                auto sb = std::make_unique<meow::SamplerPool>();
+                if (!sb->init(n_streams, n_groups, o.egress_base + w * 64 + 32,
+                              engine.worker_device(w), eerr)) {
+                    std::fprintf(stderr, "error: %s\n", eerr.c_str());
+                    client.stop();
+                    return 1;
+                }
+                pools_b.push_back(std::move(sb));
+            }
         }
         std::printf("  proof-of-inference ready — %d context(s) x %d sampler group(s) across %zu device(s)\n\n",
                     n_workers, n_groups, engine.config().devices.size());
@@ -558,8 +580,10 @@ int main(int argc, char** argv) {
 
         auto mine_device = [&](int worker) {
             meow::SamplerPool& pool = *pools[worker];
+            meow::SamplerPool* poolB = want_double ? pools_b[worker].get() : nullptr;
             pow_gpu_bind_device(engine.worker_device(worker));
             uint64_t my_windows = 0;
+            bool double_ok = want_double;   // falls false if -2 (no device logits)
             while (!g_stop) {
                 meow::PoolJob   j;
                 meow::PoolModel m;
@@ -580,29 +604,53 @@ int main(int argc, char** argv) {
                     p.request_id       = j.request_id;
                     p.valid            = true;
                     std::string perr;
-                    if (!pool.set_job(p, perr)) {
+                    if (!pool.set_job(p, perr) || (poolB && !poolB->set_job(p, perr))) {
                         std::fprintf(stderr, "  job rejected: %s\n", perr.c_str());
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                         continue;
                     }
                 }
 
-                std::vector<std::string> prompts;
-                prompts.reserve(n_streams);
-                for (int st = 0; st < n_streams; ++st)
-                    prompts.push_back("Explain distributed consensus in detail. [" +
-                        std::to_string(prompt_salt) + "-" + std::to_string(worker) + "-" +
-                        std::to_string(my_windows) + "-" + std::to_string(st) + "]");
+                auto make_prompts = [&](const char* tag) {
+                    std::vector<std::string> prompts;
+                    prompts.reserve(n_streams);
+                    for (int st = 0; st < n_streams; ++st)
+                        prompts.push_back("Explain distributed consensus in detail. [" +
+                            std::to_string(prompt_salt) + "-" + std::to_string(worker) + tag +
+                            std::to_string(my_windows) + "-" + std::to_string(st) + "]");
+                    return prompts;
+                };
 
                 std::string gerr;
                 const auto tb0 = std::chrono::steady_clock::now();
-                const int n = engine.generate_windows_stepwise(worker, prompts,
-                    [&](const std::vector<const float*>& all, const float* dev,
-                        int n_vocab,
-                        const std::vector<std::vector<int64_t>>& ctx,
-                        std::vector<int>& out) -> bool {
-                        return pool.sample_step(all, dev, n_vocab, ctx, out);
-                    }, gerr);
+                int n = -1;
+                if (double_ok) {
+                    n = engine.generate_windows_double(worker,
+                        make_prompts("A"), make_prompts("B"),
+                        [&](const std::vector<const float*>& all, const float* dev,
+                            int n_vocab, const std::vector<std::vector<int64_t>>& ctx,
+                            std::vector<int>& out) -> bool {
+                            return pool.sample_step(all, dev, n_vocab, ctx, out);
+                        },
+                        [&](const std::vector<const float*>& all, const float* dev,
+                            int n_vocab, const std::vector<std::vector<int64_t>>& ctx,
+                            std::vector<int>& out) -> bool {
+                            return poolB->sample_step(all, dev, n_vocab, ctx, out);
+                        }, gerr);
+                    if (n == -2) {
+                        double_ok = false;
+                        std::fprintf(stderr, "  device logits unavailable — single-batch fallback\n");
+                        continue;
+                    }
+                } else {
+                    n = engine.generate_windows_stepwise(worker, make_prompts("-"),
+                        [&](const std::vector<const float*>& all, const float* dev,
+                            int n_vocab,
+                            const std::vector<std::vector<int64_t>>& ctx,
+                            std::vector<int>& out) -> bool {
+                            return pool.sample_step(all, dev, n_vocab, ctx, out);
+                        }, gerr);
+                }
                 const auto tb1 = std::chrono::steady_clock::now();
                 if (n < 0) {
                     std::fprintf(stderr, "  window failed (worker %d): %s\n", worker, gerr.c_str());
@@ -619,6 +667,9 @@ int main(int argc, char** argv) {
                     std::lock_guard<std::mutex> lk(submit_mx);
                     while (auto sh = pool.take_share())
                         submit_q.push_back({std::move(sh), engine.worker_device(worker)});
+                    if (poolB)
+                        while (auto sh = poolB->take_share())
+                            submit_q.push_back({std::move(sh), engine.worker_device(worker)});
                 }
                 submit_cv.notify_one();
                 // End-to-end batch accounting — [prof] times only the

@@ -50,6 +50,9 @@ struct EngineConfig {
     // what lets the batch scale past ~48 slots.
     int               ctx_per_slot     = 384;
     int               threads          = 0;  // 0 = auto
+    // Double-buffered decode (generate_windows_double): doubles n_seq_max and
+    // n_ctx so two full window batches coexist in the KV cache.
+    bool              double_buffer    = false;
 };
 
 struct DeviceEngineStats {
@@ -121,6 +124,21 @@ public:
     int generate_windows_stepwise(int device_slot,
                                   const std::vector<std::string>& prompts,
                                   const StepSampler& step, std::string& error);
+
+    // Double-buffered variant: TWO window batches (A = seqs [0,S), B = seqs
+    // [S,2S)) alternate on one context, so the GPU decodes batch B while the
+    // CPU samples batch A from a private D2D copy of its logits — the decode
+    // pipe never drains. Requires GPU-resident logits (the device pointer is
+    // the thing being copied); returns -2 if that is unavailable so the
+    // caller can fall back to the single-batch path. cfg.double_buffer must
+    // have been set at load() time (it doubles n_ctx / n_seq_max).
+    // Returns 2*S windows on success.
+    int generate_windows_double(int device_slot,
+                                const std::vector<std::string>& prompts_a,
+                                const std::vector<std::string>& prompts_b,
+                                const StepSampler& step_a,
+                                const StepSampler& step_b,
+                                std::string& error);
 
     // Throughput measurement across every loaded device, used by --benchmark.
     std::vector<DeviceEngineStats> benchmark(int windows_per_device, std::string& error);
