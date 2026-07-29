@@ -1,3 +1,6 @@
 build/
 *.o
 *.so
+
+# Local working doc: names pool infrastructure, must never reach the public repo.
+CONTINUE-HERE-MINER.md
