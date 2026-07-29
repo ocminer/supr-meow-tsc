@@ -270,9 +270,35 @@ extern "C" bool pow_gpu_sort_and_stats_device_k(
         uint32_t* h_idx, float* h_val, float* h_head, double* h_stats, float* h_probes);
 extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 extern "C" bool pow_gpu_register_host_range(const void* p, size_t bytes);
+extern "C" bool pow_gpu_corrupt_device(float* d_logits, int S, int n, int mode,
+                                       float sigma, uint64_t seed);
+extern "C" void* pow_gpu_device_alloc(size_t bytes);
+extern "C" bool pow_gpu_d2d_copy_sync(void* dst, const void* src, size_t bytes);
 #else
 static inline bool pow_gpu_register_host_range(const void*, size_t) { return false; }
 #endif
+
+namespace {
+// Corruption test mode (POW_CORRUPT): 0 off, 1 random, 2 noise, 3 replay.
+// Dishonest by design — for measuring what the pool's checks catch. See
+// pow_gpu.cu. Read once, process-wide.
+struct CorruptCfg {
+    int   mode  = 0;
+    float sigma = 0.5f;
+    CorruptCfg() {
+        if (const char* m = std::getenv("POW_CORRUPT")) mode = std::atoi(m);
+        if (const char* s = std::getenv("POW_CORRUPT_SIGMA")) sigma = (float)std::atof(s);
+        if (mode) {
+            std::fprintf(stderr,
+                "[corrupt] MODE %d ACTIVE (%s) — proofs are DELIBERATELY WRONG; "
+                "never point this at a payable worker\n", mode,
+                mode == 1 ? "random" : mode == 2 ? "noise" : mode == 3 ? "replay" : "?");
+            std::fflush(stderr);
+        }
+    }
+};
+const CorruptCfg& corrupt_cfg() { static const CorruptCfg c; return c; }
+}  // namespace
 
 void PoiMiner::prepare_batch(const std::vector<const float*>& logits, int n_vocab) {
 #ifdef POW_GPU_SORT_ENABLED
@@ -483,6 +509,9 @@ struct SamplerPool::Impl {
     size_t sort_cap = 0; int sort_S = 0;
     int sort_stride = 0; bool sort_ok = false;
     bool reg_done = false;   // llama logits block page-locked (once)
+    void*    corrupt_buf = nullptr;   // POW_CORRUPT: private mutable logits copy
+    size_t   corrupt_cap = 0;
+    uint64_t corrupt_seq = 0;         // varies the corruption per step
     void free_sort_bufs() {
         pow_gpu_host_free(sort_idx);  pow_gpu_host_free(sort_val);
         pow_gpu_host_free(sort_head); pow_gpu_host_free(sort_stats);
@@ -665,6 +694,27 @@ bool SamplerPool::sample_step(const std::vector<const float*>& logits,
             impl_->reg_done = true;
         }
     }
+#ifdef POW_GPU_SORT_ENABLED
+    // Corruption test mode: mutate a PRIVATE copy of the device logits, then
+    // let the whole real pipeline (snap, sort, stats, sampling, proof) run on
+    // the corrupted values — so the emitted proof is internally consistent
+    // but not what the registered model produced. Device path only; that is
+    // the production path.
+    if (corrupt_cfg().mode && dev_logits) {
+        const size_t bytes = sizeof(float) * (size_t)impl_->n_streams * n_vocab;
+        if (impl_->corrupt_cap < bytes) {
+            impl_->corrupt_buf = pow_gpu_device_alloc(bytes);
+            impl_->corrupt_cap = impl_->corrupt_buf ? bytes : 0;
+        }
+        if (impl_->corrupt_buf &&
+            pow_gpu_d2d_copy_sync(impl_->corrupt_buf, dev_logits, bytes) &&
+            pow_gpu_corrupt_device((float*)impl_->corrupt_buf, impl_->n_streams, n_vocab,
+                                   corrupt_cfg().mode, corrupt_cfg().sigma,
+                                   ++impl_->corrupt_seq)) {
+            dev_logits = (const float*)impl_->corrupt_buf;
+        }
+    }
+#endif
     {
         std::lock_guard<std::mutex> lk(impl_->mtx);
         impl_->in_logits  = &logits;

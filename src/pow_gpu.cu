@@ -926,6 +926,68 @@ extern "C" bool pow_gpu_d2d_copy_sync(void* dst, const void* src, size_t bytes) 
         && cudaStreamSynchronize(s) == cudaSuccess;
 }
 
+// ==========================================================================
+// CORRUPTOR (test-only, POW_CORRUPT=<mode>). Deliberately produces proofs
+// that are NOT what the registered model computed, so the pool can measure
+// what its fingerprint/canary checks actually catch. Modes:
+//   1 random   — logits replaced by uniform noise in a plausible range
+//   2 noise    — real logits + Gaussian noise (POW_CORRUPT_SIGMA, default 0.5)
+//   3 replay   — logits of stream (s+1)%S used for stream s (context mismatch)
+// NEVER enable on a payable worker: these are dishonest shares by design.
+// ==========================================================================
+__global__ void k_corrupt_random(float* __restrict__ v, int total, uint64_t seed) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    uint64_t x = seed ^ (uint64_t)i * 0x9E3779B97F4A7C15ull;
+    x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 27; x *= 0x94D049BB133111EBull;
+    x ^= x >> 31;
+    // uniform in [-8, 24) — the rough range real logits occupy
+    v[i] = -8.0f + 32.0f * ((float)(x >> 40) / 16777216.0f);
+}
+__global__ void k_corrupt_noise(float* __restrict__ v, int total, uint64_t seed, float sigma) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    uint64_t x = seed ^ (uint64_t)i * 0x9E3779B97F4A7C15ull;
+    x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 27; x *= 0x94D049BB133111EBull;
+    x ^= x >> 31;
+    const float u1 = fmaxf(1e-7f, (float)((x >> 40) & 0xFFFFFF) / 16777216.0f);
+    const float u2 = (float)((x >> 16) & 0xFFFFFF) / 16777216.0f;
+    v[i] += sigma * sqrtf(-2.0f * logf(u1)) * cosf(6.2831853f * u2);
+}
+extern "C" bool pow_gpu_corrupt_device(float* d_logits, int S, int n, int mode,
+                                       float sigma, uint64_t seed) {
+    const int total = S * n;
+    const int T = 256, G = (total + T - 1) / T;
+    static thread_local cudaStream_t cs = nullptr;
+    if (!cs && cudaStreamCreate(&cs) != cudaSuccess) { cudaGetLastError(); return false; }
+    if (mode == 1) {
+        k_corrupt_random<<<G, T, 0, cs>>>(d_logits, total, seed);
+    } else if (mode == 2) {
+        k_corrupt_noise<<<G, T, 0, cs>>>(d_logits, total, seed, sigma);
+    } else if (mode == 3) {
+        // Rotate rows by one stream: s reads (s+1)%S. Needs a temp copy of
+        // row 0 so the rotation is not destructive.
+        static thread_local float* tmp = nullptr;
+        static thread_local size_t tmp_n = 0;
+        if (tmp_n < (size_t)n) {
+            if (tmp) cudaFree(tmp);
+            if (cudaMalloc(&tmp, sizeof(float) * n) != cudaSuccess) { cudaGetLastError(); return false; }
+            tmp_n = n;
+        }
+        cudaMemcpyAsync(tmp, d_logits, sizeof(float) * n, cudaMemcpyDeviceToDevice, cs);
+        for (int s = 0; s + 1 < S; ++s)
+            cudaMemcpyAsync(d_logits + (size_t)s * n, d_logits + (size_t)(s + 1) * n,
+                            sizeof(float) * n, cudaMemcpyDeviceToDevice, cs);
+        cudaMemcpyAsync(d_logits + (size_t)(S - 1) * n, tmp, sizeof(float) * n,
+                        cudaMemcpyDeviceToDevice, cs);
+    } else {
+        return false;
+    }
+    return cudaStreamSynchronize(cs) == cudaSuccess && cudaGetLastError() == cudaSuccess;
+}
+
 // Pinned host allocation for the sampler's receive buffers. An "async" D2H
 // into pageable memory is synchronous in effect — the driver stages it and
 // blocks; with a PITCHED 2D copy it degrades to row-by-row staging, which
