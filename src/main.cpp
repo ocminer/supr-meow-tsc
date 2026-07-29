@@ -114,6 +114,8 @@ struct Options {
     bool        vdf_test     = false;
     std::string vdf_vector;          // --vdf-vector <64-hex parent> -> print exact vdf bytes
     std::string canary_test;         // --canary-test <seed64hex>:<w> -> print step-0 top-10
+    std::string canary_ref;          // --canary-ref <seed64hex>:<wmax> -> emit reference table
+    std::string canary_out;          // --canary-out <path> (default canary-ref-<seed8>.jsonl)
     int         slots = 8;
     int         workers = 1;   // independent contexts per GPU (--workers)
     int         groups  = 8;   // parallel sampler threads per GPU (--groups)
@@ -199,6 +201,8 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--vdf-test")        o.vdf_test = true;
         else if (a == "--vdf-vector")      { if (!need_value(i, argc, "--vdf-vector")) return false; o.vdf_vector = argv[++i]; }
         else if (a == "--canary-test")     { if (!need_value(i, argc, "--canary-test")) return false; o.canary_test = argv[++i]; }
+        else if (a == "--canary-ref")      { if (!need_value(i, argc, "--canary-ref")) return false; o.canary_ref = argv[++i]; }
+        else if (a == "--canary-out")      { if (!need_value(i, argc, "--canary-out")) return false; o.canary_out = argv[++i]; }
         else if (a == "--slots")           { if (!need_value(i, argc, "--slots")) return false; o.slots = std::atoi(argv[++i]); }
         else if (a == "--workers")         { if (!need_value(i, argc, "--workers")) return false; o.workers = std::atoi(argv[++i]); }
         else if (a == "--groups")          { if (!need_value(i, argc, "--groups")) return false; o.groups = std::atoi(argv[++i]); }
@@ -342,6 +346,112 @@ int main(int argc, char** argv) {
         std::printf("parent  = %s\ntick    = %llu\nvdf_len = %zu bytes\nvdf     = %s\n",
                     o.vdf_vector.c_str(), (unsigned long long)tick, proof.size(),
                     meow::Vdf::to_hex(proof).c_str());
+        return 0;
+    }
+
+    if (!o.canary_ref.empty()) {
+        // Reference-table generator (CANARY-JOBS-SPEC, pool-side automation):
+        // for every w in [0, wmax) derive the prompt, run the prompt pass in
+        // BATCHES, and emit one JSONL record per w with the step-0 top-64
+        // (ids + bf16-snapped values, §4.1 tie rule). This binary IS the
+        // reference implementation — the same engine, snap and sort that
+        // mine — so on the same GPU arch the table matches compliant miners
+        // bit-for-bit, and the chain's Σ_err envelope covers the rest.
+        const auto colon = o.canary_ref.rfind(':');
+        if (colon == std::string::npos) {
+            std::fprintf(stderr, "error: --canary-ref wants <seed64hex>:<wmax>\n"); return 2;
+        }
+        std::vector<uint8_t> seed;
+        const std::string seed_hex = o.canary_ref.substr(0, colon);
+        if (!meow::canary_parse_seed(seed_hex, seed)) {
+            std::fprintf(stderr, "error: bad seed hex\n"); return 2;
+        }
+        const uint32_t wmax = (uint32_t)std::strtoul(o.canary_ref.c_str() + colon + 1, nullptr, 10);
+        if (wmax == 0) { std::fprintf(stderr, "error: wmax must be > 0\n"); return 2; }
+
+        meow::EngineConfig ec;
+        ec.model_path = o.model_path;
+        ec.slots_per_device = std::max(1, o.slots);
+        ec.devices.push_back(dm.devices()[0].index);
+        meow::InferenceEngine engine;
+        std::string eerr;
+        if (!engine.load(ec, eerr, nullptr)) { std::fprintf(stderr, "error: %s\n", eerr.c_str()); return 1; }
+        const int n_vocab = engine.n_vocab();
+        constexpr int kTopK = 64;
+
+        const std::string out_path = !o.canary_out.empty() ? o.canary_out
+            : "canary-ref-" + seed_hex.substr(0, 8) + ".jsonl";
+        FILE* out = std::fopen(out_path.c_str(), "w");
+        if (!out) { std::fprintf(stderr, "error: cannot open %s\n", out_path.c_str()); return 1; }
+        {
+            nlohmann::json hdr;
+            hdr["format"]    = "supr-meow-tsc canary-ref v1";
+            hdr["generator"] = std::string("supr-meow-tsc/") + kVersion;
+            hdr["model"]     = o.model_path;
+            hdr["n_vocab"]   = n_vocab;
+            hdr["seed"]      = seed_hex;
+            hdr["wmax"]      = wmax;
+            hdr["top_k"]     = kTopK;
+            hdr["snap"]      = "bf16";
+            hdr["tie_rule"]  = "desc value, ties asc token id (spec 4.1)";
+            std::fprintf(out, "%s\n", hdr.dump().c_str());
+        }
+
+        const int S = ec.slots_per_device;
+        uint32_t done = 0;
+        const auto tgen0 = std::chrono::steady_clock::now();
+        for (uint32_t w0 = 0; w0 < wmax; w0 += (uint32_t)S) {
+            const int batch = (int)std::min<uint32_t>((uint32_t)S, wmax - w0);
+            std::vector<std::vector<int32_t>> prompts;
+            prompts.reserve(batch);
+            for (int b = 0; b < batch; ++b)
+                prompts.push_back(meow::canary_derive_prompt(seed, w0 + (uint32_t)b, n_vocab));
+            bool captured = false;
+            engine.generate_windows_stepwise_tok(0, prompts,
+                [&](const std::vector<const float*>& all, const float*, int nv,
+                    const std::vector<std::vector<int64_t>>&, std::vector<int>&) -> bool {
+                    for (int b = 0; b < batch; ++b) {
+                        std::vector<std::pair<float,int>> v(nv);
+                        for (int i = 0; i < nv; ++i) {
+                            uint32_t x; std::memcpy(&x, &all[b][i], 4);
+                            x = (x + (0x00007FFFu + ((x >> 16) & 1u))) & 0xFFFF0000u;
+                            float sv; std::memcpy(&sv, &x, 4);
+                            v[i] = { sv, i };
+                        }
+                        std::partial_sort(v.begin(), v.begin() + kTopK, v.end(),
+                            [](const auto& a, const auto& c){
+                                if (a.first != c.first) return a.first > c.first;
+                                return a.second < c.second;
+                            });
+                        nlohmann::json rec;
+                        rec["w"]   = w0 + (uint32_t)b;
+                        rec["key"] = meow::canary_prompt_key(prompts[b]);
+                        nlohmann::json idx = nlohmann::json::array();
+                        nlohmann::json val = nlohmann::json::array();
+                        for (int k = 0; k < kTopK; ++k) { idx.push_back(v[k].second); val.push_back(v[k].first); }
+                        rec["idx"] = std::move(idx);
+                        rec["val"] = std::move(val);
+                        std::fprintf(out, "%s\n", rec.dump().c_str());
+                    }
+                    captured = true;
+                    return false;   // step 0 is all we need
+                }, eerr);
+            if (!captured) {
+                std::fprintf(stderr, "error at w=%u: %s\n", w0, eerr.c_str());
+                std::fclose(out);
+                return 1;
+            }
+            done += (uint32_t)batch;
+            if ((w0 / (uint32_t)S) % 50 == 0) {
+                const double el = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - tgen0).count();
+                std::fprintf(stderr, "  %u/%u (%.0f w/s)\n", done, wmax, el > 0 ? done / el : 0.0);
+            }
+        }
+        std::fclose(out);
+        const double el = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - tgen0).count();
+        std::printf("wrote %u records to %s in %.1fs\n", done, out_path.c_str(), el);
         return 0;
     }
 

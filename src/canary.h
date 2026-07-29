@@ -29,4 +29,8 @@ bool canary_parse_seed(const std::string& hex, std::vector<uint8_t>& out);
 std::vector<int32_t> canary_derive_prompt(const std::vector<uint8_t>& seed32,
                                           uint32_t w, int32_t n_vocab);
 
+// Prompt key = SHA256(LE32(tok[0]) ‖ … ‖ LE32(tok[31])), lowercase hex — the
+// reference-table join key (spec §6).
+std::string canary_prompt_key(const std::vector<int32_t>& toks);
+
 }  // namespace meow

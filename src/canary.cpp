@@ -46,4 +46,21 @@ std::vector<int32_t> canary_derive_prompt(const std::vector<uint8_t>& seed32,
     return toks;
 }
 
+std::string canary_prompt_key(const std::vector<int32_t>& toks) {
+    std::vector<uint8_t> msg;
+    msg.reserve(toks.size() * 4);
+    for (int32_t t : toks) {
+        const uint32_t u = static_cast<uint32_t>(t);
+        msg.push_back(uint8_t(u)); msg.push_back(uint8_t(u >> 8));
+        msg.push_back(uint8_t(u >> 16)); msg.push_back(uint8_t(u >> 24));
+    }
+    uint8_t d[32];
+    SHA256(msg.data(), msg.size(), d);
+    static const char* hexd = "0123456789abcdef";
+    std::string out;
+    out.reserve(64);
+    for (int i = 0; i < 32; ++i) { out.push_back(hexd[d[i] >> 4]); out.push_back(hexd[d[i] & 0xF]); }
+    return out;
+}
+
 }  // namespace meow
