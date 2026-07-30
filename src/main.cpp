@@ -120,6 +120,7 @@ struct Options {
     int         workers = 1;   // independent contexts per GPU (--workers)
     int         groups  = 8;   // parallel sampler threads per GPU (--groups)
     int         egress_base = 47021;  // base loopback port for proof egress (--egress-base)
+    int         ctx_per_slot = 384;   // --ctx: KV per slot. MUST exceed prompt+window.
     std::string api_bind = "127.0.0.1:21550";  // --api-bind ("off" disables)
     std::vector<std::string> pools;   // repeated -o = failover order
     meow::DeviceTuning tuning;   // --cclock/--mclock/--pl/--fan/--lock-core
@@ -151,6 +152,8 @@ void print_usage() {
 "      --vdf-test          Self-test the VDF (prove, verify, and confirm a\n"
 "                          proof does NOT verify against another challenge).\n"
 "      --slots <n>         Concurrent windows per GPU (default 8).\n"
+"      --ctx <n>           KV tokens per slot (default 384). Must exceed\n"
+"                          prompt+window (~280); smaller fits more slots.\n"
 "      --protocol-test     Connect to the pool and print jobs/targets/model\n"
 "                          without mining. Verifies pool reachability and\n"
 "                          that both sides speak TSC Stratum.\n"
@@ -207,6 +210,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--workers")         { if (!need_value(i, argc, "--workers")) return false; o.workers = std::atoi(argv[++i]); }
         else if (a == "--groups")          { if (!need_value(i, argc, "--groups")) return false; o.groups = std::atoi(argv[++i]); }
         else if (a == "--egress-base")     { if (!need_value(i, argc, "--egress-base")) return false; o.egress_base = std::atoi(argv[++i]); }
+        else if (a == "--ctx")             { if (!need_value(i, argc, "--ctx")) return false; o.ctx_per_slot = std::atoi(argv[++i]); }
         else if (a == "--api-bind")        { if (!need_value(i, argc, "--api-bind")) return false; o.api_bind = argv[++i]; }
         else if (a == "--no-color")        o.no_color = true;
         else if (eq("-o", "--pool"))       { if (!need_value(i, argc, "-o")) return false; o.pool = argv[++i]; o.pools.push_back(o.pool); }
@@ -692,6 +696,7 @@ int main(int argc, char** argv) {
         meow::EngineConfig ec;
         ec.model_path       = o.model_path;
         ec.slots_per_device = o.slots;
+        ec.ctx_per_slot     = o.ctx_per_slot;   // smaller KV => more slots fit
         ec.double_buffer    = want_double;
         for (const auto& d : dm.devices()) ec.devices.push_back(d.index);
 
