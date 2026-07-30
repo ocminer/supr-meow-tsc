@@ -605,7 +605,16 @@ int main(int argc, char** argv) {
                         (unsigned long long)m.difficulty, m.precision.c_str());
             std::fflush(stdout);
         };
-        cb.on_target = [](const std::string& t) {
+        cb.on_target = [&](const std::string& t) {
+            // Vardiff: apply the new share target to WORK STARTED FROM NOW.
+            // Without this, cur_job keeps the target it was created with and
+            // the miner mines a stale (easier) threshold indefinitely — the
+            // pool grace-accepts for ~30 s and then returns RED. Observed on
+            // mainnet at 05:57:13, 36 s after a 128 -> 400 vardiff step.
+            // In-flight windows deliberately keep their own target: that is
+            // what the pool's grace period exists for, and re-registering
+            // mid-window would reset the sampler's rows and corrupt it.
+            { std::lock_guard<std::mutex> lk(jm); if (cur_job.valid) cur_job.share_target = t; }
             // The number a human debugs vardiff with, plus the raw target for
             // when the number is not enough.
             const double diff = target_to_difficulty(t);
@@ -794,6 +803,7 @@ int main(int argc, char** argv) {
             pow_gpu_bind_device(engine.worker_device(worker));
             uint64_t my_windows = 0;
             bool double_ok = want_double;   // falls false if -2 (no device logits)
+            std::string my_target;          // share target this pool is registered with
             while (!g_stop) {
                 meow::PoolJob   j;
                 meow::PoolModel m;
@@ -802,7 +812,11 @@ int main(int argc, char** argv) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     continue;
                 }
-                if (!pool.ready() || pool.job_id() != j.job_id) {
+                // Re-register on a new job OR a vardiff target change. Only
+                // ever here — BETWEEN window batches. set_job() clears the
+                // per-sequence context map, so calling it mid-window would
+                // restart the sampler's rows and corrupt the transcript.
+                if (!pool.ready() || pool.job_id() != j.job_id || my_target != j.share_target) {
                     meow::PoiJobParams p;
                     p.header_prefix    = j.header_prefix;
                     p.block_target     = j.block_target;
@@ -821,6 +835,7 @@ int main(int argc, char** argv) {
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                         continue;
                     }
+                    my_target = j.share_target;
                 }
 
                 // Seed-derived prompts when the job carries field 9; legacy
