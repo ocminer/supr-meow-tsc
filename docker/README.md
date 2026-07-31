@@ -132,12 +132,16 @@ starts again from zero. Your own web server or a public Hugging Face repo both
 work (Qwen3 is Apache-2.0, so redistributing a converted GGUF is fine; credit
 the source commit).
 
-A ready-to-use copy is served at:
+A ready-to-use copy is on Hugging Face (preferred — it has the bandwidth for a
+fleet pulling in parallel, and resumes cleanly):
 
 ```
-MODEL_URL=https://www.suprnova.cc/models/Qwen3-8B-9c925d64-bf16.gguf
+MODEL_URL=https://huggingface.co/ocminer/Qwen3-8B-9c925d64-bf16-GGUF/resolve/main/Qwen3-8B-9c925d64-bf16.gguf
 MODEL_SHA256=fef5847c18f860086007cec0b08960f206c13c5cba69e3ed6292ee1e02ed7e44
 ```
+
+Mirror: `https://www.suprnova.cc/models/Qwen3-8B-9c925d64-bf16.gguf` (same
+bytes, same checksum).
 
 Worth verifying any mirror before a fleet depends on it — `curl -sI` should
 report `content-length: 16388043744` and `accept-ranges: bytes`, and hashing
