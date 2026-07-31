@@ -1,0 +1,7 @@
+build/
+from-pool/
+CONTINUE-HERE-MINER.md
+*.gguf
+*.jsonl
+.git/modules
+docker/.empty
