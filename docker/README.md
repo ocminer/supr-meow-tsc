@@ -101,3 +101,35 @@ step required for a normal run.
 |---|---|
 | `SSH_PUBKEY` | enables sshd with this key (optional, off by default) |
 | `SSH_PORT` | sshd port, default 22 |
+
+## Model hosting
+
+The image ships **without** a model — every rig fetches it once from
+`MODEL_URL` into the `/models` volume and reuses it thereafter.
+
+For TSC mainnet the model is `Qwen/Qwen3-8B` at the **chain-registered
+commit** `9c925d64d72725edaf899c6cb9c377fd0709d9c5`, converted to a bf16 GGUF
+with llama.cpp's `convert_hf_to_gguf.py`:
+
+```bash
+python3 -c "from huggingface_hub import snapshot_download as d; \
+  d(repo_id='Qwen/Qwen3-8B', revision='9c925d64d72725edaf899c6cb9c377fd0709d9c5', \
+    local_dir='qwen3-8b', allow_patterns=['*.json','*.safetensors','*.txt','*.model'])"
+python3 llama.cpp/convert_hf_to_gguf.py qwen3-8b \
+  --outfile Qwen3-8B-9c925d64-bf16.gguf --outtype bf16
+```
+
+Result: 16,388,043,744 bytes, sha256
+`fef5847c18f860086007cec0b08960f206c13c5cba69e3ed6292ee1e02ed7e44`.
+
+**Always set `MODEL_SHA256`** — the entrypoint refuses to mine on a mismatch,
+which turns a truncated download or a swapped file into a clean startup
+failure instead of a stream of rejected shares.
+
+Host it anywhere that serves large files with range requests (your own web
+server, or a public Hugging Face repo — Qwen3 is Apache-2.0, so
+redistributing a converted GGUF is fine; credit the source commit).
+
+**Do not use a random third-party GGUF.** The registered commit is not
+HuggingFace `main`, so a generic "Qwen3-8B GGUF" is likely built from a
+different revision — and the chain verifies what your proofs claim.
