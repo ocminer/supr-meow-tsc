@@ -844,13 +844,30 @@ int main(int argc, char** argv) {
                         std::printf("[%s] %sprompt-seed mode ACTIVE%s — prompts derived per CANARY-JOBS-SPEC\n",
                                     timestamp_now().c_str(), C_C(), C_0());
                 }
+                // POW_PROMPT_STYLE selects the local (non-canary) prompt text.
+                // The chain's reuse-entropy guard rejects transcripts whose
+                // continuations are too PREDICTABLE, and an 8B model answering
+                // a factual "explain X" request is highly confident — low
+                // entropy, guard fires. Style 1 asks for open-ended invention,
+                // where many continuations are equally plausible.
+                //   0 = legacy factual (testnet default; 3.9% RED on 8B)
+                //   1 = open-ended creative
+                static const int prompt_style = [](){
+                    const char* e = std::getenv("POW_PROMPT_STYLE");
+                    return e ? std::atoi(e) : 0;
+                }();
                 auto make_prompts = [&](const char* tag) {
                     std::vector<std::string> prompts;
                     prompts.reserve(n_streams);
-                    for (int st = 0; st < n_streams; ++st)
-                        prompts.push_back("Explain distributed consensus in detail. [" +
-                            std::to_string(prompt_salt) + "-" + std::to_string(worker) + tag +
-                            std::to_string(my_windows) + "-" + std::to_string(st) + "]");
+                    for (int st = 0; st < n_streams; ++st) {
+                        const std::string salt = std::to_string(prompt_salt) + "-" +
+                            std::to_string(worker) + tag + std::to_string(my_windows) +
+                            "-" + std::to_string(st);
+                        prompts.push_back(prompt_style == 1
+                            ? "Invent a strange short tale that has never been told. "
+                              "Do not explain it. Begin abruptly. [" + salt + "]"
+                            : "Explain distributed consensus in detail. [" + salt + "]");
+                    }
                     return prompts;
                 };
                 auto make_tok_prompts = [&]() {
