@@ -15,6 +15,7 @@
 #include "poi.h"
 #include "api.h"
 #include "canary.h"
+#include "tuning.h"
 #include <algorithm>
 #include "../vendor/nlohmann/json.hpp"
 #include <random>
@@ -116,9 +117,10 @@ struct Options {
     std::string canary_test;         // --canary-test <seed64hex>:<w> -> print step-0 top-10
     std::string canary_ref;          // --canary-ref <seed64hex>:<wmax> -> emit reference table
     std::string canary_out;          // --canary-out <path> (default canary-ref-<seed8>.jsonl)
-    int         slots = 8;
+    int         slots = 8;   bool slots_set = false;
     int         workers = 1;   // independent contexts per GPU (--workers)
-    int         groups  = 8;   // parallel sampler threads per GPU (--groups)
+    int         groups  = 8;   bool groups_set = false;  // --groups
+    bool        double_buffer_set = false;
     int         egress_base = 47021;  // base loopback port for proof egress (--egress-base)
     int         ctx_per_slot = 384;   // --ctx: KV per slot. MUST exceed prompt+window.
     std::string api_bind = "127.0.0.1:21550";  // --api-bind ("off" disables)
@@ -206,9 +208,9 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--canary-test")     { if (!need_value(i, argc, "--canary-test")) return false; o.canary_test = argv[++i]; }
         else if (a == "--canary-ref")      { if (!need_value(i, argc, "--canary-ref")) return false; o.canary_ref = argv[++i]; }
         else if (a == "--canary-out")      { if (!need_value(i, argc, "--canary-out")) return false; o.canary_out = argv[++i]; }
-        else if (a == "--slots")           { if (!need_value(i, argc, "--slots")) return false; o.slots = std::atoi(argv[++i]); }
+        else if (a == "--slots")           { if (!need_value(i, argc, "--slots")) return false; o.slots = std::atoi(argv[++i]); o.slots_set = true; }
         else if (a == "--workers")         { if (!need_value(i, argc, "--workers")) return false; o.workers = std::atoi(argv[++i]); }
-        else if (a == "--groups")          { if (!need_value(i, argc, "--groups")) return false; o.groups = std::atoi(argv[++i]); }
+        else if (a == "--groups")          { if (!need_value(i, argc, "--groups")) return false; o.groups = std::atoi(argv[++i]); o.groups_set = true; }
         else if (a == "--egress-base")     { if (!need_value(i, argc, "--egress-base")) return false; o.egress_base = std::atoi(argv[++i]); }
         else if (a == "--ctx")             { if (!need_value(i, argc, "--ctx")) return false; o.ctx_per_slot = std::atoi(argv[++i]); }
         else if (a == "--api-bind")        { if (!need_value(i, argc, "--api-bind")) return false; o.api_bind = argv[++i]; }
@@ -718,6 +720,21 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
         }
 
+        // Auto-tune per GPU unless the user pinned values. The optimum is
+        // hardware-specific in ways that are not guessable — see tuning.cpp
+        // for the measured evidence behind each profile.
+        if (!o.slots_set || !o.groups_set) {
+            const auto& d0 = dm.devices().front();
+            const auto tp = meow::tuning_for(d0.sm_major * 10 + d0.sm_minor,
+                                             d0.vram_total, 0);
+            if (!o.slots_set)  o.slots  = tp.slots;
+            if (!o.groups_set) o.groups = tp.groups;
+            if (!o.double_buffer_set && tp.double_buffer) ::setenv("MEOW_DOUBLE_BUFFER", "1", 0);
+            std::printf("[%s] %sauto-tuned for %s%s: --slots %d --groups %d%s\n",
+                        timestamp_now().c_str(), C_C(), tp.name, C_0(),
+                        o.slots, o.groups, tp.double_buffer ? " (double-buffered)" : "");
+            std::printf("      basis: %s\n", tp.evidence);
+        }
         const int n_streams = std::max(1, o.slots);
         const int n_groups  = std::max(1, std::min(o.groups, n_streams));
 
