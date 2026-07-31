@@ -687,6 +687,27 @@ int main(int argc, char** argv) {
         }
 
         // ---- real mining -------------------------------------------------
+        // Auto-tune per GPU unless the user pinned values. The optimum is
+        // hardware-specific in ways that are not guessable — see tuning.cpp
+        // for the measured evidence behind each profile. This MUST run before
+        // EngineConfig is filled in and before MEOW_DOUBLE_BUFFER is read:
+        // the profile sizes the llama contexts, and a profile applied after
+        // engine.load() leaves the contexts at the default slot count while
+        // the sampler pool expects the tuned one ("bad stream count").
+        if (!o.slots_set || !o.groups_set) {
+            const auto& d0 = dm.devices().front();
+            const auto tp = meow::tuning_for(d0.sm_major * 10 + d0.sm_minor,
+                                             d0.vram_total, 0);
+            if (!o.slots_set)  o.slots  = tp.slots;
+            if (!o.groups_set) o.groups = tp.groups;
+            if (!o.double_buffer_set && tp.double_buffer) ::setenv("MEOW_DOUBLE_BUFFER", "1", 0);
+            std::printf("[%s] %sauto-tuned for %s%s: --slots %d --groups %d%s\n",
+                        timestamp_now().c_str(), C_C(), tp.name, C_0(),
+                        o.slots, o.groups, tp.double_buffer ? " (double-buffered)" : "");
+            std::printf("      basis: %s\n", tp.evidence);
+            std::fflush(stdout);
+        }
+
         // Double-buffered decode is the default: two window batches alternate
         // so the GPU never drains between sample steps. MEOW_DOUBLE_BUFFER=0
         // reverts to the single-batch path (also the automatic fallback when
@@ -720,21 +741,6 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
         }
 
-        // Auto-tune per GPU unless the user pinned values. The optimum is
-        // hardware-specific in ways that are not guessable — see tuning.cpp
-        // for the measured evidence behind each profile.
-        if (!o.slots_set || !o.groups_set) {
-            const auto& d0 = dm.devices().front();
-            const auto tp = meow::tuning_for(d0.sm_major * 10 + d0.sm_minor,
-                                             d0.vram_total, 0);
-            if (!o.slots_set)  o.slots  = tp.slots;
-            if (!o.groups_set) o.groups = tp.groups;
-            if (!o.double_buffer_set && tp.double_buffer) ::setenv("MEOW_DOUBLE_BUFFER", "1", 0);
-            std::printf("[%s] %sauto-tuned for %s%s: --slots %d --groups %d%s\n",
-                        timestamp_now().c_str(), C_C(), tp.name, C_0(),
-                        o.slots, o.groups, tp.double_buffer ? " (double-buffered)" : "");
-            std::printf("      basis: %s\n", tp.evidence);
-        }
         const int n_streams = std::max(1, o.slots);
         const int n_groups  = std::max(1, std::min(o.groups, n_streams));
 
