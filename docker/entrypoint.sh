@@ -52,6 +52,17 @@ if [[ -z "${MODEL_PATH:-}" ]]; then
 fi
 [[ -s "$MODEL_PATH" ]] || die "model not readable: $MODEL_PATH"
 
+# ---- optional sshd (OctaSpace has no shell unless the image provides one) --
+# Key-only, no passwords. Absent SSH_PUBKEY the daemon never starts.
+if [[ -n "${SSH_PUBKEY:-}" ]]; then
+  mkdir -p /root/.ssh /run/sshd
+  echo "$SSH_PUBKEY" > /root/.ssh/authorized_keys
+  chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys
+  ssh-keygen -A >/dev/null 2>&1
+  sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/; s/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+  /usr/sbin/sshd -p "${SSH_PORT:-22}" && echo "[entrypoint] sshd listening on ${SSH_PORT:-22} (key auth only)"
+fi
+
 # ---- user string ------------------------------------------------------
 USER_ARG="$WALLET"
 [[ -n "${WORKER:-}" ]] && USER_ARG="${WALLET}.${WORKER}"

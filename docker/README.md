@@ -78,3 +78,26 @@ Model needs ~15.3 GB resident; the rest is KV cache and compute buffers.
   the container runtime injects them from the host driver.
 - The miner is a stratum client only — it needs outbound TCP to the pool, and
   outbound HTTPS once for the model download.
+
+## OctaSpace
+
+Rigs are started **from an image**, not by SSHing to a machine: push to Docker
+Hub → add the image under **My Applications** → select it when renting.
+
+Two consequences that shape this image:
+
+1. **SSH exists only because this image ships `openssh-server`** — it is not a
+   platform feature. Set `SSH_PUBKEY` to your public key and sshd starts on
+   port 22 (key auth only, passwords disabled, root login key-only). Leave it
+   unset and no daemon runs at all. Without this a rented rig is a black box.
+2. **Monitoring is the platform's "View logs"** on container stdout, so the
+   miner logs there, `--no-color` is the default, and the first lines report
+   the detected GPU, the auto-tuned config, the model and the pool.
+
+Everything else is env vars — there is no config file to place and no shell
+step required for a normal run.
+
+| variable | purpose |
+|---|---|
+| `SSH_PUBKEY` | enables sshd with this key (optional, off by default) |
+| `SSH_PORT` | sshd port, default 22 |

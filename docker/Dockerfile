@@ -59,6 +59,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libzmq5 libargon2-1 libgmp10 libgomp1 libssl3t64 \
         ca-certificates curl \
+        openssh-server \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -77,5 +78,10 @@ VOLUME ["/models"]
 # Local stats API for rig managers (HiveOS-style). Off by default in Docker
 # unless API_BIND is set to 0.0.0.0:21550.
 EXPOSE 21550
+# OctaSpace gives a rented rig NO shell unless the image itself ships an SSH
+# server — it is not a platform feature. Without it a rig is a black box you
+# cannot debug. sshd starts ONLY when SSH_PUBKEY is provided; no key, no
+# daemon, no password auth ever.
+EXPOSE 22
 
 ENTRYPOINT ["/app/entrypoint.sh"]
