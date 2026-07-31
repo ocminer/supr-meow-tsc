@@ -126,9 +126,23 @@ Result: 16,388,043,744 bytes, sha256
 which turns a truncated download or a swapped file into a clean startup
 failure instead of a stream of rejected shares.
 
-Host it anywhere that serves large files with range requests (your own web
-server, or a public Hugging Face repo — Qwen3 is Apache-2.0, so
-redistributing a converted GGUF is fine; credit the source commit).
+Host it anywhere that serves large files with **range requests** — that part
+matters: without `Accept-Ranges: bytes`, a rig whose download drops at 14 GB
+starts again from zero. Your own web server or a public Hugging Face repo both
+work (Qwen3 is Apache-2.0, so redistributing a converted GGUF is fine; credit
+the source commit).
+
+A ready-to-use copy is served at:
+
+```
+MODEL_URL=https://www.suprnova.cc/models/Qwen3-8B-9c925d64-bf16.gguf
+MODEL_SHA256=fef5847c18f860086007cec0b08960f206c13c5cba69e3ed6292ee1e02ed7e44
+```
+
+Worth verifying any mirror before a fleet depends on it — `curl -sI` should
+report `content-length: 16388043744` and `accept-ranges: bytes`, and hashing
+the first and last megabyte against a known-good copy catches a truncated
+upload that a size check alone would miss.
 
 **Do not use a random third-party GGUF.** The registered commit is not
 HuggingFace `main`, so a generic "Qwen3-8B GGUF" is likely built from a
