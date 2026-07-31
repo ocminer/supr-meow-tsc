@@ -14,7 +14,7 @@ share verdicts checked, not in a synthetic harness.
 
 | GPU | VRAM | best config | **w/s (8B)** | notes |
 |---|---|---|---|---|
-| **H100 80GB HBM3** | 80 GB | `--slots 256 --groups 12`, single-buffered | **~38** | llama `n_seq_max` caps slots at 256; groups flat 12–48 |
+| **H100 80GB HBM3** | 80 GB | `--slots 512 --groups 12`, single-buffered | **~40.5** | needs `llama-max-seq-512.patch`; stock llama caps at 256 (→37.6) |
 | **RTX 5090** | 32 GB | `--slots 128 --groups 12`, single-buffered | **19.5** | VRAM-limited before the seq cap |
 
 Both are selected **automatically** — the miner reads compute capability and
@@ -52,9 +52,18 @@ slots regardless of free memory (512 slots fails to initialise).
 |---|---|---|
 | 128 × 1 | 28.9 | 25.5 GB |
 | 192 × 1 | 33.8 | 30.6 GB |
-| **256 × 1 (single)** | **37.6–38.0** | **35.5 GB** |
+| 256 × 1 | 37.6–38.0 | 35.5 GB | ← stock llama ceiling |
 | 256 × 2 (double) | 37.4 | 56.3 GB |
-| 512 × 1 | fails | `n_seq_max must be <= 256` |
+| 384 × 1 | 38.1 | 46.5 GB |
+| **512 × 1 (single)** | **40.5** | **56.3 GB** | ← with the patch |
+
+Stock llama.cpp hard-codes `#define LLAMA_MAX_SEQ 256`, and 512 slots fails
+outright with `n_seq_max must be <= 256`. `tools/llama-max-seq-512.patch`
+raises it; the Docker build applies it. **Verified correct: 0 rejects at 384
+and 512** — this matters because the constant sizes `std::bitset<LLAMA_MAX_SEQ>`
+and per-batch arrays, so a regression would corrupt transcripts rather than
+crash. Gains are real but diminishing (+7.7% from 256 to 512 for +21 GB), and
+768 will not fit alongside the model.
 
 Slots scale cleanly to the cap (28.9 → 33.8 → 37.6), so the H100 is limited by
 llama's 256-sequence ceiling, not by the card. **Groups barely matter** on this

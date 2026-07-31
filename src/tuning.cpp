@@ -11,9 +11,10 @@ TuningProfile tuning_for(int sm, size_t vram_bytes, size_t model_bytes) {
     // free. Double-buffering measured neutral (37.4 vs 36.4 w/s) at 2x the
     // VRAM, so it is not worth the memory.
     if (sm == 90 && vram_gb > 60.0)
-        return { "H100 80GB", 256, 12, false,
-                 "37.6-38.0 w/s at 256 slots (128->28.9, 192->33.8); groups flat (12:37.8 24:37.6 32:37.5 48:37.3); 2x256 double 37.4 at 56GB; "
-                 "512 slots impossible (llama n_seq_max<=256)" };
+        return { "H100 80GB", 512, 12, false,
+                 "40.5 w/s at 512 slots, 0 rejects (128->28.9 192->33.8 256->37.6 384->38.1 512->40.5); "
+                 "REQUIRES tools/llama-max-seq-512.patch — stock llama caps n_seq_max at 256; "
+                 "groups flat (12:37.8 24:37.6 32:37.5 48:37.3); double-buffering neutral" };
 
     // RTX 5090 32GB (sm_120). Bandwidth-bound at 8B: one big batch beats two
     // alternating ones because a second context pays the 15.3 GB weight read
@@ -29,7 +30,7 @@ TuningProfile tuning_for(int sm, size_t vram_bytes, size_t model_bytes) {
     const double model_gb = model_bytes ? double(model_bytes) / (1024.0*1024.0*1024.0) : 15.3;
     const double free_gb  = vram_gb - model_gb - 4.0;
     int slots = int(free_gb * 1024.0 / 57.0 * 0.80);   // 80% of what fits
-    if (slots > 256) slots = 256;                       // llama n_seq_max cap
+    if (slots > 512) slots = 512;                       // llama n_seq_max cap (patched to 512)
     if (slots < 8)   slots = 8;
     const int groups = slots >= 128 ? 12 : (slots >= 32 ? 8 : 4);
     return { "auto (from VRAM)", slots, groups, false,
