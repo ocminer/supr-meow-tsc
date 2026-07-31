@@ -118,7 +118,17 @@ bool InferenceEngine::load(const EngineConfig& cfg, std::string& error,
             // n_batch must cover slots * prompt_len or llama_decode fails and
             // the miner produces nothing. Sized generously from the slot count.
             cp.n_batch   = std::max(2048u, static_cast<uint32_t>(cfg.slots_per_device) * 64u);
-            cp.n_ubatch  = 512;
+            // The prompt pass submits every stream's prompt at once, so it is
+            // processed in ceil(total_prompt / n_ubatch) forward passes. At
+            // 256 slots that is ~10.9k tokens = 22 passes at the old 512, and
+            // it measured 612 ms per window batch on an H100 (~9% of wall
+            // time). Larger ubatches do the same token-work in fewer, bigger
+            // GEMMs. MEOW_UBATCH overrides for A/B.
+            cp.n_ubatch  = [](){
+                const char* e = std::getenv("MEOW_UBATCH");
+                const int v = e ? std::atoi(e) : 2048;
+                return static_cast<uint32_t>(v > 0 ? v : 2048);
+            }();
             cp.n_seq_max = static_cast<uint32_t>(cfg.slots_per_device);
             cp.n_threads = cfg.threads > 0 ? cfg.threads : 8;
             cp.n_threads_batch = cp.n_threads;

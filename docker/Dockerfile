@@ -36,6 +36,7 @@ RUN rm -rf /src/vendor/llama.cpp && \
     git clone --filter=blob:none "${LLAMA_REPO}" /src/vendor/llama.cpp && \
     cd /src/vendor/llama.cpp && git checkout -q "${LLAMA_COMMIT}" && \
     git apply --verbose /src/tools/llama-gpu-logits.patch && \
+    git apply --verbose /src/tools/llama-max-seq-512.patch && \
     grep -q llama_get_logits_device include/llama.h || \
       (echo "FATAL: llama patch did not apply" && exit 1)
 
