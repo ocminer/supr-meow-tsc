@@ -87,9 +87,14 @@ Hub → add the image under **My Applications** → select it when renting.
 Two consequences that shape this image:
 
 1. **SSH exists only because this image ships `openssh-server`** — it is not a
-   platform feature. Set `SSH_PUBKEY` to your public key and sshd starts on
-   port 22 (key auth only, passwords disabled, root login key-only). Leave it
-   unset and no daemon runs at all. Without this a rented rig is a black box.
+   platform feature. sshd starts if you set `SSH_PUBKEY` (an authorized_keys
+   line), `SSH_PASSWORD` (a root password), or both; set neither and no daemon
+   runs at all. Without one of them a rented rig is a black box.
+
+   Prefer the key: a password on a port the whole internet can reach will be
+   guessed at continuously, so if you use `SSH_PASSWORD` make it long and
+   random. The daemon starts **before** the 15 GB model download, because a rig
+   that cannot fetch the model is exactly when you need a shell.
 2. **Monitoring is the platform's "View logs"** on container stdout, so the
    miner logs there, `--no-color` is the default, and the first lines report
    the detected GPU, the auto-tuned config, the model and the pool.
@@ -99,7 +104,8 @@ step required for a normal run.
 
 | variable | purpose |
 |---|---|
-| `SSH_PUBKEY` | enables sshd with this key (optional, off by default) |
+| `SSH_PUBKEY` | enables sshd with this key (preferred; off by default) |
+| `SSH_PASSWORD` | enables sshd with root password login (use a long random one) |
 | `SSH_PORT` | sshd port, default 22 |
 
 ## Model hosting

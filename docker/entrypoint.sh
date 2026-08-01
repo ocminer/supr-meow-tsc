@@ -16,14 +16,65 @@
 #   WORKER, PASSWORD, DEVICES, SLOTS, GROUPS, CTX, API_BIND, LOG_INTERVAL,
 #   MODEL_DIR, EXTRA_ARGS
 #   DOUBLE_BUFFER=0|1   PROMPT_STYLE=0|1
+#
+# SHELL ACCESS (sshd starts only if at least one of these is set)
+#   SSH_PUBKEY    authorized_keys line — preferred, no password to guess
+#   SSH_PASSWORD  root password; enables PasswordAuthentication
+#   SSH_PORT      default 22
 set -euo pipefail
 
 die() { echo "error: $*" >&2; exit 2; }
+
+start_sshd() {
+  mkdir -p /root/.ssh /run/sshd
+  chmod 700 /root/.ssh
+  ssh-keygen -A >/dev/null 2>&1
+
+  local pw_auth=no root_login=prohibit-password mode=
+  if [[ -n "${SSH_PUBKEY:-}" ]]; then
+    echo "$SSH_PUBKEY" > /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    mode="key"
+  fi
+  if [[ -n "${SSH_PASSWORD:-}" ]]; then
+    echo "root:${SSH_PASSWORD}" | chpasswd
+    pw_auth=yes; root_login=yes
+    mode="${mode:+$mode+}password"
+  fi
+
+  sed -i \
+    -e "s/^#\?PasswordAuthentication.*/PasswordAuthentication ${pw_auth}/" \
+    -e "s/^#\?PermitRootLogin.*/PermitRootLogin ${root_login}/" \
+    -e "s/^#\?UsePAM.*/UsePAM yes/" \
+    /etc/ssh/sshd_config
+  # Ubuntu ships drop-ins under sshd_config.d that override the main file —
+  # cloud images in particular disable password auth there. Without this the
+  # settings above look applied but do nothing.
+  mkdir -p /etc/ssh/sshd_config.d
+  printf 'PasswordAuthentication %s\nPermitRootLogin %s\n' "$pw_auth" "$root_login" \
+    > /etc/ssh/sshd_config.d/zz-supr-meow.conf
+
+  if /usr/sbin/sshd -p "${SSH_PORT:-22}"; then
+    echo "[entrypoint] sshd listening on ${SSH_PORT:-22} (${mode} auth)"
+    [[ $pw_auth == yes ]] && echo "[entrypoint] WARNING: root password login is enabled — anyone who reaches this port can try to guess it. Use a long random SSH_PASSWORD, or prefer SSH_PUBKEY."
+  else
+    echo "[entrypoint] WARNING: sshd failed to start — continuing without a shell" >&2
+  fi
+}
 [[ -n "${POOL_URL:-}" ]] || die "POOL_URL is required (stratum+tcp://host:port)"
 [[ -n "${WALLET:-}"   ]] || die "WALLET is required"
 
 MODEL_DIR="${MODEL_DIR:-/models}"
 mkdir -p "$MODEL_DIR"
+
+# ---- optional sshd (OctaSpace has no shell unless the image provides one) --
+# Deliberately BEFORE the model download: a rig that cannot fetch the 15 GB
+# model is exactly when a shell is needed, and starting sshd afterwards left
+# precisely those rigs unreachable. Set SSH_PUBKEY (keys, preferred),
+# SSH_PASSWORD (root password), or both. Neither set = no daemon, as before.
+if [[ -n "${SSH_PUBKEY:-}" || -n "${SSH_PASSWORD:-}" ]]; then
+  start_sshd
+fi
 
 # ---- model resolution -------------------------------------------------
 if [[ -z "${MODEL_PATH:-}" ]]; then
@@ -52,17 +103,6 @@ if [[ -z "${MODEL_PATH:-}" ]]; then
   fi
 fi
 [[ -s "$MODEL_PATH" ]] || die "model not readable: $MODEL_PATH"
-
-# ---- optional sshd (OctaSpace has no shell unless the image provides one) --
-# Key-only, no passwords. Absent SSH_PUBKEY the daemon never starts.
-if [[ -n "${SSH_PUBKEY:-}" ]]; then
-  mkdir -p /root/.ssh /run/sshd
-  echo "$SSH_PUBKEY" > /root/.ssh/authorized_keys
-  chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys
-  ssh-keygen -A >/dev/null 2>&1
-  sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/; s/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
-  /usr/sbin/sshd -p "${SSH_PORT:-22}" && echo "[entrypoint] sshd listening on ${SSH_PORT:-22} (key auth only)"
-fi
 
 # ---- user string ------------------------------------------------------
 USER_ARG="$WALLET"
