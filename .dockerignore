@@ -5,3 +5,4 @@ CONTINUE-HERE-MINER.md
 *.jsonl
 .git/modules
 docker/.empty
+vendor/llama.cpp/

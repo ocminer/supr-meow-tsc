@@ -15,7 +15,10 @@
 # ---------- build ----------
 FROM nvidia/cuda:13.0.0-devel-ubuntu24.04 AS build
 ARG CUDA_ARCHS="80;86;89;90;120"
-ARG JOBS=8
+# Empty = use every core the builder has. The CUDA compile is several hundred
+# template instantiations across five architectures and is the whole cost of
+# this image; the old fixed -j8 left 24 of 32 cores idle for over an hour.
+ARG JOBS=
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git ca-certificates \
@@ -24,7 +27,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-COPY . /src
+# Copy ONLY what the compile consumes, never `COPY . /src`. The whole-repo copy
+# meant that editing docker/entrypoint.sh, a README or a doc invalidated this
+# layer and every layer after it — i.e. a one-line entrypoint change triggered
+# the full ~70 minute CUDA rebuild. vendor/llama.cpp is deliberately absent: it
+# is cloned at the pinned commit below, and copying the host checkout over the
+# clone would defeat the `rm -rf` that keeps the fork pristine.
+COPY tools/             /src/tools/
+COPY vendor/nlohmann/   /src/vendor/nlohmann/
+COPY vendor/tensorcash/ /src/vendor/tensorcash/
 
 # The llama.cpp fork is fetched here rather than relying on a host checkout,
 # and OUR PATCH IS APPLIED — without it the miner does not link
@@ -46,12 +57,18 @@ RUN rm -rf /src/vendor/llama.cpp && \
 # path. The stub is never loaded at runtime — the real driver library is
 # injected by the container runtime on the mining host.
 ENV LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib/stubs:${LIBRARY_PATH:-}
+
+# Our own sources land last: they change most often, and everything above
+# (apt, the llama clone and patches) then stays cached across edits.
+COPY CMakeLists.txt /src/
+COPY src/           /src/src/
+
 RUN cmake -B build -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
       -DMEOW_LLAMA_DIR=/src/vendor/llama.cpp \
       -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/targets/x86_64-linux/lib/stubs -lcuda" \
       -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/targets/x86_64-linux/lib/stubs -lcuda" \
- && cmake --build build -j"${JOBS}" --target supr-meow-tsc
+ && cmake --build build -j"${JOBS:-$(nproc)}" --target supr-meow-tsc
 
 # ---------- runtime ----------
 FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04
