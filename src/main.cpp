@@ -786,7 +786,15 @@ int main(int argc, char** argv) {
         // long enough to ride out a transient, short enough not to waste a
         // rental. See the abort in the mining loop.
         std::atomic<int> consecutive_failures{0};
-        constexpr int kFailAbort = 300;
+        // MEOW_FAIL_ABORT=0 disables the abort (keep limping instead of exiting);
+        // any positive value overrides the threshold.
+        const int kFailAbort = [](){
+            if (const char* e = std::getenv("MEOW_FAIL_ABORT")) {
+                const int v = std::atoi(e);
+                if (v >= 0) return v;
+            }
+            return 300;
+        }();
         const auto t_start = std::chrono::steady_clock::now();
         const uint64_t prompt_salt = std::random_device{}();
 
@@ -948,7 +956,7 @@ int main(int argc, char** argv) {
                     if (fails <= 8 || fails % 500 == 0)
                         std::fprintf(stderr, "  window failed (worker %d): %s%s\n", worker, gerr.c_str(),
                                      fails > 8 ? "  [repeating]" : "");
-                    if (fails == kFailAbort) {
+                    if (kFailAbort > 0 && fails == kFailAbort) {
                         std::fprintf(stderr,
                             "\n*** %d consecutive window failures and no shares — aborting. ***\n"
                             "    Last error: %s\n"
