@@ -16,6 +16,7 @@ share verdicts checked, not in a synthetic harness.
 |---|---|---|---|---|
 | **H100 80GB HBM3** | 80 GB | `--slots 512 --groups 12`, single-buffered | **~40.5** | needs `LLAMA_MAX_SEQ=512`; stock llama caps at 256 (→37.6) |
 | **H200 141GB HBM3e** | 141 GB | `--slots 512 --groups 12`, single-buffered | **~40.5** | same as the H100 despite +43% bandwidth — see below |
+| **A100 80GB SXM** | 80 GB | `--slots 512 --groups 12`, single-buffered | **20.7** | curve nearly flat — saturates early |
 | **RTX 5090** | 32 GB | `--slots 128 --groups 12`, single-buffered | **19.5** | VRAM-limited before the seq cap |
 
 Both are selected **automatically** — the miner reads compute capability and
@@ -120,6 +121,27 @@ inside llama.cpp's decode efficiency rather than in miner code.
 Notably the H100 shows a **similar ~26 ms step time** at twice the batch — it
 converts its bandwidth advantage into more sequences per step rather than
 faster steps.
+
+## Where bandwidth stops paying (measured, not modelled)
+
+Throughput tracks memory bandwidth **up to about an H100, and not beyond**:
+
+| GPU | bandwidth | w/s | w/s per TB/s |
+|---|---|---|---|
+| RTX 5090 | 1.79 TB/s | 19.5 | 10.9 |
+| A100 80GB | 2.04 TB/s | 20.7 | 10.1 |
+| H100 80GB | 3.35 TB/s | 40.5 | 12.1 |
+| **H200 141GB** | **4.8 TB/s** | **40.5** | **8.4** |
+
+The H200 has 43% more bandwidth than the H100 and returns exactly the same
+number. Buying bandwidth above an H100 buys nothing here, so **B200/B300/GB300
+class parts (~8 TB/s) should not be expected to exceed ~40 w/s either.**
+
+The shape of each card's slot curve says the same thing from the other side:
+the A100 is flat from 256 to 512 slots (19.9 → 20.7, i.e. saturated almost
+immediately), while the H100 climbs steeply over the identical range
+(28.9 → 40.5). The A100 also ran pinned at its 400 W limit; the H200 idled at
+476 W of 700 W.
 
 ## Model size matters more than anything else
 

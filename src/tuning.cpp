@@ -39,6 +39,20 @@ TuningProfile tuning_for(int sm, size_t vram_bytes, size_t model_bytes) {
         return { "RTX 5090 32GB", 128, 12, false,
                  "19.5 w/s single 128 slots; 64x2 double 12.8; 96x2 17.0; 192 single 17.4 (KV traffic)" };
 
+    // A100 80GB SXM (sm_80). Measured 2026-08-01: 20.7 w/s at 512 slots, and
+    // the curve is nearly FLAT (256->19.9, 384->19.6, 512->20.8/20.7 on two
+    // runs) where the H100 climbed 28.9->40.5 over the same range. So the A100
+    // is already saturated at low batch — it is bandwidth-bound in the regime
+    // the H100 only reaches much later, which is consistent with 2.04 vs
+    // 3.35 TB/s. It also sat AT its 400 W limit throughout (413 W draw), unlike
+    // the H200 which idled at 476 W of 700 W. Nothing here is worth retuning:
+    // a 25% slot change moves throughput by ~1 w/s.
+    if (sm == 80 && vram_gb > 60.0)
+        return { "A100 80GB", 512, 12, false,
+                 "20.7 w/s at 512 slots, 0 rejects; curve nearly flat (256->19.9, 384->19.6, "
+                 "512->20.8/20.7) so the card saturates early and slot count barely matters. "
+                 "Power-limited: 413 W against a 400 W cap." };
+
     // ---- conservative fallbacks, derived from VRAM -------------------
     // Budget: model weights + KV (~57 MB/slot for an 8B at ctx 384) + ~4 GB
     // of compute buffers must fit, with headroom. Keep well clear of the
