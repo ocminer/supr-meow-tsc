@@ -199,6 +199,15 @@ manages 14.3 w/s per TB/s against the H100's 12.1, because it is not waiting.
 of the step and compose: more sampler groups shorten the tail (11.5 → 9.2 ms
 alone), while a larger ubatch raises utilisation (76% → 99% alone).
 
+**The size of the gain tracks GPU idle, not the card.** The same settings on a
+PRO 6000 — which already runs at 88–100% utilisation — gained only **+1.3%**
+(25.77 → 26.10, overlapping ranges) against the H100's +6.2%. The sampler tail
+shrank by the same ~1 ms on both, but that is 1 ms of a 52 ms step on the H100
+versus a 77 ms step on the PRO 6000. **Check `nvidia-smi
+--query-gpu=utilization.gpu` before applying any CPU-side fix**: well below
+100% means there is idle to reclaim; near 100% means the card is saturated and
+the tail is already hidden behind decode.
+
 **But the best group count depends on the HOST, not the GPU.** An 80-CPU H100
 measured groups flat (12 → 37.8, 24 → 37.6, 48 → 37.3); the 176-CPU box gains
 clearly from 24. So this is deliberately **not** baked into the per-GPU
