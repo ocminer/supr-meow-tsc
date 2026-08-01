@@ -10,14 +10,29 @@ share verdicts checked, not in a synthetic harness.
 > 19. The gap was per-share proof files being written to disk and proof
 > serialisation on the mining thread.
 
-## Summary
+## Summary — throughput and cost per GPU
 
-| GPU | VRAM | best config | **w/s (8B)** | notes |
-|---|---|---|---|---|
-| **H100 80GB HBM3** | 80 GB | `--slots 512 --groups 12`, single-buffered | **~40.5** | needs `LLAMA_MAX_SEQ=512`; stock llama caps at 256 (→37.6) |
-| **H200 141GB HBM3e** | 141 GB | `--slots 512 --groups 12`, single-buffered | **~40.5** | same as the H100 despite +43% bandwidth — see below |
-| **A100 80GB SXM** | 80 GB | `--slots 512 --groups 12`, single-buffered | **20.7** | curve nearly flat — saturates early |
-| **RTX 5090** | 32 GB | `--slots 128 --groups 12`, single-buffered | **19.5** | VRAM-limited before the seq cap |
+Spot prices are what these cards cost on the rental market on 2026-08-01; the
+last column is the number that actually matters when you are renting.
+
+| GPU | VRAM | best config | **w/s** | €/GPU/h | **w/s per €/h** |
+|---|---|---|---|---|---|
+| **RTX A6000** | 48 GB | `--slots 361 --groups 12` | 9.5 | **0.187** | **50.8** ★ |
+| **RTX PRO 6000 Blackwell** | 96 GB | `--slots 512 --groups 12` | 25.6 | 0.579 | **44.2** |
+| **H100 80GB HBM3** | 80 GB | `--slots 512 --groups 12` | 40.5 | 0.996 | 40.7 |
+| **A100 80GB SXM** | 80 GB | `--slots 512 --groups 12` | 20.7 | 0.549 | 37.7 |
+| **H200 141GB HBM3e** | 141 GB | `--slots 512 --groups 12` | 40.5 | 1.226 | 33.0 |
+| **RTX 5090** | 32 GB | `--slots 128 --groups 12` | 19.5 | (owned) | — |
+
+All single-buffered. Every config is selected **automatically** — the miner
+reads compute capability and VRAM at startup and applies the matching profile
+(`src/tuning.cpp`); explicit `--slots`/`--groups` always win.
+
+**The cheapest card is the best buy.** An A6000 returns 50.8 w/s per €/h
+against the H200's 33.0 — the H200 costs 6.6× more per GPU-hour for 4.3× the
+throughput. Per instance: 8× A6000 ≈ 76 w/s for €1.50/h, versus 2× H200 ≈ 80
+w/s for €2.45/h.
+
 
 Both are selected **automatically** — the miner reads compute capability and
 VRAM at startup and applies the matching profile (`src/tuning.cpp`). Explicit
@@ -122,13 +137,50 @@ Notably the H100 shows a **similar ~26 ms step time** at twice the batch — it
 converts its bandwidth advantage into more sequences per step rather than
 faster steps.
 
+## Two regimes, and which one a card is in decides everything
+
+Every card falls into one of two regimes, and they behave in **opposite**
+directions — which is why one global "best slots" number does not exist.
+
+**VRAM-bound (A6000, 5090, PRO 6000 below its cap).** More slots always help,
+right up to the memory ceiling, with no KV-traffic penalty:
+
+| slots | A6000 (48 GB) | PRO 6000 (96 GB) |
+|---|---|---|
+| 128 | 7.8 | 18.7 |
+| 192 | 8.3 | 21.6 |
+| 256 | 8.8 / 8.8 | 23.9 / 23.8 |
+| 320 | 9.0 | 24.3 |
+| 384 | OOM | 25.5 |
+| 361 | **9.5** (ceiling) | — |
+| 512 | — | **25.6** (llama seq cap) |
+
+The PRO 6000 is the cleanest demonstration: it is a 5090 with 3× the VRAM, and
+unlocking slots takes it from the 5090's 18.7 to **25.6, +37%**. The 5090's
+`--slots 128` was never an optimum, only a memory limit.
+
+On the A6000, 361 is a hard ceiling — 400 slots OOMs, and trading context for
+slots does not rescue it (420 and 460 at ctx 336 also OOM), because compute
+buffers grow with batch alongside the KV cache.
+
+**Bandwidth-bound (A100, H100, H200).** Slots stop helping, and past the
+optimum they *hurt*, because KV read traffic grows with batch while weight
+traffic is fixed. The A100 is flat from 256 to 512 (19.9 → 20.7); the H200
+regresses hard above 512 (768 → 24.0, 1024 → 29.6).
+
+**Groups barely matter in either regime** — even on a 10-CPU A6000, 5 / 8 / 12
+groups gave 8.7 / 8.8 / 8.8. Use the lowest value that keeps `slots/groups`
+under the GPU sort's 64-stream limit.
+
 ## Where bandwidth stops paying (measured, not modelled)
 
 Throughput tracks memory bandwidth **up to about an H100, and not beyond**:
 
 | GPU | bandwidth | w/s | w/s per TB/s |
 |---|---|---|---|
+| RTX A6000 | 0.77 TB/s | 9.5 | 12.3 |
 | RTX 5090 | 1.79 TB/s | 19.5 | 10.9 |
+| RTX PRO 6000 | 1.79 TB/s | 25.6 | 14.3 |
 | A100 80GB | 2.04 TB/s | 20.7 | 10.1 |
 | H100 80GB | 3.35 TB/s | 40.5 | 12.1 |
 | **H200 141GB** | **4.8 TB/s** | **40.5** | **8.4** |

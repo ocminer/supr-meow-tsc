@@ -32,9 +32,23 @@ TuningProfile tuning_for(int sm, size_t vram_bytes, size_t model_bytes) {
                  "REQUIRES tools/llama-max-seq-512.patch — stock llama caps n_seq_max at 256; "
                  "groups flat (12:37.8 24:37.6 32:37.5 48:37.3); double-buffering neutral" };
 
+    // RTX PRO 6000 Blackwell 96GB (sm_120). Same silicon and roughly the same
+    // bandwidth as a 5090, but 3x the VRAM — and that is the whole story: the
+    // 5090 is capped at 128 slots by memory, not by bandwidth. Measured
+    // 2026-08-01 across 8 cards in parallel: 128->18.7 (the 5090's config),
+    // 192->21.6, 256->23.9/23.8, 320->24.3, 384->25.5, 512->25.6. Unlocking
+    // slots is worth +37%. MUST come before the 5090 branch below, which keys
+    // only on sm_120 and would hand this card 32 GB settings.
+    if (sm == 120 && vram_gb > 60.0)
+        return { "RTX PRO 6000 96GB", 512, 12, false,
+                 "25.6 w/s at 512 slots (llama's seq cap, not VRAM — 56 GB of 96 used). "
+                 "128->18.7 192->21.6 256->23.9/23.8 320->24.3 384->25.5 448->23.5 512->25.6; "
+                 "duplicate 256 on a second card agreed to 0.4%, so the parallel sweep is sound." };
+
     // RTX 5090 32GB (sm_120). Bandwidth-bound at 8B: one big batch beats two
     // alternating ones because a second context pays the 15.3 GB weight read
-    // a second time to hide a ~2.4 ms CPU tail.
+    // a second time to hide a ~2.4 ms CPU tail. 128 slots is a VRAM limit, not
+    // an optimum — the 96 GB PRO 6000 above reaches 512 and gains 37%.
     if (sm == 120 && vram_gb > 24.0)
         return { "RTX 5090 32GB", 128, 12, false,
                  "19.5 w/s single 128 slots; 64x2 double 12.8; 96x2 17.0; 192 single 17.4 (KV traffic)" };
@@ -52,6 +66,20 @@ TuningProfile tuning_for(int sm, size_t vram_bytes, size_t model_bytes) {
                  "20.7 w/s at 512 slots, 0 rejects; curve nearly flat (256->19.9, 384->19.6, "
                  "512->20.8/20.7) so the card saturates early and slot count barely matters. "
                  "Power-limited: 413 W against a 400 W cap." };
+
+    // RTX A6000 48GB (sm_86, also A40). The cheapest card tested and the best
+    // value of any of them. Unlike the big cards this one is VRAM-bound, and
+    // in that regime slots help MONOTONICALLY — no KV-traffic regression at
+    // all: 128->7.8, 192->8.3, 256->8.8/8.8, 320->9.0, 361->9.5. 361 is the
+    // ceiling: 400 slots OOMs, and trading context for slots does not rescue
+    // it (420 and 460 at ctx 336 both OOM) because compute buffers grow with
+    // batch too. Groups are flat even on 10 CPUs (5->8.7, 8->8.8, 12->8.8).
+    // Power-capped at 287 W of 300 W.
+    if (sm == 86 && vram_gb > 40.0)
+        return { "RTX A6000 48GB", 361, 12, false,
+                 "9.5 w/s at 361 slots — the VRAM ceiling (400 OOMs; 420/460 at ctx 336 also OOM). "
+                 "Slots help monotonically here: 128->7.8 192->8.3 256->8.8 320->9.0 361->9.5. "
+                 "Groups flat on 10 CPUs (5:8.7 8:8.8 12:8.8). 287 W of a 300 W cap." };
 
     // ---- conservative fallbacks, derived from VRAM -------------------
     // Budget: model weights + KV (~57 MB/slot for an 8B at ctx 384) + ~4 GB
