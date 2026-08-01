@@ -478,6 +478,27 @@ struct BatchScratch {
     cudaStream_t stream = nullptr;
     bool failed = false;
 
+    // Report the first allocation failure with the numbers needed to act on it.
+    // Without this a starved GPU looks identical to a broken kernel: every
+    // window fails, nothing says why, and the miner sits at 0.00 PoI/s
+    // indefinitely (observed: 7h on a rented rig).
+    void report_alloc_failure(int S, int n) {
+        static std::atomic<bool> once{false};
+        if (once.exchange(true)) return;
+        size_t freeb = 0, totb = 0;
+        cudaMemGetInfo(&freeb, &totb);
+        const double need_mb = (double)S * n * (4+2+8+8+4+4) / (1024.0*1024.0);
+        std::fprintf(stderr,
+            "\n[pow_gpu] FATAL: sampler scratch allocation failed on the GPU.\n"
+            "          wanted ~%.0f MB per worker group (%d streams x %d vocab); "
+            "VRAM free %.2f GB of %.2f GB.\n"
+            "          The model and its KV cache have taken the card. Lower "
+            "--slots (or --ctx), or use a GPU with more VRAM.\n"
+            "          Every window will fail until this is fixed.\n\n",
+            need_mb, S, n, freeb / 1073741824.0, totb / 1073741824.0);
+        std::fflush(stderr);
+    }
+
     bool ensure(int S, int n) {
         if (failed) return false;
         const int total = S * n;
@@ -511,7 +532,7 @@ struct BatchScratch {
             ok = cudaMalloc(&d_temp, bytes) == cudaSuccess;
             temp_bytes = bytes;
         }
-        if (!ok) { failed = true;
+        if (!ok) { report_alloc_failure(S, n); cudaGetLastError(); failed = true;
             std::fprintf(stderr, "[pow-gpu] batched scratch alloc FAILED — per-stream path stays\n");
             return false; }
         cap_total = total; cap_seg = S;
@@ -631,7 +652,21 @@ extern "C" bool pow_gpu_sort_and_stats_device_k(
         float* h_probes /* [S*20] */) {
     if (!d_logits || S < 1 || n < 1) return false;
     if (topk < 1 || topk > n) topk = n;
-    if (S > 64 || n > (1 << 18)) return false;   // flat combined-key limits
+    if (S > 64 || n > (1 << 18)) {
+        // Not a transient error: this configuration can never sort. Say so —
+        // silently returning false here fails every window forever.
+        static std::atomic<bool> once{false};
+        if (!once.exchange(true)) {
+            std::fprintf(stderr,
+                "\n[pow_gpu] FATAL: sampler slice out of range (%d streams, %d vocab).\n"
+                "          A worker group may sort at most 64 streams and 262144 vocab.\n"
+                "          Raise --groups so that slots/groups <= 64 (e.g. --slots %d "
+                "needs --groups >= %d).\n\n",
+                S, n, S, (S + 63) / 64);
+            std::fflush(stderr);
+        }
+        return false;
+    }
     if (!g_batch.ensure(S, n)) return false;
     auto& b = g_batch;
     const int total = S * n;
@@ -654,7 +689,22 @@ extern "C" bool pow_gpu_sort_and_stats_device_k(
            && cudaMemcpyAsync(h_head, b.d_heads, sizeof(float)*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
            && cudaMemcpyAsync(h_stats, b.d_stats, sizeof(double)*6*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
            && cudaMemcpyAsync(h_probes, b.d_probes, sizeof(float)*20*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess;
-    return ok && cudaStreamSynchronize(b.stream) == cudaSuccess && cudaGetLastError() == cudaSuccess;
+    ok = ok && cudaStreamSynchronize(b.stream) == cudaSuccess;
+    const cudaError_t ce = cudaGetLastError();
+    if (!ok || ce != cudaSuccess) {
+        // The device path has no host fallback (llama's D2H is skipped), so
+        // this kills the window. Name the CUDA error once — "sampler step
+        // failed" on its own is not actionable.
+        static std::atomic<bool> once{false};
+        if (!once.exchange(true)) {
+            std::fprintf(stderr,
+                "\n[pow_gpu] device sort failed: %s (%d streams, %d vocab, topk %d)\n\n",
+                cudaGetErrorString(ce == cudaSuccess ? cudaErrorUnknown : ce), S, n, topk);
+            std::fflush(stderr);
+        }
+        return false;
+    }
+    return true;
 }
 
 // Bind the calling thread's CUDA context to a device — each mining thread

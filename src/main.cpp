@@ -40,7 +40,7 @@ extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 
 namespace {
 
-const char* kVersion = "0.2.0";
+const char* kVersion = "0.2.3";
 
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop = true; }
@@ -780,6 +780,13 @@ int main(int argc, char** argv) {
                     n_workers, n_groups, engine.config().devices.size());
 
         std::atomic<uint64_t> windows{0}, shares{0};
+        // Shared across workers: reset by ANY worker completing a window, so it
+        // counts "nothing on this box is making progress", not one bad thread.
+        // At the 500 ms retry sleep this is a few minutes before giving up —
+        // long enough to ride out a transient, short enough not to waste a
+        // rental. See the abort in the mining loop.
+        std::atomic<int> consecutive_failures{0};
+        constexpr int kFailAbort = 300;
         const auto t_start = std::chrono::steady_clock::now();
         const uint64_t prompt_salt = std::random_device{}();
 
@@ -933,10 +940,28 @@ int main(int argc, char** argv) {
                 }
                 const auto tb1 = std::chrono::steady_clock::now();
                 if (n < 0) {
-                    std::fprintf(stderr, "  window failed (worker %d): %s\n", worker, gerr.c_str());
+                    // A rented rig that fails every window is burning money.
+                    // Complain loudly and give up rather than logging the same
+                    // line for hours at 0.00 PoI/s — a non-zero exit also lets
+                    // the container platform restart or flag the instance.
+                    const int fails = ++consecutive_failures;
+                    if (fails <= 8 || fails % 500 == 0)
+                        std::fprintf(stderr, "  window failed (worker %d): %s%s\n", worker, gerr.c_str(),
+                                     fails > 8 ? "  [repeating]" : "");
+                    if (fails == kFailAbort) {
+                        std::fprintf(stderr,
+                            "\n*** %d consecutive window failures and no shares — aborting. ***\n"
+                            "    Last error: %s\n"
+                            "    This is a configuration or hardware problem, not a pool problem;\n"
+                            "    look for a [pow_gpu] line above for the specific cause.\n\n",
+                            kFailAbort, gerr.c_str());
+                        std::fflush(stderr);
+                        std::_Exit(3);
+                    }
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
                     continue;
                 }
+                consecutive_failures = 0;
                 my_windows += n;
                 windows += n;
                 gpu_stats[gpu_slot(engine.worker_device(worker))].windows += n;

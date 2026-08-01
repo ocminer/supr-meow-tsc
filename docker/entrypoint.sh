@@ -11,7 +11,8 @@
 #   MODEL_URL   fetched to $MODEL_DIR on first start, then cached
 #   MODEL_SHA256  optional integrity check for MODEL_URL
 #
-# OPTIONAL (defaults are the values measured on an RTX 5090 / Qwen3-8B)
+# OPTIONAL — SLOTS/GROUPS default to the miner's per-GPU auto-tuning; set them
+# only to override it.
 #   WORKER, PASSWORD, DEVICES, SLOTS, GROUPS, CTX, API_BIND, LOG_INTERVAL,
 #   MODEL_DIR, EXTRA_ARGS
 #   DOUBLE_BUFFER=0|1   PROMPT_STYLE=0|1
@@ -73,7 +74,12 @@ args=( -o "$POOL_URL" )
 [[ -n "${POOL_URL3:-}" ]] && args+=( -o "$POOL_URL3" )
 args+=( -u "$USER_ARG" -p "${PASSWORD:-x}" --model "$MODEL_PATH" --no-color )
 [[ -n "${DEVICES:-}"      ]] && args+=( -d "$DEVICES" )
-args+=( --slots "${SLOTS:-128}" --groups "${GROUPS:-12}" )
+# Leave these UNSET by default so the miner's own auto-tuning picks them from
+# the card it actually got (src/tuning.cpp). Hardcoding the 5090 numbers here
+# defeated that on every other GPU: 128 slots on a card that cannot hold their
+# KV cache leaves no VRAM for the sampler scratch, and every window fails.
+[[ -n "${SLOTS:-}"  ]] && args+=( --slots "$SLOTS" )
+[[ -n "${GROUPS:-}" ]] && args+=( --groups "$GROUPS" )
 [[ -n "${CTX:-}"          ]] && args+=( --ctx "$CTX" )
 args+=( --api-bind "${API_BIND:-off}" )
 [[ -n "${LOG_INTERVAL:-}" ]] && args+=( --log-interval "$LOG_INTERVAL" )
@@ -87,5 +93,5 @@ export MEOW_DOUBLE_BUFFER="${DOUBLE_BUFFER:-0}"
 export POW_PROMPT_STYLE="${PROMPT_STYLE:-1}"
 
 echo "[entrypoint] pool=$POOL_URL user=$USER_ARG model=$(basename "$MODEL_PATH")"
-echo "[entrypoint] slots=${SLOTS:-128} groups=${GROUPS:-12} double_buffer=$MEOW_DOUBLE_BUFFER prompt_style=$POW_PROMPT_STYLE"
+echo "[entrypoint] slots=${SLOTS:-auto} groups=${GROUPS:-auto} double_buffer=$MEOW_DOUBLE_BUFFER prompt_style=$POW_PROMPT_STYLE"
 exec /app/supr-meow-tsc "${args[@]}"
