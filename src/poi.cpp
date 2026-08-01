@@ -625,7 +625,20 @@ struct SamplerPool::Impl {
                                               dev ? 20 : 0);
                 const int tok = miners[g]->on_logits(local, dev ? nullptr : (*logits)[s], nvoc,
                                                      (*ctx)[s], 1.0f, 50, 1.0f);
-                if (tok < 0) ok = false; else (*out)[s] = tok;
+                if (tok < 0) {
+                    // The third way a window can die. Without this, a sampler
+                    // refusal is indistinguishable in the log from a GPU sort
+                    // failure — both surface only as "sampler step failed".
+                    static std::atomic<bool> once{false};
+                    if (!once.exchange(true)) {
+                        std::fprintf(stderr,
+                            "\n[poi] sampler rejected a step: on_logits returned %d "
+                            "(group %d, stream %d, presorted=%d, device=%d, ctx=%zu tokens).\n\n",
+                            tok, g, s, (int)gsort, (int)(dev != nullptr), (*ctx)[s].size());
+                        std::fflush(stderr);
+                    }
+                    ok = false;
+                } else (*out)[s] = tok;
             }
 
             {
