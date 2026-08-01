@@ -172,6 +172,53 @@ regresses hard above 512 (768 → 24.0, 1024 → 29.6).
 groups gave 8.7 / 8.8 / 8.8. Use the lowest value that keeps `slots/groups`
 under the GPU sort's 64-stream limit.
 
+## What the ~40 w/s ceiling actually is: the CPU tail
+
+Profiling an H100 at 512 slots shows the card **idle 22% of the time**:
+
+| phase | ms/step | share |
+|---|---|---|
+| decode (GPU) | ~34.9 | 67% |
+| sampler tail (CPU) | 11.0 | 21% |
+| decode-issue (CPU) | 6.0 | 12% |
+
+The 5090 splits 82/13/5 — the H100 decodes so much faster that a roughly fixed
+CPU cost dominates. **That, not memory bandwidth, is the ceiling**, and it
+explains the H200 result: more bandwidth cannot fill a gap the CPU is causing.
+Efficiency per TB/s says the same thing from the other direction — the PRO 6000
+manages 14.3 w/s per TB/s against the H100's 12.1, because it is not waiting.
+
+**Attacking the CPU tail works.** On a 176-CPU H100 box, 4 GPUs per arm:
+
+| | mean w/s | range | sampler tail |
+|---|---|---|---|
+| default (`groups 12`) | 37.42 | 36.9–38.2 | 11.1–11.3 ms |
+| **`MEOW_GROUPS=24` + `MEOW_UBATCH=4096`** | **39.75** | 38.8–40.5 | 8.8–9.1 ms |
+
+**+6.2%**, ranges barely overlapping. The two settings attack different parts
+of the step and compose: more sampler groups shorten the tail (11.5 → 9.2 ms
+alone), while a larger ubatch raises utilisation (76% → 99% alone).
+
+**But the best group count depends on the HOST, not the GPU.** An 80-CPU H100
+measured groups flat (12 → 37.8, 24 → 37.6, 48 → 37.3); the 176-CPU box gains
+clearly from 24. So this is deliberately **not** baked into the per-GPU
+profile — set `MEOW_GROUPS=24` yourself when the host has ≥128 cores.
+
+### Loading the model multiple times does not help
+
+A frequently suggested idea, measured and rejected on three cards. Two llama
+contexts sharing **one** model load (strictly better than two copies, which
+would waste 15.3 GB):
+
+| card | two contexts | one context |
+|---|---|---|
+| H100 | 320×2 → 31.4, 256×2 → 30.9 | 512×1 → 37.4 |
+| H200 | 512×2 → 36.6 | 512×1 → 39.9 |
+| RTX 5090 | 64×2 → 12.8 | 128×1 → 19.5 |
+
+Weights are not the bottleneck, so a second copy buys nothing and costs the KV
+budget that slots actually need.
+
 ## Where bandwidth stops paying (measured, not modelled)
 
 Throughput tracks memory bandwidth **up to about an H100, and not beyond**:
