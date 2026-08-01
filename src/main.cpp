@@ -40,7 +40,7 @@ extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 
 namespace {
 
-const char* kVersion = "0.2.3";
+const char* kVersion = "0.2.4";
 
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop = true; }
@@ -210,7 +210,11 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--canary-out")      { if (!need_value(i, argc, "--canary-out")) return false; o.canary_out = argv[++i]; }
         else if (a == "--slots")           { if (!need_value(i, argc, "--slots")) return false; o.slots = std::atoi(argv[++i]); o.slots_set = true; }
         else if (a == "--workers")         { if (!need_value(i, argc, "--workers")) return false; o.workers = std::atoi(argv[++i]); }
-        else if (a == "--groups")          { if (!need_value(i, argc, "--groups")) return false; o.groups = std::atoi(argv[++i]); o.groups_set = true; }
+        // A non-positive --groups means "auto", not "one group". Shell wrappers
+        // can pass 0 by accident: GROUPS is a bash BUILT-IN array (the caller's
+        // group ids), so an env var of that name is silently replaced by "0"
+        // and `--groups ${GROUPS}` becomes `--groups 0`.
+        else if (a == "--groups")          { if (!need_value(i, argc, "--groups")) return false; o.groups = std::atoi(argv[++i]); o.groups_set = o.groups > 0; }
         else if (a == "--egress-base")     { if (!need_value(i, argc, "--egress-base")) return false; o.egress_base = std::atoi(argv[++i]); }
         else if (a == "--ctx")             { if (!need_value(i, argc, "--ctx")) return false; o.ctx_per_slot = std::atoi(argv[++i]); }
         else if (a == "--api-bind")        { if (!need_value(i, argc, "--api-bind")) return false; o.api_bind = argv[++i]; }
@@ -742,7 +746,18 @@ int main(int argc, char** argv) {
         }
 
         const int n_streams = std::max(1, o.slots);
-        const int n_groups  = std::max(1, std::min(o.groups, n_streams));
+        int n_groups = std::max(1, std::min(o.groups, n_streams));
+        // The GPU sort takes at most 64 streams per group (flat combined-key
+        // limit in pow_gpu_sort_and_stats_device_k). A group slice above that
+        // cannot sort, so EVERY window fails — silently, until it was made to
+        // report itself. Raise the group count to fit instead of mining at
+        // zero: a slower-than-ideal group split beats no shares at all.
+        if (const int min_groups = (n_streams + 63) / 64; n_groups < min_groups) {
+            std::printf("[%s] %sgroups raised %d -> %d%s (a worker group sorts at most 64 of the %d slots)\n",
+                        timestamp_now().c_str(), C_Y(), n_groups, min_groups, C_0(), n_streams);
+            std::fflush(stdout);
+            n_groups = min_groups;
+        }
 
         // One SamplerPool per worker context (one llama context per device).
         // Each pool runs the per-stream sampler tail across n_groups threads,

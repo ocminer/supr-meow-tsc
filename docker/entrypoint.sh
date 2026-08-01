@@ -13,7 +13,7 @@
 #
 # OPTIONAL — SLOTS/GROUPS default to the miner's per-GPU auto-tuning; set them
 # only to override it.
-#   WORKER, PASSWORD, DEVICES, SLOTS, GROUPS, CTX, API_BIND, LOG_INTERVAL,
+#   WORKER, PASSWORD, DEVICES, SLOTS, MEOW_GROUPS, CTX, API_BIND, LOG_INTERVAL,
 #   MODEL_DIR, EXTRA_ARGS
 #   DOUBLE_BUFFER=0|1   PROMPT_STYLE=0|1
 #
@@ -119,7 +119,12 @@ args+=( -u "$USER_ARG" -p "${PASSWORD:-x}" --model "$MODEL_PATH" --no-color )
 # defeated that on every other GPU: 128 slots on a card that cannot hold their
 # KV cache leaves no VRAM for the sampler scratch, and every window fails.
 [[ -n "${SLOTS:-}"  ]] && args+=( --slots "$SLOTS" )
-[[ -n "${GROUPS:-}" ]] && args+=( --groups "$GROUPS" )
+# NOT "GROUPS": that is a bash BUILT-IN array holding the caller's group ids,
+# so bash overwrites any env var of that name and `${GROUPS:-12}` expands to
+# "0" for root. Every containerised run therefore passed `--groups 0`, which
+# made each worker group sort all the slots at once — above the GPU sort's
+# 64-stream limit, so every window failed and the rig mined nothing at all.
+[[ -n "${MEOW_GROUPS:-}" ]] && args+=( --groups "$MEOW_GROUPS" )
 [[ -n "${CTX:-}"          ]] && args+=( --ctx "$CTX" )
 args+=( --api-bind "${API_BIND:-off}" )
 [[ -n "${LOG_INTERVAL:-}" ]] && args+=( --log-interval "$LOG_INTERVAL" )
@@ -133,5 +138,5 @@ export MEOW_DOUBLE_BUFFER="${DOUBLE_BUFFER:-0}"
 export POW_PROMPT_STYLE="${PROMPT_STYLE:-1}"
 
 echo "[entrypoint] pool=$POOL_URL user=$USER_ARG model=$(basename "$MODEL_PATH")"
-echo "[entrypoint] slots=${SLOTS:-auto} groups=${GROUPS:-auto} double_buffer=$MEOW_DOUBLE_BUFFER prompt_style=$POW_PROMPT_STYLE"
+echo "[entrypoint] slots=${SLOTS:-auto} groups=${MEOW_GROUPS:-auto} double_buffer=$MEOW_DOUBLE_BUFFER prompt_style=$POW_PROMPT_STYLE"
 exec /app/supr-meow-tsc "${args[@]}"

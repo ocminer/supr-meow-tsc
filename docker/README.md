@@ -37,8 +37,8 @@ Or `docker compose up -d` with the bundled `docker-compose.yml`.
 | `MODEL_PATH` | — | use a model already in the container/volume instead |
 | `MODEL_DIR` | `/models` | cache location — mount a volume here |
 | `DEVICES` | all | `0` or `0,1` |
-| `SLOTS` | `128` | concurrent windows per GPU |
-| `GROUPS` | `12` | sampler threads per GPU |
+| `SLOTS` | auto | concurrent windows per GPU |
+| `MEOW_GROUPS` | auto | sampler threads per GPU. **Not `GROUPS`** — bash overwrites that name with its built-in group-id array, so it always arrives as `0`. |
 | `CTX` | engine default | KV tokens per slot; must exceed window+64 (>320) |
 | `API_BIND` | `off` | `0.0.0.0:21550` to expose the JSON stats API |
 | `DOUBLE_BUFFER` | `0` | keep 0 for large models (see below) |
