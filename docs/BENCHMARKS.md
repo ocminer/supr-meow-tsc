@@ -14,7 +14,8 @@ share verdicts checked, not in a synthetic harness.
 
 | GPU | VRAM | best config | **w/s (8B)** | notes |
 |---|---|---|---|---|
-| **H100 80GB HBM3** | 80 GB | `--slots 512 --groups 12`, single-buffered | **~40.5** | needs `llama-max-seq-512.patch`; stock llama caps at 256 (→37.6) |
+| **H100 80GB HBM3** | 80 GB | `--slots 512 --groups 12`, single-buffered | **~40.5** | needs `LLAMA_MAX_SEQ=512`; stock llama caps at 256 (→37.6) |
+| **H200 141GB HBM3e** | 141 GB | `--slots 512 --groups 12`, single-buffered | **~40.5** | same as the H100 despite +43% bandwidth — see below |
 | **RTX 5090** | 32 GB | `--slots 128 --groups 12`, single-buffered | **19.5** | VRAM-limited before the seq cap |
 
 Both are selected **automatically** — the miner reads compute capability and
@@ -71,6 +72,38 @@ box (80 cores): 12 → 37.8, 24 → 37.6, 32 → 37.5, 48 → 37.3 — a slight 
 from thread contention, so the lowest value that keeps up is best.
 
 Double-buffering costs 21 GB more for no gain, so it is off.
+
+## The H200 result: bandwidth stops being the limit
+
+The H200 has 4.8 TB/s against the H100's 3.35 and 141 GB against 80. It
+delivers **exactly the same 40.5 w/s**. Everything that spends the extra
+memory made it worse, each measured against a *concurrent* control on the
+other card of the same box:
+
+| config (H200, 8B) | w/s |
+|---|---|
+| **512 slots, single-buffered** | **40.4 / 40.5 / 39.9** (three runs) |
+| 512 slots, `MEOW_UBATCH=4096` | 40.9 (noise) |
+| 512 × 2 double-buffered (98 GB) | 36.6 |
+| 1024 slots (`LLAMA_MAX_SEQ=1024`) | 29.6 |
+| 768 slots (`LLAMA_MAX_SEQ=1024`) | 24.0 |
+| 512 slots on a `LLAMA_MAX_SEQ=1024` build | 35.9 |
+
+Two conclusions worth keeping:
+
+**Raising `LLAMA_MAX_SEQ` is not free.** The constant sizes
+`std::bitset<LLAMA_MAX_SEQ>` and per-batch arrays regardless of the slots you
+actually use, so a 1024 build costs **11%** even when run at 512 slots
+(35.9 vs 40.4). Any gain from more slots has to beat that handicap first, and
+none did.
+
+**Above the H100 the workload is no longer memory-bandwidth-bound.** Clocks
+sat pinned at 1980/1980 MHz drawing 476 W of a 700 W limit, so the card was
+neither throttling nor compute-saturated — the ceiling is elsewhere (CPU
+sampler tail, per-window prompt eval at ~1.07 s of a 12.6 s batch, and llama's
+decode efficiency). **Practical consequence: buying more HBM bandwidth than an
+H100 buys nothing for this miner.** A 5090 at 1.79 TB/s does 19.5 and scales
+with bandwidth; an H200 at 4.8 does not.
 
 ## Where the time goes (RTX 5090, 128 slots, 8B)
 

@@ -10,6 +10,22 @@ TuningProfile tuning_for(int sm, size_t vram_bytes, size_t model_bytes) {
     // not VRAM — 512 slots fails to create a context however much memory is
     // free. Double-buffering measured neutral (37.4 vs 36.4 w/s) at 2x the
     // VRAM, so it is not worth the memory.
+    // H200 141GB (sm_90). Measured 2026-08-01: SAME 40.5 w/s as the H100 at
+    // the same config, despite 43% more memory bandwidth (4.8 vs 3.35 TB/s) —
+    // so at 512 slots this workload is NOT bandwidth-bound any more, and the
+    // extra VRAM buys nothing. Everything that spends the extra memory lost:
+    // 768 slots 24.0, 1024 slots 29.6, and 512x2 double-buffered 36.6 vs 39.9
+    // on a concurrent control. Raising LLAMA_MAX_SEQ to reach those slot
+    // counts costs 11% on its own (512 slots measured 35.9 on a MAX_SEQ=1024
+    // build vs 40.4 on the standard one) because the constant sizes per-batch
+    // bitsets whatever you actually use. Do not "optimise" this back.
+    if (sm == 90 && vram_gb > 100.0)
+        return { "H200 141GB", 512, 12, false,
+                 "40.5 w/s at 512 slots, 0 rejects — identical to the H100 despite 43% more "
+                 "bandwidth, so 512 is a workload ceiling here, not a memory one. Measured "
+                 "against a concurrent control: 768->24.0, 1024->29.6, 512x2 double->36.6 vs "
+                 "39.9, ubatch 4096->40.9 (noise). MAX_SEQ=1024 build costs 11% even at 512." };
+
     if (sm == 90 && vram_gb > 60.0)
         return { "H100 80GB", 512, 12, false,
                  "40.5 w/s at 512 slots, 0 rejects (128->28.9 192->33.8 256->37.6 384->38.1 512->40.5); "
