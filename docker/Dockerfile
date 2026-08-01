@@ -41,13 +41,22 @@ COPY vendor/tensorcash/ /src/vendor/tensorcash/
 # and OUR PATCH IS APPLIED — without it the miner does not link
 # (llama_get_logits_device / llama_set_skip_logits_copy are ours, and the
 # GPU-resident-logits path that doubled throughput depends on them).
+# Stock llama.cpp hard-codes `#define LLAMA_MAX_SEQ 256`, which caps slots per
+# context regardless of free VRAM — on an H100 that was the real ceiling, not
+# the card (256->37.6 w/s, 512->40.5). Set as a build arg rather than a patch
+# file so a bigger card can be tried without a new patch to maintain. The
+# constant sizes std::bitset<LLAMA_MAX_SEQ> and per-batch arrays, so ALWAYS
+# re-check reject counts after raising it: a regression corrupts transcripts
+# rather than crashing.
+ARG LLAMA_MAX_SEQ=512
 ARG LLAMA_REPO=https://github.com/tensorcash/llama.cpp
 ARG LLAMA_COMMIT=966fb8619648da1b2033dd78ee12756cbc7ff3b0
 RUN rm -rf /src/vendor/llama.cpp && \
     git clone --filter=blob:none "${LLAMA_REPO}" /src/vendor/llama.cpp && \
     cd /src/vendor/llama.cpp && git checkout -q "${LLAMA_COMMIT}" && \
     git apply --verbose /src/tools/llama-gpu-logits.patch && \
-    git apply --verbose /src/tools/llama-max-seq-512.patch && \
+    sed -i "s/#define LLAMA_MAX_SEQ .*/#define LLAMA_MAX_SEQ ${LLAMA_MAX_SEQ}/" src/llama-cparams.h && \
+    grep -q "#define LLAMA_MAX_SEQ ${LLAMA_MAX_SEQ}" src/llama-cparams.h && \
     grep -q llama_get_logits_device include/llama.h || \
       (echo "FATAL: llama patch did not apply" && exit 1)
 
