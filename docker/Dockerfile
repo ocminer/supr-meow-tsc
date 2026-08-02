@@ -49,15 +49,14 @@ COPY vendor/tensorcash/ /src/vendor/tensorcash/
 # re-check reject counts after raising it: a regression corrupts transcripts
 # rather than crashing.
 ARG LLAMA_MAX_SEQ=512
-# PREFER THE VENDORED COPY. github.com/tensorcash/llama.cpp became unreachable
-# on 2026-08-02 (a git clone now prompts for credentials, i.e. private or
-# deleted) and the pinned commit is fork-specific — it is NOT in
-# ggml-org/llama.cpp, so there is no upstream to fall back to. Until the fork
-# is rehosted somewhere we control, vendor/llama-src.tar.gz IS the dependency:
-# it is the fork at 966fb86 with llama-gpu-logits.patch already applied.
-# Full history: $HOME/llama-fork-966fb86.bundle (28 MB, verified).
-# The clone path is kept for when a reachable remote exists again.
-ARG LLAMA_REPO=https://github.com/tensorcash/llama.cpp
+# github.com/tensorcash/llama.cpp vanished on 2026-08-02 (clone began
+# prompting for credentials) and the pinned commit is fork-specific — it is NOT
+# in ggml-org/llama.cpp, so there was no upstream to fall back on and every
+# clean build broke. The fork was recovered from the Docker cache and rehosted
+# at github.com/ocminer/llama.cpp, which we control; verified fetchable
+# anonymously. vendor/llama-src.tar.gz (already patched, gitignored) is kept as
+# an offline fallback and wins when present.
+ARG LLAMA_REPO=https://github.com/ocminer/llama.cpp
 ARG LLAMA_COMMIT=966fb8619648da1b2033dd78ee12756cbc7ff3b0
 COPY vendor/llama-src.tar.gz* /tmp/
 RUN rm -rf /src/vendor/llama.cpp && \

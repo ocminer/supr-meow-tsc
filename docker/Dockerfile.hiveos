@@ -34,16 +34,24 @@ COPY tools/             /src/tools/
 COPY vendor/nlohmann/   /src/vendor/nlohmann/
 COPY vendor/tensorcash/ /src/vendor/tensorcash/
 
-# SOURCED LOCALLY, NOT CLONED. github.com/tensorcash/llama.cpp became
-# unreachable on 2026-08-02 (auth prompt = private or deleted), and the pinned
-# commit is fork-specific — it does not exist in ggml-org/llama.cpp. Every
-# clean build would now fail. vendor/llama-src.tar.gz is the recovered fork at
-# 966fb86 with our GPU-logits patch already applied; see
-# $HOME/llama-fork-966fb86.bundle for the full history.
+# The original tensorcash fork vanished on 2026-08-02; it is rehosted at
+# github.com/ocminer/llama.cpp. vendor/llama-src.tar.gz is an already-patched
+# offline copy and wins when present (it is gitignored, so a fresh checkout
+# takes the clone path instead).
 ARG LLAMA_MAX_SEQ=512
-COPY vendor/llama-src.tar.gz /tmp/
+ARG LLAMA_REPO=https://github.com/ocminer/llama.cpp
+ARG LLAMA_COMMIT=966fb8619648da1b2033dd78ee12756cbc7ff3b0
+COPY vendor/llama-src.tar.gz* /tmp/
 RUN rm -rf /src/vendor/llama.cpp && \
-    tar -xzf /tmp/llama-src.tar.gz -C /src/vendor/ && rm -f /tmp/llama-src.tar.gz && \
+    if [ -f /tmp/llama-src.tar.gz ]; then \
+      echo "using vendored llama fork" && \
+      tar -xzf /tmp/llama-src.tar.gz -C /src/vendor/ && rm -f /tmp/llama-src.tar.gz; \
+    else \
+      echo "cloning ${LLAMA_REPO}" && \
+      git clone --filter=blob:none "${LLAMA_REPO}" /src/vendor/llama.cpp && \
+      cd /src/vendor/llama.cpp && git checkout -q "${LLAMA_COMMIT}" && \
+      git apply --verbose /src/tools/llama-gpu-logits.patch; \
+    fi && \
     cd /src/vendor/llama.cpp && \
     sed -i "s/#define LLAMA_MAX_SEQ .*/#define LLAMA_MAX_SEQ ${LLAMA_MAX_SEQ}/" src/llama-cparams.h && \
     grep -q "#define LLAMA_MAX_SEQ ${LLAMA_MAX_SEQ}" src/llama-cparams.h && \
