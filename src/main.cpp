@@ -121,6 +121,8 @@ struct Options {
     int         workers = 1;   // independent contexts per GPU (--workers)
     int         groups  = 8;   bool groups_set = false;  // --groups
     bool        double_buffer_set = false;
+    bool        split_model = false;   // --split-model: one model across all -d cards
+    bool        split_rows  = false;   // --split-rows: tensor-parallel instead of layer
     int         egress_base = 47021;  // base loopback port for proof egress (--egress-base)
     int         ctx_per_slot = 384;   // --ctx: KV per slot. MUST exceed prompt+window.
     std::string api_bind = "127.0.0.1:21550";  // --api-bind ("off" disables)
@@ -154,6 +156,12 @@ void print_usage() {
 "      --vdf-test          Self-test the VDF (prove, verify, and confirm a\n"
 "                          proof does NOT verify against another challenge).\n"
 "      --slots <n>         Concurrent windows per GPU (default 8).\n"
+"      --split-model       Split ONE model across all -d GPUs instead of a\n"
+"                          full copy per card. For cards too small to hold\n"
+"                          the model alone (2x12GB, 4x8GB, 8x6GB). Aggregates\n"
+"                          VRAM; does NOT add throughput. Cards should match.\n"
+"      --split-rows        As --split-model but tensor-parallel (all-reduce\n"
+"                          per layer). Usually slower without NVLink; measure.\n"
 "      --ctx <n>           KV tokens per slot (default 384). Must exceed\n"
 "                          prompt+window (~280); smaller fits more slots.\n"
 "      --protocol-test     Connect to the pool and print jobs/targets/model\n"
@@ -215,6 +223,8 @@ bool parse_args(int argc, char** argv, Options& o) {
         // group ids), so an env var of that name is silently replaced by "0"
         // and `--groups ${GROUPS}` becomes `--groups 0`.
         else if (a == "--groups")          { if (!need_value(i, argc, "--groups")) return false; o.groups = std::atoi(argv[++i]); o.groups_set = o.groups > 0; }
+        else if (a == "--split-model")     { o.split_model = true; }
+        else if (a == "--split-rows")      { o.split_model = true; o.split_rows = true; }
         else if (a == "--egress-base")     { if (!need_value(i, argc, "--egress-base")) return false; o.egress_base = std::atoi(argv[++i]); }
         else if (a == "--ctx")             { if (!need_value(i, argc, "--ctx")) return false; o.ctx_per_slot = std::atoi(argv[++i]); }
         else if (a == "--api-bind")        { if (!need_value(i, argc, "--api-bind")) return false; o.api_bind = argv[++i]; }
@@ -700,8 +710,20 @@ int main(int argc, char** argv) {
         // the sampler pool expects the tuned one ("bad stream count").
         if (!o.slots_set || !o.groups_set) {
             const auto& d0 = dm.devices().front();
-            const auto tp = meow::tuning_for(d0.sm_major * 10 + d0.sm_minor,
-                                             d0.vram_total, 0);
+            // In split mode the measured per-card profiles do NOT apply: they
+            // assume a full model copy per GPU and size slots from one card's
+            // VRAM. Here the model is spread over every card, so the budget is
+            // the AGGREGATE minus a single copy. Feed the combined figure to
+            // the same sizing logic and let it fall through to the VRAM-derived
+            // path rather than matching, say, "RTX A6000 48GB" on a pair of
+            // 12 GB cards that jointly have less usable room.
+            size_t vram_for_tuning = d0.vram_total;
+            if (o.split_model) {
+                vram_for_tuning = 0;
+                for (const auto& d : dm.devices()) vram_for_tuning += d.vram_total;
+            }
+            const auto tp = meow::tuning_for(o.split_model ? -1 : (d0.sm_major * 10 + d0.sm_minor),
+                                             vram_for_tuning, 0);
             if (!o.slots_set)  o.slots  = tp.slots;
             if (!o.groups_set) o.groups = tp.groups;
             if (!o.double_buffer_set && tp.double_buffer) ::setenv("MEOW_DOUBLE_BUFFER", "1", 0);
@@ -725,6 +747,8 @@ int main(int argc, char** argv) {
         ec.slots_per_device = o.slots;
         ec.ctx_per_slot     = o.ctx_per_slot;   // smaller KV => more slots fit
         ec.double_buffer    = want_double;
+        ec.split_model      = o.split_model;
+        ec.split_rows       = o.split_rows;
         for (const auto& d : dm.devices()) ec.devices.push_back(d.index);
 
         meow::InferenceEngine engine;

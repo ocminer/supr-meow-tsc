@@ -53,6 +53,21 @@ struct EngineConfig {
     // Double-buffered decode (generate_windows_double): doubles n_seq_max and
     // n_ctx so two full window batches coexist in the KV cache.
     bool              double_buffer    = false;
+    // Split ONE model across all selected GPUs instead of giving each GPU its
+    // own full copy. This is for cards that cannot hold the 15.3 GB model
+    // alone (the pool documents 2x12 GB, 4x8 GB, 8x6 GB combining into a
+    // single worker); it aggregates VRAM, it does NOT add throughput — the
+    // GPUs work on the same batch rather than on independent ones.
+    //
+    // Default false, which keeps the data-parallel path (one full model per
+    // card, N independent workers) that every measured profile was tuned on.
+    bool              split_model      = false;
+    // Only consulted when split_model is set. LAYER gives each GPU a slice of
+    // the layers and passes activations along — little interconnect traffic,
+    // but the cards run in sequence. ROW is true tensor parallelism: the cards
+    // work simultaneously but all-reduce every layer, which without NVLink is
+    // usually slower than LAYER. Measure before believing either.
+    bool              split_rows       = false;
 };
 
 struct DeviceEngineStats {

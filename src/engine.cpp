@@ -1,6 +1,8 @@
 #include "engine.h"
 
 #include "llama.h"
+// ggml_backend_dev_by_name: needed to pin the split to exactly our GPUs.
+#include "ggml-backend.h"
 
 #include <chrono>
 #include <cstdio>
@@ -91,12 +93,40 @@ bool InferenceEngine::load(const EngineConfig& cfg, std::string& error,
     }, nullptr);
 
     const int W = std::max(1, cfg.workers_per_device);
-    for (int dev : cfg.devices) {
+    // Split mode loads the model ONCE across every selected GPU, so the loop
+    // below runs a single time and `dev` is only the main/first card. The
+    // data-parallel path is unchanged: one full model per device.
+    const std::vector<int> load_devices =
+        cfg.split_model ? std::vector<int>{ cfg.devices.front() } : cfg.devices;
+
+    for (int dev : load_devices) {
         llama_model_params mp = llama_model_default_params();
         mp.n_gpu_layers = 999;                       // the whole model on the GPU
         mp.main_gpu     = dev;
         mp.split_mode   = LLAMA_SPLIT_MODE_NONE;     // data parallel, see engine.h
         mp.use_mmap     = true;
+
+        // Restrict llama to the cards we were given, in order. Without this it
+        // would spread across every visible GPU and quietly collide with the
+        // other miner processes on a multi-card box.
+        std::vector<ggml_backend_dev_t> split_devs;
+        if (cfg.split_model) {
+            for (int d : cfg.devices) {
+                char name[32];
+                std::snprintf(name, sizeof(name), "CUDA%d", d);
+                if (ggml_backend_dev_t bd = ggml_backend_dev_by_name(name)) split_devs.push_back(bd);
+            }
+            if (split_devs.size() != cfg.devices.size()) {
+                error = "split-model: could not resolve every selected GPU as a llama backend device";
+                return false;
+            }
+            split_devs.push_back(nullptr);           // llama wants a null terminator
+            mp.devices    = split_devs.data();
+            mp.split_mode = cfg.split_rows ? LLAMA_SPLIT_MODE_ROW : LLAMA_SPLIT_MODE_LAYER;
+            if (progress)
+                progress("splitting one model across " + std::to_string(cfg.devices.size()) +
+                         " GPUs (" + (cfg.split_rows ? "row/tensor-parallel" : "layer") + ")");
+        }
 
         if (progress) progress("loading model on GPU " + std::to_string(dev));
         llama_model* model = llama_model_load_from_file(cfg.model_path.c_str(), mp);
@@ -394,7 +424,16 @@ int InferenceEngine::generate_windows_stepwise_tok(int device_slot,
     // 29 MB D2H + host narrowing + H2D disappear. Step 0 consumes the PROMPT
     // pass logits (scattered rows, possibly multi-ubatch) and stays on the
     // host path. Verified once per window; POW_GPU_DEVICE_LOGITS=0 disables.
-    static const bool want_dev_logits = [](){
+    // GPU-resident logits assume the output tensor lives on the ONE card the
+    // sampler is bound to. Under a model split that is false: with a layer
+    // split the output sits on whichever card holds the last layer, so reading
+    // it from the sampler's device is an illegal access — which is exactly how
+    // this first failed (CUDA error at ggml-cuda.cu:97). Fall back to llama's
+    // host copy whenever the model is split; it costs the D2H that the device
+    // path exists to avoid, but split mode is for cards that cannot hold the
+    // model at all, where correctness is the whole point.
+    const bool want_dev_logits = [this](){
+        if (cfg_.split_model) return false;
         const char* e = std::getenv("POW_GPU_DEVICE_LOGITS");
         return !(e && *e == '0');
     }();
