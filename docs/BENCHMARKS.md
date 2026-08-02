@@ -257,6 +257,47 @@ immediately), while the H100 climbs steeply over the identical range
 (28.9 → 40.5). The A100 also ran pinned at its 400 W limit; the H200 idled at
 476 W of 700 W.
 
+## Splitting one model across several GPUs (`--split-model`)
+
+For cards that cannot hold the 15.3 GB model alone, one model can be spread
+over several GPUs and mined as a single worker. It aggregates VRAM; it does
+**not** add throughput.
+
+| config | w/s |
+|---|---|
+| 1× RTX 5090, device logits | 19.5 |
+| 1× RTX 5090, **host** logits | 7.4 |
+| 2× RTX 5090 split | 12.3 |
+| 2× RTX 5080 split, host logits | 2.7 |
+| **2× RTX 5080 split, device logits** | **9.0** |
+
+**The split scales; the logits path was the cost.** 2× 5090 split gives 12.3
+against 7.4 for a single card on the same footing — the cards do add up. The
+apparent disaster was that split mode fell back to llama's host logits copy,
+worth **2.6×** on its own. Recovering GPU-resident logits under a split turned
+2× 5080 from 2.7 into **9.0 w/s**.
+
+Two things had to be fixed to get there, the second only visible after the
+first: the sampler must bind to the card that actually **owns** the logits
+(under a layer split that is wherever the last layer lives, not the first card
+and not reliably the last one either — ask CUDA), and its scratch buffers must
+be **dropped and reallocated** on that card, or kernels write across devices
+and fault.
+
+Sizing differs too: the sampler scratch (~0.6 GB) lands entirely on the output
+card instead of being spread like model and KV, so split mode reserves 2 GiB
+of the aggregate. Without that, 167 slots died on the scratch allocation while
+140 ran clean.
+
+**Known limits.** Cards should be identical and the aggregate must genuinely
+exceed model + KV: 2× 8 GB (15.4 GB total) correctly refuses a 15.3 GB model,
+matching the pool's 4×8 GB minimum. Mixed architectures additionally need a
+multi-arch build, or the odd card out dies with "no kernel image is available".
+
+**Watch the ordinals:** the miner uses CUDA ordering, which is *not*
+`nvidia-smi`'s PCI order — on one test rig `nvidia-smi` showed 0,1 as the
+3070s while the miner saw 0,1 as the 5080s.
+
 ## Model size matters more than anything else
 
 | model | GPU | w/s |
