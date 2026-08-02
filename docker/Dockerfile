@@ -49,12 +49,28 @@ COPY vendor/tensorcash/ /src/vendor/tensorcash/
 # re-check reject counts after raising it: a regression corrupts transcripts
 # rather than crashing.
 ARG LLAMA_MAX_SEQ=512
+# PREFER THE VENDORED COPY. github.com/tensorcash/llama.cpp became unreachable
+# on 2026-08-02 (a git clone now prompts for credentials, i.e. private or
+# deleted) and the pinned commit is fork-specific — it is NOT in
+# ggml-org/llama.cpp, so there is no upstream to fall back to. Until the fork
+# is rehosted somewhere we control, vendor/llama-src.tar.gz IS the dependency:
+# it is the fork at 966fb86 with llama-gpu-logits.patch already applied.
+# Full history: $HOME/llama-fork-966fb86.bundle (28 MB, verified).
+# The clone path is kept for when a reachable remote exists again.
 ARG LLAMA_REPO=https://github.com/tensorcash/llama.cpp
 ARG LLAMA_COMMIT=966fb8619648da1b2033dd78ee12756cbc7ff3b0
+COPY vendor/llama-src.tar.gz* /tmp/
 RUN rm -rf /src/vendor/llama.cpp && \
-    git clone --filter=blob:none "${LLAMA_REPO}" /src/vendor/llama.cpp && \
-    cd /src/vendor/llama.cpp && git checkout -q "${LLAMA_COMMIT}" && \
-    git apply --verbose /src/tools/llama-gpu-logits.patch && \
+    if [ -f /tmp/llama-src.tar.gz ]; then \
+      echo "using vendored llama fork" && \
+      tar -xzf /tmp/llama-src.tar.gz -C /src/vendor/ && rm -f /tmp/llama-src.tar.gz; \
+    else \
+      echo "vendored copy absent — cloning ${LLAMA_REPO}" && \
+      git clone --filter=blob:none "${LLAMA_REPO}" /src/vendor/llama.cpp && \
+      cd /src/vendor/llama.cpp && git checkout -q "${LLAMA_COMMIT}" && \
+      git apply --verbose /src/tools/llama-gpu-logits.patch; \
+    fi && \
+    cd /src/vendor/llama.cpp && \
     sed -i "s/#define LLAMA_MAX_SEQ .*/#define LLAMA_MAX_SEQ ${LLAMA_MAX_SEQ}/" src/llama-cparams.h && \
     grep -q "#define LLAMA_MAX_SEQ ${LLAMA_MAX_SEQ}" src/llama-cparams.h && \
     grep -q llama_get_logits_device include/llama.h || \

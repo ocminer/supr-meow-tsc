@@ -1,0 +1,121 @@
+# Builds the HiveOS custom-miner package.
+#
+# WHY A SEPARATE DOCKERFILE: HiveOS is Ubuntu 22.04 (glibc 2.35). The normal
+# image is built on 24.04 (glibc 2.39), and glibc is forward- but not
+# backward-compatible, so that binary dies on a HiveOS rig with
+# "GLIBC_2.38 not found". This builds against 22.04 so the result runs there.
+#
+# CUDA 12.8 rather than 13: it is the oldest toolkit that supports sm_120
+# (RTX 5090) and it pairs with 22.04. HiveOS supplies libcuda.so.1 and
+# libnvidia-ml.so.1 from its own driver; everything else we ship.
+#
+# Output is a tarball on stdout — see tools/build-hiveos-package.sh.
+FROM nvidia/cuda:12.8.0-devel-ubuntu22.04 AS build
+
+# HiveOS rigs are consumer cards: 75 Turing (2080Ti), 86 Ampere (3090),
+# 89 Ada (4090), 120 Blackwell (5090). Datacentre archs (80/90) are dropped —
+# they add ~100 MB of cubins to a package nobody will run on an A100.
+ARG CUDA_ARCHS="75;86;89;120"
+ARG JOBS=
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git ca-certificates \
+        libssl-dev libzmq3-dev libargon2-dev libgmp-dev \
+        flatbuffers-compiler libflatbuffers-dev python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 22.04 has no cppzmq-dev package (24.04 does), and the build needs zmq.hpp.
+RUN git clone --depth 1 --branch v4.10.0 https://github.com/zeromq/cppzmq /tmp/cppzmq \
+    && cp /tmp/cppzmq/zmq.hpp /tmp/cppzmq/zmq_addon.hpp /usr/include/ \
+    && rm -rf /tmp/cppzmq
+
+WORKDIR /src
+COPY tools/             /src/tools/
+COPY vendor/nlohmann/   /src/vendor/nlohmann/
+COPY vendor/tensorcash/ /src/vendor/tensorcash/
+
+# SOURCED LOCALLY, NOT CLONED. github.com/tensorcash/llama.cpp became
+# unreachable on 2026-08-02 (auth prompt = private or deleted), and the pinned
+# commit is fork-specific — it does not exist in ggml-org/llama.cpp. Every
+# clean build would now fail. vendor/llama-src.tar.gz is the recovered fork at
+# 966fb86 with our GPU-logits patch already applied; see
+# $HOME/llama-fork-966fb86.bundle for the full history.
+ARG LLAMA_MAX_SEQ=512
+COPY vendor/llama-src.tar.gz /tmp/
+RUN rm -rf /src/vendor/llama.cpp && \
+    tar -xzf /tmp/llama-src.tar.gz -C /src/vendor/ && rm -f /tmp/llama-src.tar.gz && \
+    cd /src/vendor/llama.cpp && \
+    sed -i "s/#define LLAMA_MAX_SEQ .*/#define LLAMA_MAX_SEQ ${LLAMA_MAX_SEQ}/" src/llama-cparams.h && \
+    grep -q "#define LLAMA_MAX_SEQ ${LLAMA_MAX_SEQ}" src/llama-cparams.h && \
+    grep -q llama_get_logits_device include/llama.h || \
+      (echo "FATAL: llama patch did not apply" && exit 1)
+
+ENV LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib/stubs:${LIBRARY_PATH:-}
+
+COPY CMakeLists.txt /src/
+COPY src/           /src/src/
+
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+      -DMEOW_LLAMA_DIR=/src/vendor/llama.cpp \
+      -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/targets/x86_64-linux/lib/stubs -lcuda" \
+      -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/targets/x86_64-linux/lib/stubs -lcuda" \
+ && cmake --build build -j"${JOBS:-$(nproc)}" --target supr-meow-tsc
+
+# Collect the non-system shared libraries the binary and our .so files pull in.
+# HiveOS is a mining distro, not a dev box: libzmq, libargon2 and libgmp are
+# NOT installed there, so without this the miner dies at startup on a rig with
+# "error while loading shared libraries". Deliberately EXCLUDED: the driver
+# pair (libcuda, libnvidia-ml) which HiveOS provides and which must not be
+# shadowed, and the core C/C++ runtime which every distro has.
+RUN mkdir -p /deps \
+ && for obj in /src/build/supr-meow-tsc /src/build/bin/*.so; do \
+      ldd "$obj" 2>/dev/null | awk '/=> \//{print $3}'; \
+    done | sort -u | while read -r lib; do \
+      case "$(basename "$lib")" in \
+        libcuda.so*|libnvidia-ml.so*|libc.so*|libm.so*|libdl.so*|librt.so*|\
+        libpthread.so*|ld-linux*|libstdc++.so*|libgcc_s.so*) ;; \
+        *) cp -L "$lib" /deps/ ;; \
+      esac; \
+    done \
+ && ls /deps | tr '\n' ' '
+
+# ---------- assemble the package ----------
+# HiveOS expects <name>-<version>.tar.gz containing a single <name>/ directory.
+FROM ubuntu:22.04 AS package
+ARG PKG_VERSION=0.0.0
+WORKDIR /out
+COPY --from=build /src/build/supr-meow-tsc       /out/supr-meow-tsc/supr-meow-tsc
+COPY --from=build /src/build/bin/*.so*           /out/supr-meow-tsc/lib/
+COPY hiveos/                                     /out/supr-meow-tsc/
+
+# The CUDA runtime libraries. HiveOS ships the DRIVER (libcuda, libnvidia-ml)
+# but not the toolkit, so cudart/cublas must travel with us. libcuda.so.1 is
+# deliberately NOT copied — the stub here would shadow the real driver.
+COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12*    /out/supr-meow-tsc/lib/
+COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.12*    /out/supr-meow-tsc/lib/
+COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcublasLt.so.12*  /out/supr-meow-tsc/lib/
+# ...and the non-system libs HiveOS does not ship (zmq, argon2, gmp and their
+# own dependencies). LD_LIBRARY_PATH puts this directory LAST, so anything the
+# rig already provides still wins — these only fill gaps.
+COPY --from=build /deps/                                                      /out/supr-meow-tsc/lib/
+
+# Docker's COPY dereferences symlinks, so libfoo.so, libfoo.so.0 and
+# libfoo.so.0.9.7 each arrive as a full copy — 1.09 GB of duplication here,
+# most of it libcublasLt at 781 MB a time. Group by checksum, keep the
+# longest (most specific) name as the real file, symlink the rest back to it.
+RUN cd /out/supr-meow-tsc/lib \
+ && md5sum *.so* | awk '{print $1, $2}' \
+      | awk '{g[$1] = g[$1] " " $2} END {for (k in g) print g[k]}' \
+      | while read -r group; do \
+            canon=$(for f in $group; do echo "${#f} $f"; done | sort -rn | head -1 | cut -d' ' -f2-); \
+            for f in $group; do \
+              if [ "$f" != "$canon" ]; then ln -sf "$canon" "$f"; fi; \
+            done; \
+          done \
+ && echo "lib/ is now $(du -sh . | cut -f1)"
+
+RUN chmod +x /out/supr-meow-tsc/supr-meow-tsc /out/supr-meow-tsc/h-*.sh \
+ && sed -i "s/^CUSTOM_VERSION=.*/CUSTOM_VERSION=${PKG_VERSION}/" /out/supr-meow-tsc/h-manifest.conf \
+ && tar -czf /supr-meow-tsc-${PKG_VERSION}.tar.gz supr-meow-tsc \
+ && ls -la /supr-meow-tsc-${PKG_VERSION}.tar.gz
