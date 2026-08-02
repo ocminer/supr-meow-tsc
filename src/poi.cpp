@@ -279,6 +279,8 @@ extern "C" bool pow_gpu_sort_and_stats_device_k(
         const float* d_logits, int S, int n, int topk, float inv_temp,
         uint32_t* h_idx, float* h_val, float* h_head, double* h_stats, float* h_probes);
 extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
+extern "C" int  pow_gpu_device_of_ptr(const void* p);
+extern "C" void pow_gpu_reset_device_scratch();
 extern "C" bool pow_gpu_register_host_range(const void* p, size_t bytes);
 extern "C" bool pow_gpu_corrupt_device(float* d_logits, int S, int n, int mode,
                                        float sigma, uint64_t seed);
@@ -560,6 +562,13 @@ struct SamplerPool::Impl {
         // per host thread, so a worker left on the default device would
         // run its sort kernels on GPU 0 regardless of which card decoded.
         pow_gpu_bind_device(cuda_device);
+        // With --split-model the logits do NOT live on that card: llama puts
+        // the output tensor on whichever GPU holds the last layer. Sorting it
+        // from here would be an illegal access, so the first time a device
+        // pointer arrives we ask CUDA who owns it and rebind. Done once, and
+        // only when it actually differs, so the single-GPU path is untouched.
+        int  bound_device  = cuda_device;
+        bool device_checked = false;
         uint64_t seen = 0;
         for (;;) {
             std::unique_lock<std::mutex> lk(mtx);
@@ -587,7 +596,28 @@ struct SamplerPool::Impl {
             const int K = sort_stride;
 #ifdef POW_GPU_SORT_ENABLED
             if (sort_ok && K > 0) {
-                if (dev)
+                // Rebind if the logits live on another card (--split-model). Asked
+            // ONCE per worker, not per step: cudaPointerGetAttributes on every
+            // step of every group would be pure overhead on the single-GPU
+            // path, which is the one that matters most.
+            if (dev && !device_checked) {
+                    device_checked = true;
+                    const int owner = pow_gpu_device_of_ptr(dev);
+                    if (owner >= 0 && owner != bound_device) {
+                        if (pow_gpu_bind_device(owner)) {
+                            // Scratch belongs to the OLD device; drop it or the
+                            // kernels write across cards and fault.
+                            pow_gpu_reset_device_scratch();
+                            bound_device = owner;
+                            static std::atomic<bool> once{false};
+                            if (!once.exchange(true))
+                                std::fprintf(stderr,
+                                    "[pow_gpu] split model: logits live on GPU %d, "
+                                    "sampler rebound from GPU %d\n", owner, cuda_device);
+                        }
+                    }
+                }
+            if (dev)
                     gsort = pow_gpu_sort_and_stats_device_k(
                         dev + (size_t)lo * nvoc, hi - lo, nvoc, K, 1.0f,
                         sort_idx  + (size_t)lo * K,

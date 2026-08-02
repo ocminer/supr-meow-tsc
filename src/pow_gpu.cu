@@ -638,6 +638,19 @@ extern "C" bool pow_gpu_is_device_ptr(const void* p) {
     return attr.type == cudaMemoryTypeDevice;
 }
 
+// Which GPU actually owns this allocation. Needed for --split-model: llama
+// puts the output tensor on whichever card holds the last layer, which is not
+// necessarily the card a sampler thread was bound to. Sorting a pointer that
+// lives on another device is an illegal access, so the caller rebinds to the
+// answer. Returns -1 if the pointer is not device memory.
+extern "C" int pow_gpu_device_of_ptr(const void* p) {
+    cudaPointerAttributes attr{};
+    if (!p) return -1;
+    if (cudaPointerGetAttributes(&attr, p) != cudaSuccess) { cudaGetLastError(); return -1; }
+    if (attr.type != cudaMemoryTypeDevice) return -1;
+    return attr.device;
+}
+
 // ==========================================================================
 // Device-input sort: identical outputs to pow_gpu_sort_and_stats_batched_k,
 // but the logits never touch the host — d_logits is llama's own output
@@ -711,6 +724,23 @@ extern "C" bool pow_gpu_sort_and_stats_device_k(
 // must run its sampler kernels on ITS OWN GPU, not on device 0 by default.
 extern "C" bool pow_gpu_bind_device(int cuda_ordinal) {
     return cudaSetDevice(cuda_ordinal) == cudaSuccess;
+}
+
+// Drop this thread's device scratch so the next ensure() reallocates on
+// whatever GPU is bound NOW. Required when --split-model makes a sampler
+// thread rebind: the buffers were allocated on the old card, and launching
+// kernels against them from the new one is an illegal access — which is
+// precisely how the first rebind attempt failed, after the rebind itself had
+// already succeeded. Host-pinned buffers are untouched; page-locked memory is
+// reachable from any device in the process.
+extern "C" void pow_gpu_reset_device_scratch() {
+    g_batch.release();
+    g_batch.failed     = false;
+    g_batch.cap_total  = 0;
+    g_batch.cap_seg    = 0;
+    g_batch.temp_bytes = 0;
+    g_batch.stream     = nullptr;
+    g_scratch.release();
 }
 
 // Process-global pinned registration of the (single) llama logits buffer.

@@ -433,7 +433,12 @@ int InferenceEngine::generate_windows_stepwise_tok(int device_slot,
     // path exists to avoid, but split mode is for cards that cannot hold the
     // model at all, where correctness is the whole point.
     const bool want_dev_logits = [this](){
-        if (cfg_.split_model) return false;
+        // Split mode CAN use device logits now: the sampler asks CUDA which
+        // card owns the pointer and rebinds itself (see poi.cpp worker). Kept
+        // behind an escape hatch because the fallback is what made split mode
+        // work at all, and a rig that trips over cross-device access should be
+        // able to get back to a correct-but-slower path without a rebuild.
+        if (cfg_.split_model && std::getenv("MEOW_SPLIT_HOST_LOGITS")) return false;
         const char* e = std::getenv("POW_GPU_DEVICE_LOGITS");
         return !(e && *e == '0');
     }();

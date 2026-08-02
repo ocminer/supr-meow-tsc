@@ -721,6 +721,14 @@ int main(int argc, char** argv) {
             if (o.split_model) {
                 vram_for_tuning = 0;
                 for (const auto& d : dm.devices()) vram_for_tuning += d.vram_total;
+                // The sampler scratch (~0.6 GB at these slot counts) lands
+                // ENTIRELY on the card holding the output tensor, not spread
+                // like the model and KV. Sizing from the raw aggregate fills
+                // that card and the scratch allocation then fails — measured:
+                // 167 slots died with "scratch allocation failed" while 140
+                // ran clean. Reserve 2 GiB so the logits card keeps room.
+                const size_t reserve = size_t(2) << 30;
+                vram_for_tuning = vram_for_tuning > reserve ? vram_for_tuning - reserve : 0;
             }
             const auto tp = meow::tuning_for(o.split_model ? -1 : (d0.sm_major * 10 + d0.sm_minor),
                                              vram_for_tuning, 0);
