@@ -53,6 +53,16 @@ clean startup failure instead of a stream of rejected shares.
 Optional: `MODEL_PATH` (model already on the rig), `MODEL_DIR`, `DEVICES`,
 `API_PORT` (default 21550), `CTX`.
 
+**Rigs of small cards:** set `SPLIT_MODEL=1` to spread one model over every
+selected GPU and mine them as a single worker. This is for cards that cannot
+hold the 15.3 GB model alone — 2×12 GB, 4×8 GB, 8×6 GB. It aggregates VRAM, it
+does not add throughput, and the cards should be identical. Measured 9.0 w/s on
+2× RTX 5080. Do **not** also run one instance per card; they would fight over
+the same GPUs.
+
+Note `DEVICES` takes **CUDA ordinals**, which are not `nvidia-smi`'s PCI order —
+run the miner with `--list-devices` once to see the mapping.
+
 **Leave `SLOTS` and `MEOW_GROUPS` unset** — the miner reads compute capability
 and VRAM at startup and applies a measured per-GPU profile. **Never use the
 name `GROUPS`**: it is a bash built-in array, so it always arrives as `0`.

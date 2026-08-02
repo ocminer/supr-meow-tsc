@@ -57,6 +57,11 @@ args+=( --api-bind "127.0.0.1:${API_PORT:-21550}" )
 [[ -n $MEOW_GROUPS ]] && args+=( --groups "$MEOW_GROUPS" )
 [[ -n $CTX         ]] && args+=( --ctx    "$CTX" )
 [[ -n $DEVICES     ]] && args+=( -d       "$DEVICES" )
+# SPLIT_MODEL=1 spreads ONE model over every selected GPU and mines them as a
+# single worker — for rigs of cards too small to hold the 15.3 GB model alone
+# (2x12, 4x8, 8x6 GB). Cards should be identical. Note the miner uses CUDA
+# ordinals, which are NOT nvidia-smi's PCI order; check --list-devices.
+[[ ${SPLIT_MODEL:-0} == 1 ]] && args+=( --split-model )
 [[ -n $EXTRA_ARGS  ]] && args+=( ${EXTRA_ARGS} )
 
 export MEOW_DOUBLE_BUFFER="${DOUBLE_BUFFER:-0}"

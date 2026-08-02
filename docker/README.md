@@ -43,6 +43,7 @@ Or `docker compose up -d` with the bundled `docker-compose.yml`.
 | `API_BIND` | `off` | `0.0.0.0:21550` to expose the JSON stats API |
 | `DOUBLE_BUFFER` | `0` | keep 0 for large models (see below) |
 | `PROMPT_STYLE` | `1` | keep 1 (see below) |
+| `SPLIT_MODEL` | `0` | `1` = one model across all `DEVICES`, mined as a single worker. For cards too small to hold it alone (2×12, 4×8, 8×6 GB). Aggregates VRAM, does not add throughput; cards should be identical. |
 | `EXTRA_ARGS` | — | raw extra flags |
 
 ## Why the defaults are what they are (measured, RTX 5090 + Qwen3-8B)

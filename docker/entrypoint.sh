@@ -14,6 +14,7 @@
 # OPTIONAL — SLOTS/GROUPS default to the miner's per-GPU auto-tuning; set them
 # only to override it.
 #   WORKER, PASSWORD, DEVICES, SLOTS, MEOW_GROUPS, CTX, API_BIND, LOG_INTERVAL,
+#   SPLIT_MODEL=1  one model across all DEVICES (cards too small to hold it)
 #   MODEL_DIR, EXTRA_ARGS
 #   DOUBLE_BUFFER=0|1   PROMPT_STYLE=0|1
 #
@@ -126,6 +127,13 @@ args+=( -u "$USER_ARG" -p "${PASSWORD:-x}" --model "$MODEL_PATH" --no-color )
 # 64-stream limit, so every window failed and the rig mined nothing at all.
 [[ -n "${MEOW_GROUPS:-}" ]] && args+=( --groups "$MEOW_GROUPS" )
 [[ -n "${CTX:-}"          ]] && args+=( --ctx "$CTX" )
+# Small cards: spread ONE model over every selected GPU and mine as a single
+# worker, instead of a full copy per card. For GPUs that cannot hold the
+# 15.3 GB model alone (2x12, 4x8, 8x6 GB). Aggregates VRAM, does not add
+# throughput, and the cards should be identical. Do NOT also run one container
+# per GPU — they would fight over the same cards.
+[[ "${SPLIT_MODEL:-0}" == "1" ]] && args+=( --split-model )
+[[ "${SPLIT_ROWS:-0}"  == "1" ]] && args+=( --split-rows )
 args+=( --api-bind "${API_BIND:-off}" )
 [[ -n "${LOG_INTERVAL:-}" ]] && args+=( --log-interval "$LOG_INTERVAL" )
 [[ -n "${EXTRA_ARGS:-}"   ]] && args+=( ${EXTRA_ARGS} )
