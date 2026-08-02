@@ -67,6 +67,19 @@ TuningProfile tuning_for(int sm, size_t vram_bytes, size_t model_bytes) {
                  "512->20.8/20.7) so the card saturates early and slot count barely matters. "
                  "Power-limited: 413 W against a 400 W cap." };
 
+    // RTX 6000 Ada 48GB (sm_89). Same VRAM class as the A6000 but the curve is
+    // FLAT rather than rising — 320 -> 12.4, 403 -> 12.5/12.6 — so unlike the
+    // A6000 it is not gaining from slots at the top; it saturates by ~320.
+    // 403 is what the VRAM heuristic picks and it is fine, but it leaves only
+    // ~1.3 GB spare: MEOW_UBATCH=4096 OOMs at this slot count. Do not enable
+    // the CPU-tail tuning here — util is 92-98%, so there is nothing to
+    // reclaim (see docs/BENCHMARKS.md), and the larger ubatch does not fit.
+    if (sm == 89 && vram_gb > 40.0)
+        return { "RTX 6000 Ada 48GB", 403, 12, false,
+                 "12.5 w/s at 403 slots (47.8 GB of 49.1 — only ~1.3 GB spare, and "
+                 "MEOW_UBATCH=4096 OOMs here). Curve is flat: 320->12.4, 403->12.5/12.6, so "
+                 "320 is equally good with 6 GB more headroom. Util 92-98%, sampler tail 20 ms." };
+
     // RTX A6000 48GB (sm_86, also A40). The cheapest card tested and the best
     // value of any of them. Unlike the big cards this one is VRAM-bound, and
     // in that regime slots help MONOTONICALLY — no KV-traffic regression at

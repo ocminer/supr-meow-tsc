@@ -19,6 +19,7 @@ last column is the number that actually matters when you are renting.
 |---|---|---|---|---|---|
 | **RTX A6000** | 48 GB | `--slots 361 --groups 12` | 9.5 | **0.187** | **50.8** ★ |
 | **RTX PRO 6000 Blackwell** | 96 GB | `--slots 512 --groups 12` | 25.6 | 0.579 | **44.2** |
+| **RTX 6000 Ada** | 48 GB | `--slots 403 --groups 12` | 12.5 | 0.319 | **39.2** |
 | **H100 80GB HBM3** | 80 GB | `--slots 512 --groups 12` | 40.5 | 0.996 | 40.7 |
 | **A100 80GB SXM** | 80 GB | `--slots 512 --groups 12` | 20.7 | 0.549 | 37.7 |
 | **H200 141GB HBM3e** | 141 GB | `--slots 512 --groups 12` | 40.5 | 1.226 | 33.0 |
@@ -207,6 +208,11 @@ versus a 77 ms step on the PRO 6000. **Check `nvidia-smi
 --query-gpu=utilization.gpu` before applying any CPU-side fix**: well below
 100% means there is idle to reclaim; near 100% means the card is saturated and
 the tail is already hidden behind decode.
+
+**`MEOW_UBATCH=4096` also costs VRAM.** On an RTX 6000 Ada at 403 slots — 47.8
+GB of 49.1, about 1.3 GB spare — enabling it **OOMs outright**. It is safe on
+the H100 and PRO 6000 only because 512 slots leave 24–40 GB free. Never enable
+it on a card already near its slot ceiling.
 
 **But the best group count depends on the HOST, not the GPU.** An 80-CPU H100
 measured groups flat (12 → 37.8, 24 → 37.6, 48 → 37.3); the 176-CPU box gains
