@@ -137,6 +137,21 @@ number), and the cheapest card on the list is the best buy per euro.
 
 Needs a CUDA toolkit (13.x tested) and an NVIDIA driver with NVML.
 
+**Do not clone with `--recursive`.** `vendor/tensorcash` contains nested
+submodules this project does not use, and at least one of them is unreachable,
+so a recursive clone aborts. Initialise only the two that are needed:
+
+```bash
+git clone https://github.com/ocminer/supr-meow-tsc
+cd supr-meow-tsc
+git submodule update --init vendor/llama.cpp vendor/tensorcash
+```
+
+`vendor/llama.cpp` is our own mirror of the TensorCash llama.cpp fork — the
+upstream disappeared mid-2026 and the pinned commit exists nowhere else. The
+GPU-resident-logits change is applied at build time from
+`tools/llama-gpu-logits.patch`, so the mirror stays a clean copy of the fork.
+
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
