@@ -9,23 +9,31 @@
 # /models, so mount a volume there if the host has persistent storage.
 #
 # MULTI-ARCH IS MANDATORY: rented rigs are not all Blackwell. sm_80 A100,
-# sm_86 A10/3090, sm_89 4090, sm_90 H100, sm_100 B200, sm_120 5090. Building
-# for one arch produces a binary that dies with "no kernel image is available"
-# elsewhere.
+# sm_86 A10/3090, sm_89 4090, sm_90 H100, sm_120 5090. Building for one arch
+# produces a binary that dies with "no kernel image is available" elsewhere.
 #
-# NOTHING JITs US OUT OF A MISSING ARCH: this build embeds SASS only, no PTX
-# (verify with `cuobjdump --list-ptx`), and PTX only ever JITs FORWARD anyway —
-# sm_120 cannot rescue sm_100, because 120 > 100. An 8x B200 box was rented on
-# 2026-08-03 and could not run the image at all for exactly this reason. When a
-# new datacenter arch appears, it must be added HERE, and the check is
-# cuobjdump on BOTH /app/supr-meow-tsc and /app/lib/libggml-cuda.so — they are
-# compiled separately and either one missing the arch is fatal.
+# sm_100 (B200) IS DELIBERATELY ABSENT — DO NOT "FIX" THIS.
+# The build embeds PTX as well as SASS (cuobjdump names the entries
+# `*.sm_90.ptx`, NOT `compute_90` — grepping for the latter wrongly reports no
+# PTX at all). A B200 therefore runs fine by JIT-compiling the sm_90 PTX
+# forward, and forward JIT is the only direction that works: sm_120 PTX cannot
+# serve sm_100 because 120 > 100.
+#
+# Adding 100 here was measured on 2026-08-03 on an 8x B200 box and is a 15%
+# REGRESSION. Concurrent A/B, same box, same moment, all cards at 512 slots,
+# four samples per arm with no overlap between them:
+#     JIT from sm_90 PTX  56.2 w/s   (55.0 56.0 56.1 57.9)
+#     native sm_100 SASS  49.0 w/s   (47.9 48.1 50.0 50.1)
+# Reproduced three ways (mixed sweep, all-512 run, concurrent A/B). ggml-cuda's
+# Blackwell-datacenter kernel selection is simply slower for this workload than
+# its Hopper path retargeted by ptxas. Re-measure before adding sm_100 back;
+# a future ggml may flip the result.
 
 # ---------- build ----------
 FROM nvidia/cuda:13.0.0-devel-ubuntu24.04 AS build
-ARG CUDA_ARCHS="80;86;89;90;100;120"
+ARG CUDA_ARCHS="80;86;89;90;120"
 # Empty = use every core the builder has. The CUDA compile is several hundred
-# template instantiations across six architectures and is the whole cost of
+# template instantiations across five architectures and is the whole cost of
 # this image; the old fixed -j8 left 24 of 32 cores idle for over an hour.
 ARG JOBS=
 ENV DEBIAN_FRONTEND=noninteractive

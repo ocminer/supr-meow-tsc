@@ -23,7 +23,7 @@ last column is the number that actually matters when you are renting.
 | **H100 80GB HBM3** | 80 GB | `--slots 512 --groups 12` | 40.5 | 0.996 | 40.7 |
 | **A100 80GB SXM** | 80 GB | `--slots 512 --groups 12` | 20.7 | 0.549 | 37.7 |
 | **H200 141GB HBM3e** | 141 GB | `--slots 512 --groups 12` | 40.5 | 1.226 | 33.0 |
-| **B200** | 183 GB | `--slots 512 --groups 12` | **54.7** | 1.873 | 29.2 |
+| **B200** | 183 GB | `--slots 512 --groups 12` | **56.2** | 1.873 | 30.0 |
 | **RTX 5090** | 32 GB | `--slots 128 --groups 12` | 19.5 | (owned) | — |
 
 All single-buffered. Every config is selected **automatically** — the miner
@@ -38,7 +38,7 @@ w/s for €2.45/h.
 **Fastest and best-value are different questions.** The B200 is the quickest
 card measured — 5.8× an A6000 — and the worst buy on the list, because it also
 costs 10× as much per GPU-hour. Rent B200s when you want maximum throughput
-per box (437.7 w/s from a single 8-GPU instance); rent A6000s when you want
+per box (~450 w/s from a single 8-GPU instance); rent A6000s when you want
 throughput per euro.
 
 ### Stale shares are part of the price
@@ -143,6 +143,54 @@ sampler tail, per-window prompt eval at ~1.07 s of a 12.6 s batch, and llama's
 decode efficiency). **Practical consequence: buying more HBM bandwidth than an
 H100 buys nothing for this miner.** A 5090 at 1.79 TB/s does 19.5 and scales
 with bandwidth; an H200 at 4.8 does not.
+
+## The B200 result: compiling *for* the card makes it slower
+
+Measured 2026-08-03 on an 8× B200 box (sm_100, 183 GB, 240 cores, €14.98/h).
+
+**56.2 w/s — the fastest card tested, and the first to break the H100/H200
+plateau** (+39%). It is also the worst value on the list at 30.0 w/s per €/h.
+
+### Do not compile sm_100 into the image
+
+The obvious move on new silicon is to add its arch to `CUDA_ARCHS`. Here that
+is a **15% regression**, and the miner is faster when the driver JIT-compiles
+the sm_90 PTX forward to sm_100 instead:
+
+| arm (all 512 slots) | per-card w/s |
+|---|---|
+| **JIT from sm_90 PTX** | **56.2** (55.0 / 56.0 / 56.1 / 57.9) |
+| native sm_100 SASS | 49.0 (47.9 / 48.1 / 50.0 / 50.1) |
+
+Run as a *concurrent* A/B — GPU0–3 on one image, GPU4–7 on the other, same box,
+same moment — because the first comparison put the arms 40 minutes apart and
+could not separate the image from drift. Four samples per arm, no overlap.
+Reproduced three ways (mixed-slot sweep, all-512 run, concurrent A/B).
+ggml-cuda's Blackwell-datacenter kernel selection is simply worse for this
+workload than its Hopper path retargeted by `ptxas`. Re-measure before adding
+sm_100 back; a future ggml release may flip it.
+
+> **A missing arch is not a blocker.** The build embeds PTX as well as SASS, so
+> any newer NVIDIA architecture runs by forward JIT. Beware the check itself:
+> `cuobjdump --list-ptx` names entries `*.sm_90.ptx`, **not** `compute_90` —
+> grepping for the latter reports "no PTX" on a binary full of it, which is
+> exactly how an 8× B200 box was briefly written off as unusable while it was
+> already mining.
+
+### 512 slots is still the cap, despite 183 GB
+
+The slot curve is still climbing at 512 and only 56 of 183 GB is used, so it is
+tempting to raise `LLAMA_MAX_SEQ`. It loses, the same way it lost on the H200:
+
+| config | per-card w/s |
+|---|---|
+| 512 slots | 47.3 |
+| 768 slots (`LLAMA_MAX_SEQ=1024`) | 40.2 |
+
+Both arms ran the native image concurrently, so the sm_100 penalty is common to
+both and cancels; what is left is the slot gain minus the 11% `LLAMA_MAX_SEQ`
+tax, and it is **15% net worse**. The underlying curve at 512 (192→39.9,
+256→43.4, 320→45.2, 384→46.0, 448→46.4, 512→48.8) rises but is flattening.
 
 ## Where the time goes (RTX 5090, 128 slots, 8B)
 
@@ -266,7 +314,7 @@ budget that slots actually need.
 | A100 80GB | 2.04 TB/s | 20.7 | 10.1 |
 | H100 80GB | 3.35 TB/s | 40.5 | 12.1 |
 | **H200 141GB** | **4.8 TB/s** | **40.5** | **8.4** |
-| **B200** | **~8 TB/s** | **54.7** | **6.8** |
+| **B200** | **~8 TB/s** | **56.2** | **7.0** |
 
 Bandwidth stops paying **within** a generation, not across generations. The
 H200 has 43% more bandwidth than the H100 and returns exactly the same number
@@ -275,9 +323,9 @@ and the binding constraint is llama's sequence cap plus the CPU sampler tail.
 
 > **An earlier revision of this document predicted from that plateau that
 > "B200/B300/GB300 class parts should not be expected to exceed ~40 w/s". The
-> B200 measured 54.7 w/s — 35% above the H100 and H200.** The plateau was a
+> B200 measured 56.2 w/s — 39% above the H100 and H200.** The plateau was a
 > property of Hopper at this batch size, not a ceiling of the workload. Marginal
-> return per TB/s does keep falling (12.1 → 8.4 → 6.8), so bandwidth is still
+> return per TB/s does keep falling (12.1 → 8.4 → 7.0), so bandwidth is still
 > not what you are buying; Blackwell simply moved the other limits. Do not
 > extrapolate a plateau across an architecture change — measure it.
 

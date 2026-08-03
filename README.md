@@ -109,7 +109,7 @@ in **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**; operational notes are in
 | RTX 6000 Ada 48GB | 403 slots | 12.5 | 0.319 | 39.2 |
 | A100 80GB | 512 slots | 20.7 | 0.549 | 37.7 |
 | H200 141GB | 512 slots | 40.5 | 1.226 | 33.0 |
-| B200 183GB | 512 slots | **54.7** | 1.873 | 29.2 |
+| B200 183GB | 512 slots | **56.2** | 1.873 | 30.0 |
 | RTX 5090 32GB | 128 slots | 19.5 | — | — |
 
 All are selected **automatically** — the miner reads compute capability and
@@ -117,13 +117,13 @@ VRAM at startup and applies the matching profile. Three results worth knowing
 before buying hardware:
 
 - **The cheapest card is the best buy per euro.** An A6000 returns 50.8 w/s per
-  €/h against the B200's 29.2, despite being 5.8× slower — it is also 10×
+  €/h against the B200's 30.0, despite being 5.8× slower — it is also 10×
   cheaper per GPU-hour.
 - **Fastest ≠ best value.** The B200 is the quickest card measured and the worst
   buy on the list. Pick by which one you actually need.
 - **Bandwidth stops paying within a generation, not across one.** The H200 has
   43% more bandwidth than the H100 and returns the identical number; the B200
-  then beat both by 35%. Marginal return per TB/s keeps falling, so bandwidth is
+  then beat both by 39%. Marginal return per TB/s keeps falling, so bandwidth is
   not the thing you are buying — but a plateau seen on one architecture says
   nothing about the next.
 

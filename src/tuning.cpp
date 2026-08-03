@@ -32,6 +32,28 @@ TuningProfile tuning_for(int sm, size_t vram_bytes, size_t model_bytes) {
                  "REQUIRES LLAMA_MAX_SEQ>=512 at build time — stock llama caps n_seq_max at 256; "
                  "groups flat (12:37.8 24:37.6 32:37.5 48:37.3); double-buffering neutral" };
 
+    // B200 183GB (sm_100, Blackwell datacenter). Measured 2026-08-03 on 8 cards.
+    // 56.2 w/s — the fastest card tested, and the first to BREAK the H100/H200
+    // bandwidth plateau (+39%). That plateau was a property of Hopper at this
+    // batch size, not a ceiling of the workload, so do not extrapolate it across
+    // an architecture change.
+    //
+    // The slot curve is still CLIMBING at 512 (192->39.9, 256->43.4, 320->45.2,
+    // 384->46.0, 448->46.4, 512->48.8, all on one image), and only 56 of 183 GB
+    // is used, so 512 is llama's seq cap here rather than anything about the
+    // card. Raising LLAMA_MAX_SEQ to chase that costs 11% on its own, which is
+    // why it stays capped — see the >512 note in docs/BENCHMARKS.md.
+    //
+    // Do NOT compile sm_100 into the image to "support" this card: native
+    // sm_100 SASS measured 49.0 against 56.2 for the same code JIT-compiled
+    // from sm_90 PTX (concurrent A/B, same box). The Dockerfile explains why.
+    if (sm == 100)
+        return { "B200 183GB", 512, 12, false,
+                 "56.2 w/s at 512 slots, 0 rejects — fastest measured, and 39% above the H100/H200 "
+                 "plateau. Curve still rising at 512 (192->39.9 256->43.4 320->45.2 384->46.0 "
+                 "448->46.4 512->48.8) with only 56 of 183 GB used, so the cap is llama's seq "
+                 "limit. Runs via forward JIT from sm_90 PTX; native sm_100 SASS is 15% SLOWER." };
+
     // RTX PRO 6000 Blackwell 96GB (sm_120). Same silicon and roughly the same
     // bandwidth as a 5090, but 3x the VRAM — and that is the whole story: the
     // 5090 is capped at 128 slots by memory, not by bandwidth. Measured
