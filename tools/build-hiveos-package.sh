@@ -28,4 +28,7 @@ echo "package: ${OUT}  ($(du -h "${OUT}" | cut -f1))"
 sha256sum "${OUT}" | tee "${OUT}.sha256"
 echo
 echo "contents:"
-tar -tzf "${OUT}" | head -20
+# `| head` makes tar take SIGPIPE, and with `set -o pipefail` that exits 141 —
+# failing the whole script on a cosmetic listing, long after the package is
+# built and valid. Keep the truncation, drop the failure.
+tar -tzf "${OUT}" | head -20 || true
