@@ -143,7 +143,7 @@ void print_usage() {
 "REQUIRED\n"
 "  -o, --pool <url>        stratum+tcp://host:port (or stratum+ssl://).\n"
 "                          Repeat -o for failover pools, tried in order.\n"
-"                          e.g. stratum+tcp://tsc.suprnova.cc:3307\n"
+"                          e.g. stratum+tcp://tsc.suprnova.cc:3310\n"
 "  -u, --user <wallet>     TSC payout address, optionally .workername\n"
 "                          e.g. tc1qexample....rig01   (testnet: tct1...)\n"
 "\n"
@@ -196,9 +196,9 @@ void print_usage() {
 "  On exit, fans are handed back to the driver and locked clocks released.\n"
 "\n"
 "EXAMPLES\n"
-"  supr-meow-tsc -o stratum+tcp://tsc.suprnova.cc:3307 -u tc1qexample.rig01 -p x\n"
-"  supr-meow-tsc -o stratum+tcp://pool-a:3307 -o stratum+tcp://pool-b:3307 -u tc1q…\n"
-"  supr-meow-tsc -o stratum+tcp://tsc.suprnova.cc:3307 -u tc1qexample --protocol-test\n"
+"  supr-meow-tsc -o stratum+tcp://tsc.suprnova.cc:3310 -u tc1qexample.rig01 -p x\n"
+"  supr-meow-tsc -o stratum+tcp://pool-a:3310 -o stratum+tcp://pool-b:3310 -u tc1q…\n"
+"  supr-meow-tsc -o stratum+tcp://tsc.suprnova.cc:3310 -u tc1qexample --protocol-test\n"
 "  supr-meow-tsc --list-devices\n"
 "\n", kVersion);
 }

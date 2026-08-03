@@ -26,7 +26,8 @@ mainnet, `Qwen3-0.6B` on testnet). The consequences for a miner:
   would be faster and every proof would be rejected.
 - Pools speak **TSC Stratum** (`stratum+tcp://`, line-delimited JSON-RPC —
   spec in `docs/STRATUM-TSC.md`). The upstream WebSocket broker dialect is a
-  different protocol; `ws://` URLs are rejected with an explanation.
+  different protocol; `ws://` and `wss://` URLs are **rejected** with an
+explanation. Always use `stratum+tcp://` (or `stratum+ssl://`).
 
 ## Usage
 
@@ -69,11 +70,17 @@ leaves a card pinned.
 # what is in this rig?
 supr-meow-tsc --list-devices
 
-# mine on every GPU
-supr-meow-tsc -o wss://tsc.suprnova.cc/ws -u tc1qexample.rig01 -p x
+# mine on every GPU (slots/groups are auto-tuned per card — leave them unset)
+supr-meow-tsc -o stratum+tcp://tsc.suprnova.cc:3310 -u tc1qexample.rig01 -p x \
+  --model Qwen3-8B-9c925d64-bf16.gguf
 
 # only GPU 0 and 1, power limited
-supr-meow-tsc -o wss://tsc.suprnova.cc/ws -u tc1qexample -d 0,1 --pl 400
+supr-meow-tsc -o stratum+tcp://tsc.suprnova.cc:3310 -u tc1qexample -d 0,1 --pl 400 \
+  --model Qwen3-8B-9c925d64-bf16.gguf
+
+# cards too small to hold the model alone (2x12GB, 4x8GB): split it across them
+supr-meow-tsc -o stratum+tcp://tsc.suprnova.cc:3310 -u tc1qexample -d 0,1 \
+  --split-model --model Qwen3-8B-9c925d64-bf16.gguf
 
 # verify device setup and watch telemetry without mining
 supr-meow-tsc --dry-run --log-interval 5
@@ -86,6 +93,29 @@ Sample telemetry:
   0   39C    30%    67W    2572MHz   13801MHz  3%     31.2 GB
   1   48C    0%     71W    2400MHz   13801MHz  0%     1.0 GB
 ```
+
+## Performance
+
+Measured end-to-end against the live pool, not in a synthetic harness. Full
+curves, the cost-per-GPU-hour table and the reasoning behind each setting are
+in **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**; operational notes are in
+**[docs/OPERATIONS.md](docs/OPERATIONS.md)**.
+
+| GPU | best config | w/s | €/GPU/h | w/s per €/h |
+|---|---|---|---|---|
+| RTX A6000 48GB | 361 slots | 9.5 | 0.187 | **50.8** |
+| RTX PRO 6000 96GB | 512 slots | 25.6 | 0.579 | 44.2 |
+| H100 80GB | 512 slots | 40.5 | 0.996 | 40.7 |
+| RTX 6000 Ada 48GB | 403 slots | 12.5 | 0.319 | 39.2 |
+| A100 80GB | 512 slots | 20.7 | 0.549 | 37.7 |
+| H200 141GB | 512 slots | 40.5 | 1.226 | 33.0 |
+| RTX 5090 32GB | 128 slots | 19.5 | — | — |
+
+All are selected **automatically** — the miner reads compute capability and
+VRAM at startup and applies the matching profile. Two results worth knowing
+before buying hardware: throughput tracks memory bandwidth only up to about an
+H100 and then stops (the H200 has 43% more bandwidth and returns the same
+number), and the cheapest card on the list is the best buy per euro.
 
 ## Status
 
