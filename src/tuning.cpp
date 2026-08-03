@@ -29,7 +29,7 @@ TuningProfile tuning_for(int sm, size_t vram_bytes, size_t model_bytes) {
     if (sm == 90 && vram_gb > 60.0)
         return { "H100 80GB", 512, 12, false,
                  "40.5 w/s at 512 slots, 0 rejects (128->28.9 192->33.8 256->37.6 384->38.1 512->40.5); "
-                 "REQUIRES tools/llama-max-seq-512.patch — stock llama caps n_seq_max at 256; "
+                 "REQUIRES LLAMA_MAX_SEQ>=512 at build time — stock llama caps n_seq_max at 256; "
                  "groups flat (12:37.8 24:37.6 32:37.5 48:37.3); double-buffering neutral" };
 
     // RTX PRO 6000 Blackwell 96GB (sm_120). Same silicon and roughly the same

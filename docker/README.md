@@ -6,7 +6,7 @@ the GGUF is fetched at container start from `MODEL_URL` and cached in `/models`.
 ## Quick start
 
 ```bash
-docker pull ocminersupr/supr-meow-tsc:0.2.1   # or :latest
+docker pull ocminersupr/supr-meow-tsc:latest
 docker run -d --name meow --gpus all --restart unless-stopped \
   -v meow-models:/models \
   -e POOL_URL="stratum+tcp://YOUR_POOL:PORT" \
@@ -14,13 +14,12 @@ docker run -d --name meow --gpus all --restart unless-stopped \
   -e WORKER="rig01" \
   -e MODEL_URL="https://YOUR_HOST/Qwen3-8B-<commit>-bf16.gguf" \
   -e MODEL_SHA256="<sha256>" \
-  ocminersupr/supr-meow-tsc:0.2.1
+  ocminersupr/supr-meow-tsc:latest
 ```
 
-**Use `:0.2.1` or `:latest`, not `:0.2.0`.** 0.2.0 was built against stock
-llama.cpp, which hard-caps `n_seq_max` at 256; auto-tuning selects 512 slots on
-an H100 and would fail to create a context. 0.2.1 carries
-`tools/llama-max-seq-512.patch`.
+**Use `:latest` or a pinned version tag.** Releases before 0.2.1 were built
+against stock llama.cpp, which hard-caps `n_seq_max` at 256 — auto-tuning
+selects 512 slots on an H100 and such a build fails to create a context.
 
 Or `docker compose up -d` with the bundled `docker-compose.yml`.
 
@@ -63,7 +62,7 @@ Or `docker compose up -d` with the bundled `docker-compose.yml`.
 
 | GPU | VRAM | suggested `SLOTS` (8B) |
 |---|---|---|
-| H100 80GB | 80 GB | 512 (needs 0.2.1) |
+| H100 80GB | 80 GB | 512 |
 | RTX 5090 | 32 GB | 128 |
 | A100 40GB | 40 GB | ~192 |
 | RTX 4090 / 3090 | 24 GB | 96 |

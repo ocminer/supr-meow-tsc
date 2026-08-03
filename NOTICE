@@ -1,0 +1,44 @@
+supr-meow-tsc
+Copyright (c) 2026 ocminer / suprnova
+
+This product includes software developed by third parties. The miner itself is
+MIT-licensed (see LICENSE); the components below keep their own terms, and
+those terms travel with any binary built from this repository.
+
+--------------------------------------------------------------------------------
+llama.cpp — MIT
+    https://github.com/ocminer/llama.cpp  (mirror of the TensorCash fork of
+    ggml-org/llama.cpp; the original upstream became unreachable in 2026)
+
+    Used as the inference engine, via the submodule at vendor/llama.cpp.
+    MODIFIED: tools/llama-gpu-logits.patch adds llama_get_logits_device() and
+    llama_set_skip_logits_copy(), which let the sampler read logits in GPU
+    memory instead of copying them to the host. The patch is applied at build
+    time, so the mirror stays a clean copy of the fork.
+    The build also raises LLAMA_MAX_SEQ from its upstream value via a build
+    argument (docker/Dockerfile, LLAMA_MAX_SEQ).
+
+--------------------------------------------------------------------------------
+TensorCash shared-utils / pow-utils — Apache License 2.0
+    https://git.tensorcash.org/tensorcash/tensorcash
+    vendor/tensorcash/shared-utils/pow-utils
+
+    The proof-of-inference sampler and proof serialisation. Used unmodified;
+    local build adjustments live in tools/patch-staged-poi.py and are applied
+    to a staged copy, not to the vendored tree.
+
+--------------------------------------------------------------------------------
+chiavdf — Apache License 2.0
+    vendor/tensorcash/shared-utils/chiavdf
+    Full licence text: vendor/tensorcash/shared-utils/chiavdf/LICENSE
+
+    Verifiable delay function used for the VDF proof attached to each share.
+
+--------------------------------------------------------------------------------
+nlohmann/json — MIT
+    vendor/nlohmann/json.hpp
+    Copyright (c) 2013-2022 Niels Lohmann
+
+--------------------------------------------------------------------------------
+The models mined against (Qwen3) are licensed by their respective authors and
+are not distributed with this software.

@@ -4,7 +4,7 @@ A self-contained GPU miner for **TensorCash (TSC)** — one binary, no Docker, n
 Python, no service install. Built for real rigs: drop it in a folder, point it
 at a pool, run it.
 
-**Version 0.2.0 — mining.** The full pipeline is in: embedded inference engine
+**Mining.** The full pipeline is in: embedded inference engine
 (llama.cpp/CUDA), GPU-offloaded proof-of-inference sampler with GPU-resident
 logits, chiavdf VDF, TSC Stratum client with failover, local JSON stats API,
 and a HiveOS integration package (`docs/hiveos/`).
@@ -164,8 +164,22 @@ installed driver.
 
 ## Credits and licence
 
-The proof-of-inference sampler and the inference engine derive from
-**TensorCash's fork of `llama.cpp`** (`github.com/tensorcash/llama.cpp`, MIT),
-itself a fork of `ggml-org/llama.cpp` (MIT). The GPU offload for the sampler
-(`pow_gpu.cu`) and the per-phase profiler are original work from the suprnova
-TSC pool project. MIT, in keeping with upstream.
+This miner is **MIT** licensed — see [LICENSE](LICENSE). The GPU offload for
+the sampler (`pow_gpu.cu`), the per-GPU tuning profiles, the model splitting
+and the per-phase profiler are original work from the suprnova TSC pool
+project.
+
+It builds on third-party components that keep their own terms, listed in full
+in [NOTICE](NOTICE):
+
+- **llama.cpp** (MIT) — the inference engine, via
+  [`ocminer/llama.cpp`](https://github.com/ocminer/llama.cpp), our mirror of
+  the TensorCash fork after the original upstream became unreachable. Modified
+  at build time by `tools/llama-gpu-logits.patch` for GPU-resident logits.
+- **TensorCash pow-utils** (Apache-2.0) — the proof-of-inference sampler and
+  proof serialisation, from
+  [git.tensorcash.org](https://git.tensorcash.org/tensorcash/tensorcash).
+- **chiavdf** (Apache-2.0) — the verifiable delay function.
+- **nlohmann/json** (MIT).
+
+Those terms travel with any binary built from this repository.

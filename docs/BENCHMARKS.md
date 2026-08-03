@@ -76,8 +76,8 @@ slots regardless of free memory (512 slots fails to initialise).
 | **512 × 1 (single)** | **40.5** | **56.3 GB** | ← with the patch |
 
 Stock llama.cpp hard-codes `#define LLAMA_MAX_SEQ 256`, and 512 slots fails
-outright with `n_seq_max must be <= 256`. `tools/llama-max-seq-512.patch`
-raises it; the Docker build applies it. **Verified correct: 0 rejects at 384
+outright with `n_seq_max must be <= 256`. The Docker build raises it
+via the `LLAMA_MAX_SEQ` build argument. **Verified correct: 0 rejects at 384
 and 512** — this matters because the constant sizes `std::bitset<LLAMA_MAX_SEQ>`
 and per-batch arrays, so a regression would corrupt transcripts rather than
 crash. Gains are real but diminishing (+7.7% from 256 to 512 for +21 GB), and
