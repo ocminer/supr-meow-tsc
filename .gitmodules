@@ -3,4 +3,4 @@
 	url = https://github.com/ocminer/llama.cpp
 [submodule "vendor/tensorcash"]
 	path = vendor/tensorcash
-	url = https://github.com/tensorcash/tensorcash
+	url = https://git.tensorcash.org/tensorcash/tensorcash
