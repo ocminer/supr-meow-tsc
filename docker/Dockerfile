@@ -9,14 +9,23 @@
 # /models, so mount a volume there if the host has persistent storage.
 #
 # MULTI-ARCH IS MANDATORY: rented rigs are not all Blackwell. sm_80 A100,
-# sm_86 A10/3090, sm_89 4090, sm_90 H100, sm_120 5090. Building for one arch
-# produces a binary that dies with "no kernel image is available" elsewhere.
+# sm_86 A10/3090, sm_89 4090, sm_90 H100, sm_100 B200, sm_120 5090. Building
+# for one arch produces a binary that dies with "no kernel image is available"
+# elsewhere.
+#
+# NOTHING JITs US OUT OF A MISSING ARCH: this build embeds SASS only, no PTX
+# (verify with `cuobjdump --list-ptx`), and PTX only ever JITs FORWARD anyway —
+# sm_120 cannot rescue sm_100, because 120 > 100. An 8x B200 box was rented on
+# 2026-08-03 and could not run the image at all for exactly this reason. When a
+# new datacenter arch appears, it must be added HERE, and the check is
+# cuobjdump on BOTH /app/supr-meow-tsc and /app/lib/libggml-cuda.so — they are
+# compiled separately and either one missing the arch is fatal.
 
 # ---------- build ----------
 FROM nvidia/cuda:13.0.0-devel-ubuntu24.04 AS build
-ARG CUDA_ARCHS="80;86;89;90;120"
+ARG CUDA_ARCHS="80;86;89;90;100;120"
 # Empty = use every core the builder has. The CUDA compile is several hundred
-# template instantiations across five architectures and is the whole cost of
+# template instantiations across six architectures and is the whole cost of
 # this image; the old fixed -j8 left 24 of 32 cores idle for over an hour.
 ARG JOBS=
 ENV DEBIAN_FRONTEND=noninteractive

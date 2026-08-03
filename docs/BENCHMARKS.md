@@ -23,6 +23,7 @@ last column is the number that actually matters when you are renting.
 | **H100 80GB HBM3** | 80 GB | `--slots 512 --groups 12` | 40.5 | 0.996 | 40.7 |
 | **A100 80GB SXM** | 80 GB | `--slots 512 --groups 12` | 20.7 | 0.549 | 37.7 |
 | **H200 141GB HBM3e** | 141 GB | `--slots 512 --groups 12` | 40.5 | 1.226 | 33.0 |
+| **B200** | 183 GB | `--slots 512 --groups 12` | **54.7** | 1.873 | 29.2 |
 | **RTX 5090** | 32 GB | `--slots 128 --groups 12` | 19.5 | (owned) | — |
 
 All single-buffered. Every config is selected **automatically** — the miner
@@ -34,10 +35,31 @@ against the H200's 33.0 — the H200 costs 6.6× more per GPU-hour for 4.3× the
 throughput. Per instance: 8× A6000 ≈ 76 w/s for €1.50/h, versus 2× H200 ≈ 80
 w/s for €2.45/h.
 
+**Fastest and best-value are different questions.** The B200 is the quickest
+card measured — 5.8× an A6000 — and the worst buy on the list, because it also
+costs 10× as much per GPU-hour. Rent B200s when you want maximum throughput
+per box (437.7 w/s from a single 8-GPU instance); rent A6000s when you want
+throughput per euro.
 
-Both are selected **automatically** — the miner reads compute capability and
-VRAM at startup and applies the matching profile (`src/tuning.cpp`). Explicit
-`--slots` / `--groups` always win over auto-tuning.
+### Stale shares are part of the price
+
+Throughput alone overstates cheap cards. A window batch takes `slots / rate`
+seconds and everything still in flight when the job changes is discarded, so
+**stale rate scales with batch latency**:
+
+| GPU | batch latency | stale | w/s per €/h (raw → stale-adjusted) |
+|---|---|---|---|
+| H200 | 512/40.5 ≈ 12 s | 1.6% | 33.0 → 32.5 |
+| RTX PRO 6000 | 512/25.6 ≈ 20 s | 2.1–3.7% | 44.2 → 44.0 |
+| RTX A6000 | 361/9.5 ≈ 38 s | **8.2%** | 50.8 → **46.1** |
+
+The A6000 still wins, but by ~5% rather than ~12%. Cutting its slots to shorten
+the batch does not help: 256 slots gives 8.8 w/s at ~29 s and ~6.3% stale, for
+8.25 effective against 361's 8.63.
+
+`[prof-e2e]` measures generation and structurally cannot see any of this —
+cross-check the pool-side `shares: N accepted, M rejected, S stale` line before
+ranking hardware.
 
 ## Why the optimum is hardware-specific (and counter-intuitive)
 
@@ -236,8 +258,6 @@ budget that slots actually need.
 
 ## Where bandwidth stops paying (measured, not modelled)
 
-Throughput tracks memory bandwidth **up to about an H100, and not beyond**:
-
 | GPU | bandwidth | w/s | w/s per TB/s |
 |---|---|---|---|
 | RTX A6000 | 0.77 TB/s | 9.5 | 12.3 |
@@ -246,10 +266,20 @@ Throughput tracks memory bandwidth **up to about an H100, and not beyond**:
 | A100 80GB | 2.04 TB/s | 20.7 | 10.1 |
 | H100 80GB | 3.35 TB/s | 40.5 | 12.1 |
 | **H200 141GB** | **4.8 TB/s** | **40.5** | **8.4** |
+| **B200** | **~8 TB/s** | **54.7** | **6.8** |
 
-The H200 has 43% more bandwidth than the H100 and returns exactly the same
-number. Buying bandwidth above an H100 buys nothing here, so **B200/B300/GB300
-class parts (~8 TB/s) should not be expected to exceed ~40 w/s either.**
+Bandwidth stops paying **within** a generation, not across generations. The
+H200 has 43% more bandwidth than the H100 and returns exactly the same number
+— on Hopper, 512 slots is already past the point where more bandwidth helps,
+and the binding constraint is llama's sequence cap plus the CPU sampler tail.
+
+> **An earlier revision of this document predicted from that plateau that
+> "B200/B300/GB300 class parts should not be expected to exceed ~40 w/s". The
+> B200 measured 54.7 w/s — 35% above the H100 and H200.** The plateau was a
+> property of Hopper at this batch size, not a ceiling of the workload. Marginal
+> return per TB/s does keep falling (12.1 → 8.4 → 6.8), so bandwidth is still
+> not what you are buying; Blackwell simply moved the other limits. Do not
+> extrapolate a plateau across an architecture change — measure it.
 
 The shape of each card's slot curve says the same thing from the other side:
 the A100 is flat from 256 to 512 slots (19.9 → 20.7, i.e. saturated almost
