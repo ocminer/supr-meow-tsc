@@ -218,6 +218,21 @@ bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
                                        : kDefaultSelfVdfTick;
         const auto proof = Vdf::prove(prev, vdf_tick_);
         if (proof.empty()) { error = "VDF proof generation failed"; return false; }
+        // Say it once, plainly. The pool enforces a minimum tick and a block
+        // below it is announced under an embargo, so an operator has to be able
+        // to see what their rig is actually emitting — a silently low tick is
+        // exactly how this went unnoticed until blocks were already at risk.
+        {
+            static std::atomic<bool> once{false};
+            if (!once.exchange(true)) {
+                std::fprintf(stderr, "  VDF self-proved at %llu ticks%s\n",
+                             (unsigned long long)vdf_tick_,
+                             vdf_tick_ < kDefaultSelfVdfTick
+                               ? "  *** BELOW the chain's prompt-relay threshold of 315000 —"
+                                 " found blocks risk a 9s announcement embargo ***" : "");
+                std::fflush(stderr);
+            }
+        }
         vdf_hex_ = Vdf::to_hex(proof);
         parent_hash_hex_ = parent;
     }
