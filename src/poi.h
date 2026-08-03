@@ -29,6 +29,9 @@ struct PoiJobParams {
     uint64_t    normalizer       = 1000000;
     uint64_t    request_id       = 0;
     std::string job_id;
+    // Ticks for the SELF-PROVE path (--vdf-tick). 0 keeps the built-in
+    // default. Ignored when the pool issues the VDF: its tick wins.
+    uint64_t    self_vdf_tick   = 0;
     // CANARY-JOBS-SPEC §19 (pool-issued VDF): when the pool supplies the
     // Wesolowski proof with the job, the miner uses it VERBATIM instead of
     // proving locally. This is what lets the pool precompute canary

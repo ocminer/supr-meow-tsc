@@ -113,6 +113,9 @@ struct Options {
     bool        protocol_test = false;
     bool        benchmark    = false;
     bool        vdf_test     = false;
+    // 0 = keep the built-in default. Only used on the SELF-PROVE path; when the
+    // pool issues the VDF its tick wins and the miner has no say.
+    uint64_t    vdf_tick     = 0;
     std::string vdf_vector;          // --vdf-vector <64-hex parent> -> print exact vdf bytes
     std::string canary_test;         // --canary-test <seed64hex>:<w> -> print step-0 top-10
     std::string canary_ref;          // --canary-ref <seed64hex>:<wmax> -> emit reference table
@@ -153,6 +156,11 @@ void print_usage() {
 "      --list-devices      Print every detected GPU and exit.\n"
 "      --dry-run           Set up devices, show telemetry, do not mine.\n"
 "      --benchmark         Load the model and measure per-GPU throughput.\n"
+"      --vdf-tick <n>      VDF ticks when the miner proves its own VDF\n"
+"                          (default 1000). Blocks carrying low ticks are\n"
+"                          relayed lazily and can be orphaned; the cost is\n"
+"                          paid once per block, not per window. Ignored when\n"
+"                          the pool issues the VDF. --vdf-test prints costs.\n"
 "      --vdf-test          Self-test the VDF (prove, verify, and confirm a\n"
 "                          proof does NOT verify against another challenge).\n"
 "      --slots <n>         Concurrent windows per GPU (default 8).\n"
@@ -212,6 +220,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--protocol-test")   o.protocol_test = true;
         else if (a == "--benchmark")       o.benchmark = true;
         else if (a == "--vdf-test")        o.vdf_test = true;
+        else if (a == "--vdf-tick")        { if (!need_value(i, argc, "--vdf-tick")) return false; o.vdf_tick = std::strtoull(argv[++i], nullptr, 10); }
         else if (a == "--vdf-vector")      { if (!need_value(i, argc, "--vdf-vector")) return false; o.vdf_vector = argv[++i]; }
         else if (a == "--canary-test")     { if (!need_value(i, argc, "--canary-test")) return false; o.canary_test = argv[++i]; }
         else if (a == "--canary-ref")      { if (!need_value(i, argc, "--canary-ref")) return false; o.canary_ref = argv[++i]; }
@@ -537,7 +546,21 @@ int main(int argc, char** argv) {
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         if (!ok) { std::fprintf(stderr, "  FAILED: %s\n", verr.c_str()); return 1; }
         std::printf("  prove+verify of 1000 iterations in %.0f ms\n", ms);
-        std::printf("  wrong-challenge rejection: ok\n  VDF ready\n");
+        std::printf("  wrong-challenge rejection: ok\n");
+        // The chain relays blocks carrying LOW VDF ticks lazily, and a lazily
+        // relayed block can be orphaned. Ticks cost wall clock only once per
+        // parent (per block), not per window, so the sensible tick is "as high
+        // as propagates promptly". Measure so that choice is informed.
+        std::printf("\n  tick cost (paid ONCE per new block, not per window):\n");
+        for (const uint64_t t : {1000ull, 10000ull, 100000ull, 1000000ull}) {
+            const auto a0 = std::chrono::steady_clock::now();
+            const auto proof = meow::Vdf::prove(std::vector<uint8_t>(32, 0x11), t);
+            const auto a1 = std::chrono::steady_clock::now();
+            const double pms = std::chrono::duration<double, std::milli>(a1 - a0).count();
+            std::printf("    %8llu ticks -> %8.0f ms  %s\n",
+                        (unsigned long long)t, pms, proof.empty() ? "FAILED" : "ok");
+        }
+        std::printf("  VDF ready\n");
         return 0;
     }
 
@@ -904,6 +927,7 @@ int main(int argc, char** argv) {
                     p.request_id       = j.request_id;
                     p.pool_vdf         = j.pool_vdf;        // §19, empty = prove locally
                     p.pool_vdf_tick    = j.pool_vdf_tick;
+                    p.self_vdf_tick    = o.vdf_tick;        // only used if pool_vdf is empty
                     p.valid            = true;
                     std::string perr;
                     if (!pool.set_job(p, perr) || (poolB && !poolB->set_job(p, perr))) {

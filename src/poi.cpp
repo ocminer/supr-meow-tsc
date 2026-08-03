@@ -197,8 +197,11 @@ bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
         std::lock_guard<std::mutex> vlk(g_vdf_mtx);   // serialize chiavdf
         const auto prev = parent_bytes;
         // Tick count is the VDF's difficulty; the chain reads it from the proof.
-        // Kept modest here — raising it costs wall-clock per window.
-        vdf_tick_ = 1000;
+        // Blocks carrying LOW ticks are relayed lazily and can be orphaned, so
+        // this is a propagation setting, not a throughput one: the cost is paid
+        // once per new parent (per block), NOT per window. --vdf-tick raises it
+        // without a rebuild once the chain's prompt-relay threshold is known.
+        vdf_tick_ = p.self_vdf_tick ? p.self_vdf_tick : 1000;
         const auto proof = Vdf::prove(prev, vdf_tick_);
         if (proof.empty()) { error = "VDF proof generation failed"; return false; }
         vdf_hex_ = Vdf::to_hex(proof);
