@@ -552,7 +552,7 @@ int main(int argc, char** argv) {
         // parent (per block), not per window, so the sensible tick is "as high
         // as propagates promptly". Measure so that choice is informed.
         std::printf("\n  tick cost (paid ONCE per new block, not per window):\n");
-        for (const uint64_t t : {1000ull, 10000ull, 100000ull, 1000000ull}) {
+        for (const uint64_t t : {1000ull, 10000ull, 100000ull, 315000ull, 1000000ull}) {
             const auto a0 = std::chrono::steady_clock::now();
             const auto proof = meow::Vdf::prove(std::vector<uint8_t>(32, 0x11), t);
             const auto a1 = std::chrono::steady_clock::now();

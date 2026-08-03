@@ -75,6 +75,12 @@ std::string base64(const uint8_t* p, size_t n) {
 // and it reuses a path that is already proven in production.
 constexpr int kEgressPort = 47021;
 
+// The chain relays blocks carrying fewer ticks than this lazily — up to a
+// 9-second announcement embargo, which is orphan risk rather than rejection.
+// Confirmed by the pool 2026-08-03. Was 1000, on a stale comment claiming the
+// cost was per-window; it is per-block, and 315k measures 3.36 s.
+constexpr uint64_t kDefaultSelfVdfTick = 315000;
+
 }  // namespace
 
 struct PoiMiner::Impl {
@@ -197,11 +203,19 @@ bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
         std::lock_guard<std::mutex> vlk(g_vdf_mtx);   // serialize chiavdf
         const auto prev = parent_bytes;
         // Tick count is the VDF's difficulty; the chain reads it from the proof.
-        // Blocks carrying LOW ticks are relayed lazily and can be orphaned, so
-        // this is a propagation setting, not a throughput one: the cost is paid
-        // once per new parent (per block), NOT per window. --vdf-tick raises it
-        // without a rebuild once the chain's prompt-relay threshold is known.
-        vdf_tick_ = p.self_vdf_tick ? p.self_vdf_tick : 1000;
+        // This is a PROPAGATION setting, not a throughput one: below the
+        // chain's threshold a block is announced under an embargo of up to 9
+        // seconds and can be orphaned. The cost is paid once per new PARENT
+        // (per block), not per window — measured 3.36 s at 315k, i.e. 0.56%
+        // of a 600 s block, against losing whole blocks.
+        //
+        // Precedence: an explicit --vdf-tick wins; else the tick the POOL
+        // advertises in job field 11 (which it may send with no VDF of its
+        // own, letting it raise the floor network-wide without every miner
+        // rebuilding); else the chain's documented threshold.
+        vdf_tick_ = p.self_vdf_tick    ? p.self_vdf_tick
+                  : p.pool_vdf_tick    ? p.pool_vdf_tick
+                                       : kDefaultSelfVdfTick;
         const auto proof = Vdf::prove(prev, vdf_tick_);
         if (proof.empty()) { error = "VDF proof generation failed"; return false; }
         vdf_hex_ = Vdf::to_hex(proof);
