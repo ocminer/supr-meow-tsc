@@ -58,6 +58,57 @@ limit. Every window failed, silently, and one rig mined nothing for over seven
 hours. The variable is now `MEOW_GROUPS`; `--groups 0` means "auto"; and the
 miner raises the group count when `slots/groups` would exceed 64.
 
+## The VDF tick is a propagation setting, and the default was wrong
+
+A block carrying too few VDF ticks is **relayed lazily** — announced under an
+embargo of up to 9 seconds — which is orphan risk, not rejection. The chain's
+prompt-relay threshold is **315,000**.
+
+This miner self-proved at **1,000** for weeks. The value had been left low on
+the strength of a code comment claiming that raising it "costs wall-clock per
+window". That was simply untrue: the VDF is recomputed only when the **parent**
+changes, i.e. once per block. Measured:
+
+| ticks | prove time | share of a 600 s block |
+|---|---|---|
+| 1,000 | 70 ms | 0.01% |
+| 10,000 | 159 ms | 0.03% |
+| 100,000 | 982 ms | 0.16% |
+| **315,000** | **3.36 s** | **0.56%** |
+
+A live run at 315,000 showed no throughput change at all. So the "saving" was
+half a percent that does not even appear in the numbers, and the cost was
+risking whole blocks.
+
+`--vdf-tick <n>` overrides it. The miner also honours a tick advertised by the
+pool in the job (field 11) **even when the pool sends no VDF of its own**,
+which lets a pool raise the floor for everyone without miners rebuilding. When
+the pool does issue a VDF, its tick wins and the miner has no say. The tick in
+use is printed at startup, with a loud warning if it is below threshold.
+
+**The general lesson: a comment asserting a cost is not evidence of one.** This
+is the same shape as the auto-tune line that printed a value it never applied,
+and the `--groups 0` that arrived from a shell builtin — something plausible
+believed instead of checked.
+
+## Version numbers are not evidence of behaviour
+
+If you gate miners on a version string, know what you are actually testing. A
+miner here once advertised an older version while *already* carrying the fix —
+it was built between the fix and the version bump. A version gate would have
+rejected a compliant miner, and would equally pass a non-compliant one that
+reports the right number.
+
+Gate on the observable property instead where you can: a pool that checks the
+tick on every share is enforcing the thing it cares about, whatever the miner
+claims. Version gates earn their place only for changes whose compliance is not
+visible in a share, or for miners whose source you cannot audit.
+
+**After any restart sweep, verify versions per miner** rather than assuming the
+sweep worked — `grep -oE "supr-meow-tsc [0-9.]+" <log> | tail -1`. One process
+here survived a sweep for hours because the kill pattern matched the killing
+command's own line. Kill by explicit PID.
+
 ## Tuning rules that do not generalise
 
 Three separate times an optimum turned out to depend on something other than
