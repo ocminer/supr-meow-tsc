@@ -55,8 +55,14 @@ std::string DeviceManager::sm_arch_name(int major, int minor) {
 
 bool DeviceManager::init(const std::string& spec, std::string& error) {
     int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
-        error = "no CUDA device found — is the NVIDIA driver loaded?";
+    // Report what CUDA actually said. "No device" and "the driver rejected the
+    // call" are different problems with different fixes, and a rig where
+    // nvidia-smi works but CUDA does not is exactly the case the generic
+    // message cannot distinguish — nvidia-smi uses NVML, not CUDA.
+    const cudaError_t rc = cudaGetDeviceCount(&count);
+    if (rc != cudaSuccess || count == 0) {
+        error = "no usable CUDA device: " + std::string(cudaGetErrorName(rc)) + " — " +
+                cudaGetErrorString(rc) + " (visible devices: " + std::to_string(count) + ")";
         return false;
     }
 
