@@ -146,8 +146,11 @@ MODEL_URL=https://huggingface.co/ocminer/Qwen3-8B-9c925d64-bf16-GGUF/resolve/mai
 MODEL_SHA256=fef5847c18f860086007cec0b08960f206c13c5cba69e3ed6292ee1e02ed7e44
 ```
 
-Mirror: `https://www.suprnova.cc/models/Qwen3-8B-9c925d64-bf16.gguf` (same
-bytes, same checksum).
+Mirror (`MODEL_URL2`): `https://www.suprnova.cc/models/Qwen3-8B-9c925d64-bf16.gguf`
+— same bytes, same checksum, but **much** slower: measured from a datacenter
+box at a 9 GB offset, 5.2 MB/s single-stream and 22.2 MB/s over 8 ranges,
+against 7702 and 8253 MB/s from Hugging Face. It is a 1 Gbit/s link shared by
+every rig, so use it only as a fallback.
 
 Worth verifying any mirror before a fleet depends on it — `curl -sI` should
 report `content-length: 16388043744` and `accept-ranges: bytes`, and hashing

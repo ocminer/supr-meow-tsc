@@ -1,4 +1,11 @@
 #!/bin/bash
+# SOURCE IS HUGGINGFACE, NOT suprnova. Measured 2026-08-04 from a datacenter
+# box, 1.5 GB at a 9 GB offset so edge caching cannot flatter it:
+#     suprnova       5.2 MB/s single, 22.2 MB/s over 8 ranges (1 Gbit/s cap)
+#     huggingface  7702   MB/s single, 8253   MB/s over 8 ranges
+# ~1500x single-stream. The 16.4 GB model lands in seconds instead of an hour.
+# The two copies are byte-identical: full sha256 of the HF file verified equal
+# to fef5847c... Keep suprnova as MODEL_URL2, never as the primary.
 # Parallel range download that needs ONE file's worth of disk, not two.
 #
 # The earlier version downloaded 8 parts and then `cat`-ed them into the
@@ -9,7 +16,7 @@
 # Per-chunk hashes are checked against the known-good local file, so a bad
 # range is identified precisely instead of failing the whole 16 GB download.
 set -u
-URL=https://www.suprnova.cc/models/Qwen3-8B-9c925d64-bf16.gguf
+URL=https://huggingface.co/ocminer/Qwen3-8B-9c925d64-bf16-GGUF/resolve/main/Qwen3-8B-9c925d64-bf16.gguf
 SIZE=16388043744
 SHA=fef5847c18f860086007cec0b08960f206c13c5cba69e3ed6292ee1e02ed7e44
 OUT=/root/models/Qwen3-8B-9c925d64-bf16.gguf
