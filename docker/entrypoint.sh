@@ -24,7 +24,29 @@
 #   SSH_PORT      default 22
 set -euo pipefail
 
-die() { echo "error: $*" >&2; exit 2; }
+SSHD_UP=0
+
+# Fatal config error. If — and only if — the operator asked for a shell and we
+# managed to start one, HOLD THE CONTAINER OPEN instead of exiting, so they can
+# log in and fix the env. Exiting would take sshd down with us (it is a child
+# of this process), which is why simply starting sshd earlier is not enough on
+# its own: the one failure you most need to inspect is the one that used to
+# guarantee the container was gone before you could.
+#
+# Without SSH the behaviour is unchanged — exit 2, crash-loop, stay visible.
+# This deliberately does not paper over failures: it never holds open silently,
+# and it never applies to a rig that did not ask for a shell.
+die() {
+  echo "error: $*" >&2
+  if [[ $SSHD_UP == 1 ]]; then
+    echo "[entrypoint] NOT MINING — config error above. sshd is up; log in and fix the environment, then restart the container." >&2
+    while true; do
+      echo "[entrypoint] idle: $* (waiting for you to fix it — this rig is NOT earning)" >&2
+      sleep 300
+    done
+  fi
+  exit 2
+}
 
 start_sshd() {
   mkdir -p /root/.ssh /run/sshd
@@ -56,6 +78,7 @@ start_sshd() {
     > /etc/ssh/sshd_config.d/zz-supr-meow.conf
 
   if /usr/sbin/sshd -p "${SSH_PORT:-22}"; then
+    SSHD_UP=1
     echo "[entrypoint] sshd listening on ${SSH_PORT:-22} (${mode} auth)"
     # MUST be `if`, never `[[ ... ]] && echo`. As the last statement of this
     # function that becomes its return value, and with key-only auth pw_auth is
@@ -71,20 +94,28 @@ start_sshd() {
   fi
   return 0   # never let this function's status abort the miner
 }
+# ---- optional sshd (OctaSpace has no shell unless the image provides one) --
+# FIRST, before ANY validation or the model download. Two reasons, both learned
+# the hard way:
+#   * a rig that cannot fetch the 15 GB model is exactly when a shell is
+#     needed, and starting sshd afterwards left precisely those rigs
+#     unreachable;
+#   * a typo in POOL_URL or WALLET used to `die` here, killing the container
+#     with no shell — so the one misconfiguration you most need to log in and
+#     inspect was the one that guaranteed you could not. On a platform where
+#     env vars are the only config channel, that is the difference between a
+#     30-second fix and destroying the instance.
+# Set SSH_PUBKEY (keys, preferred), SSH_PASSWORD (root password), or both.
+# Neither set = no daemon, as before.
+if [[ -n "${SSH_PUBKEY:-}" || -n "${SSH_PASSWORD:-}" ]]; then
+  start_sshd
+fi
+
 [[ -n "${POOL_URL:-}" ]] || die "POOL_URL is required (stratum+tcp://host:port)"
 [[ -n "${WALLET:-}"   ]] || die "WALLET is required"
 
 MODEL_DIR="${MODEL_DIR:-/models}"
 mkdir -p "$MODEL_DIR"
-
-# ---- optional sshd (OctaSpace has no shell unless the image provides one) --
-# Deliberately BEFORE the model download: a rig that cannot fetch the 15 GB
-# model is exactly when a shell is needed, and starting sshd afterwards left
-# precisely those rigs unreachable. Set SSH_PUBKEY (keys, preferred),
-# SSH_PASSWORD (root password), or both. Neither set = no daemon, as before.
-if [[ -n "${SSH_PUBKEY:-}" || -n "${SSH_PASSWORD:-}" ]]; then
-  start_sshd
-fi
 
 # ---- model resolution -------------------------------------------------
 if [[ -z "${MODEL_PATH:-}" ]]; then
