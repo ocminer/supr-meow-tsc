@@ -757,7 +757,18 @@ int main(int argc, char** argv) {
                                              vram_for_tuning, 0);
             if (!o.slots_set)  o.slots  = tp.slots;
             if (!o.groups_set) o.groups = tp.groups;
-            if (!o.double_buffer_set && tp.double_buffer) ::setenv("MEOW_DOUBLE_BUFFER", "1", 0);
+            // Make the PROFILE authoritative in both directions. Setting only
+            // the "1" case left every profile's measured `false` unenforced,
+            // so the bare binary fell through to the old default-on behaviour
+            // while docker/entrypoint.sh and hiveos/h-run.sh both pinned it to
+            // 0 — the wrappers masked it and only the standalone tarball broke.
+            // That is not cosmetic: double-buffering allocates a SECOND KV
+            // cache, and every slot count here is sized for one. A 2x 5080
+            // split auto-tuned to 138 slots and then died with
+            // "failed to allocate buffer for kv cache". overwrite=0 keeps an
+            // explicit MEOW_DOUBLE_BUFFER from the environment winning.
+            if (!o.double_buffer_set)
+                ::setenv("MEOW_DOUBLE_BUFFER", tp.double_buffer ? "1" : "0", 0);
             std::printf("[%s] %sauto-tuned for %s%s: --slots %d --groups %d%s\n",
                         timestamp_now().c_str(), C_C(), tp.name, C_0(),
                         o.slots, o.groups, tp.double_buffer ? " (double-buffered)" : "");
@@ -765,13 +776,23 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
         }
 
-        // Double-buffered decode is the default: two window batches alternate
-        // so the GPU never drains between sample steps. MEOW_DOUBLE_BUFFER=0
-        // reverts to the single-batch path (also the automatic fallback when
-        // GPU-resident logits are unavailable).
+        // Double-buffered decode is OPT-IN. The idea is that two window batches
+        // alternate so the GPU never drains between sample steps, and it was
+        // once the default — but it has since lost on every card measured,
+        // because the second context pays the full weight read again to hide a
+        // few ms of CPU sampler tail: 5090 19.5 -> 12.8, H200 39.9 -> 36.6,
+        // H100 neutral at twice the VRAM. Every profile in tuning.cpp
+        // accordingly sets double_buffer=false.
+        //
+        // Leaving it default-on was also a live bug: it allocates a SECOND KV
+        // cache while every auto-tuned slot count is sized for one, so the
+        // standalone binary could OOM at startup on a config the miner had just
+        // chosen for itself. The wrappers hid it by pinning 0.
+        //
+        // MEOW_DOUBLE_BUFFER=1 (or a profile that asks for it) turns it on.
         const bool want_double = [](){
             const char* e = std::getenv("MEOW_DOUBLE_BUFFER");
-            return !(e && *e == '0');
+            return e && *e == '1';
         }();
         meow::EngineConfig ec;
         ec.model_path       = o.model_path;
