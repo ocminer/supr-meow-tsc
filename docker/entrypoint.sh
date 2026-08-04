@@ -140,7 +140,12 @@ fetch_model() {   # <url> <destination>
   for (( i=0; i<jobs; i++ )); do
     lo=$(( i * chunk )); hi=$(( lo + chunk - 1 ))
     (( hi >= size )) && hi=$(( size - 1 ))
-    ( curl -fsS --retry 5 --retry-delay 3 --max-time 3600 -r "${lo}-${hi}" "$url" \
+    # -L is MANDATORY here: Hugging Face resolve/ URLs answer 302 to the CDN,
+    # and `-f` does NOT treat 302 as an error — without -L every range
+    # "succeeds" instantly with a ~1 KB redirect body and the file stays
+    # zeros. The size check below catches it and falls back, but that turns
+    # the fast path into a silent no-op for exactly the URLs it exists for.
+    ( curl -fsSL --retry 5 --retry-delay 3 --max-time 3600 -r "${lo}-${hi}" "$url" \
         | dd of="$out.part" bs=4M seek="$lo" oflag=seek_bytes conv=notrunc status=none ) &
     pids+=("$!")
   done
