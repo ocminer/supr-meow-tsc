@@ -9,7 +9,9 @@
 # MODEL (one of)
 #   MODEL_PATH  path inside the container (use with a mounted volume / baked image)
 #   MODEL_URL   fetched to $MODEL_DIR on first start, then cached
-#   MODEL_SHA256  optional integrity check for MODEL_URL
+#   MODEL_URL2  mirror, tried only if MODEL_URL fails
+#   MODEL_SHA256  optional integrity check, applied whichever URL was used
+#   MODEL_DL_JOBS parallel byte ranges for the fetch (default 8; 1 = single stream)
 #
 # OPTIONAL — SLOTS/GROUPS default to the miner's per-GPU auto-tuning; set them
 # only to override it.
@@ -94,6 +96,63 @@ start_sshd() {
   fi
   return 0   # never let this function's status abort the miner
 }
+# Parallel ranged model fetch.
+#
+# A single-stream curl measured 7 MiB/s on an OctaSpace rig — 29 minutes for
+# the 16.4 GB model, with the GPU sitting idle the whole time. The same file
+# over 8 ranges lands in about 7. Every rig downloads independently, so this is
+# ~22 minutes off EVERY cold start, which dwarfs any tuning gain in the miner.
+#
+# Ranges are written straight to their offset in the destination, so peak disk
+# is ONE file, not two. An earlier parallel fetcher wrote 8 parts and cat-ed
+# them, needing 2x16.4 GB on a 23 GB box; the concatenation silently truncated
+# and only the final sha256 caught it.
+#
+# Degrades to a single stream whenever anything is unclear — no Content-Length,
+# no Accept-Ranges, a failed part. A slow download is an annoyance; a wrong one
+# is a rig mining garbage, and MODEL_SHA256 is checked either way.
+fetch_model() {   # <url> <destination>
+  local url="$1" out="$2" jobs="${MODEL_DL_JOBS:-8}"
+  local hdr size ranges
+
+  single_stream() {
+    echo "[entrypoint] downloading model (single stream): $1"
+    rm -f "$2.part"
+    curl -fL --retry 5 --retry-delay 5 -o "$2.part" "$1" || return 1
+    mv "$2.part" "$2"
+  }
+
+  hdr=$(curl -fsSLI --retry 2 --max-time 60 "$url" 2>/dev/null) || { single_stream "$url" "$out"; return $?; }
+  size=$(printf '%s' "$hdr"   | tr -d '\r' | awk 'tolower($1)=="content-length:"{v=$2} END{print v}')
+  ranges=$(printf '%s' "$hdr" | tr -d '\r' | awk 'tolower($1)=="accept-ranges:"{v=tolower($2)} END{print v}')
+
+  if [[ -z "$size" || ! "$size" =~ ^[0-9]+$ || "$size" -lt 1048576 || "$ranges" != "bytes" || "$jobs" -lt 2 ]]; then
+    echo "[entrypoint] server does not advertise byte ranges — falling back"
+    single_stream "$url" "$out"; return $?
+  fi
+
+  echo "[entrypoint] downloading model: $((size/1048576)) MiB over $jobs ranges"
+  rm -f "$out.part"
+  fallocate -l "$size" "$out.part" 2>/dev/null || truncate -s "$size" "$out.part" || { single_stream "$url" "$out"; return $?; }
+
+  local chunk=$(( (size + jobs - 1) / jobs )) i lo hi rc=0
+  local -a pids=()
+  for (( i=0; i<jobs; i++ )); do
+    lo=$(( i * chunk )); hi=$(( lo + chunk - 1 ))
+    (( hi >= size )) && hi=$(( size - 1 ))
+    ( curl -fsS --retry 5 --retry-delay 3 --max-time 3600 -r "${lo}-${hi}" "$url" \
+        | dd of="$out.part" bs=4M seek="$lo" oflag=seek_bytes conv=notrunc status=none ) &
+    pids+=("$!")
+  done
+  for p in "${pids[@]}"; do wait "$p" || rc=1; done
+
+  if (( rc != 0 )) || [[ "$(stat -c %s "$out.part" 2>/dev/null)" != "$size" ]]; then
+    echo "[entrypoint] ranged fetch incomplete — falling back to a single stream"
+    single_stream "$url" "$out"; return $?
+  fi
+  mv "$out.part" "$out"
+}
+
 # ---- optional sshd (OctaSpace has no shell unless the image provides one) --
 # FIRST, before ANY validation or the model download. Two reasons, both learned
 # the hard way:
@@ -123,10 +182,11 @@ if [[ -z "${MODEL_PATH:-}" ]]; then
     fname="$(basename "${MODEL_URL%%\?*}")"
     MODEL_PATH="$MODEL_DIR/$fname"
     if [[ ! -s "$MODEL_PATH" ]]; then
-      echo "[entrypoint] downloading model: $MODEL_URL"
-      curl -fL --retry 5 --retry-delay 5 -o "$MODEL_PATH.part" "$MODEL_URL" \
+      fetch_model "$MODEL_URL" "$MODEL_PATH" \
+        || { [[ -n "${MODEL_URL2:-}" ]] \
+               && echo "[entrypoint] primary failed — trying MODEL_URL2" \
+               && fetch_model "$MODEL_URL2" "$MODEL_PATH"; } \
         || die "model download failed"
-      mv "$MODEL_PATH.part" "$MODEL_PATH"
     else
       echo "[entrypoint] using cached model: $MODEL_PATH"
     fi
