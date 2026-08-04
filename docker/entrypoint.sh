@@ -57,10 +57,19 @@ start_sshd() {
 
   if /usr/sbin/sshd -p "${SSH_PORT:-22}"; then
     echo "[entrypoint] sshd listening on ${SSH_PORT:-22} (${mode} auth)"
-    [[ $pw_auth == yes ]] && echo "[entrypoint] WARNING: root password login is enabled — anyone who reaches this port can try to guess it. Use a long random SSH_PASSWORD, or prefer SSH_PUBKEY."
+    # MUST be `if`, never `[[ ... ]] && echo`. As the last statement of this
+    # function that becomes its return value, and with key-only auth pw_auth is
+    # "no", so the list returns 1, `start_sshd` returns 1, and `set -e` killed
+    # the container right after printing "sshd listening". SSH_PUBKEY — the
+    # option this very warning recommends — was therefore fatal, while
+    # SSH_PASSWORD worked, which is why the fleet never hit it.
+    if [[ $pw_auth == yes ]]; then
+      echo "[entrypoint] WARNING: root password login is enabled — anyone who reaches this port can try to guess it. Use a long random SSH_PASSWORD, or prefer SSH_PUBKEY."
+    fi
   else
     echo "[entrypoint] WARNING: sshd failed to start — continuing without a shell" >&2
   fi
+  return 0   # never let this function's status abort the miner
 }
 [[ -n "${POOL_URL:-}" ]] || die "POOL_URL is required (stratum+tcp://host:port)"
 [[ -n "${WALLET:-}"   ]] || die "WALLET is required"
