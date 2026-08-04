@@ -40,7 +40,7 @@ extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 
 namespace {
 
-const char* kVersion = "0.3.0";
+const char* kVersion = "0.3.1";
 
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop = true; }

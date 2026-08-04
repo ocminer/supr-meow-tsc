@@ -367,6 +367,44 @@ card instead of being spread like model and KV, so split mode reserves 2 GiB
 of the aggregate. Without that, 167 slots died on the scratch allocation while
 140 ran clean.
 
+**Slot count on a split is left conservative on purpose.** Measured on 2x RTX
+5080 (16 GB each), with 138 re-measured last as a drift control and reading
+identically both times:
+
+| slots | w/s | VRAM used (of 15872 MiB/card) | headroom |
+|---|---|---|---|
+| **138 (auto)** | **7.2** | 13188 / 14772 | 1100 MiB |
+| 150 | 7.6 | 13652 / 15236 | 636 MiB |
+| 160 | 7.9 | 14026 / 15642 | **230 MiB** |
+| 172 | fails to load | — | — |
+
+160 slots is ~10% faster and leaves 230 MiB on the second card. The auto-tuner
+stays at 138 anyway: an OOM here is fatal at startup, not a slowdown, and 230
+MiB is inside the noise of a driver version, an attached display, or a slightly
+different board. The 2 GiB reserve is a SAFETY parameter calibrated across
+split shapes, and retuning it from one rig is how per-architecture tunings have
+gone wrong here before.
+
+If your rig is headless and you watch it, `--slots 150` is a reasonable opt-in
+for ~+5%; `--slots 160` for ~+10% if you are willing to test it.
+
+**Neither way of attacking the pipeline bubble works.** A layer split runs one
+card at a time, so utilisation sits at 31-64% (~45%) drawing ~135 W of a ~360 W
+part. Both fixes lost, on the same rig:
+
+| config | w/s |
+|---|---|
+| **138 slots, layer split** | **7.2** |
+| double-buffered, 69 slots x2 | 2.8 |
+| `--split-rows` | ~0 (1 window vs 31) |
+
+Double-buffering looked like the one case where it should pay — filling a real
+structural idle instead of paying a second weight read to hide a small sampler
+tail. It lost 2.6x: the two contexts do not overlap across devices, they
+serialise, and per-window overhead doubles. Groups are flat (6 -> 7.3,
+8 -> 7.3, 12 -> 7.2), so the 8-core CPU is not the constraint either, even
+though the sampler shows `wait(sort+tail)=10.9 ms/step`.
+
 **Known limits.** Cards should be identical and the aggregate must genuinely
 exceed model + KV: 2× 8 GB (15.4 GB total) correctly refuses a 15.3 GB model,
 matching the pool's 4×8 GB minimum. Mixed architectures additionally need a
