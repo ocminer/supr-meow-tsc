@@ -166,7 +166,7 @@ pick the one matching your rig:
 | package | for |
 |---|---|
 | `supr-meow-tsc-<v>-linux-x86_64.tar.gz` | any Linux rig — unpack and run |
-| `supr-meow-tsc-<v>-hiveos.tar.gz` | HiveOS custom miner (Installation URL) |
+| `supr-meow-tsc-<v>.tar.gz` | HiveOS custom miner (Installation URL) — HiveOS requires exactly this name |
 | `supr-meow-tsc-<v>-mmpos.tar.gz` | MMPOS custom miner |
 | `supr-meow-tsc-<v>-smos.tar.gz` | SimpleMining (SMOS) custom miner |
 

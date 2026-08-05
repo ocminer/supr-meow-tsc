@@ -28,13 +28,21 @@ Two independent requirements, and both are hard:
 
 ### Turing (RTX 20-series) — read this before trying
 
-A 2080 Ti has 11 GB and no bf16. The miner will **start** on it, because the
-release packages still contain Turing GPU code, and it may even appear to run —
-but every proof it produces is invalid and the pool will reject all of it. There
-is no configuration, no flag and no future version that changes this: the
-precision is fixed by the chain, not by us.
+A 2080 Ti has 11 GB and no bf16. **From 0.3.5 the miner refuses to start on
+it** and tells you why:
 
-If you have Turing cards, they cannot mine TSC. That is the whole answer.
+```
+error: this GPU cannot mine TensorCash — it has no bf16 support.
+
+         GPU 0  NVIDIA GeForce RTX 2080 Ti  (Turing (sm_75))
+```
+
+Earlier versions would start on Turing and appear to run while every share was
+rejected, which looked like a miner bug rather than unusable hardware.
+
+There is no configuration, no flag and no future version that changes this: the
+precision is fixed by the chain, not by us. If you have Turing cards, they
+cannot mine TSC. That is the whole answer.
 
 ---
 
@@ -132,7 +140,7 @@ which must come from your installed driver.
 
 | platform | package |
 |---|---|
-| HiveOS | `supr-meow-tsc-<v>-hiveos.tar.gz` — use as the Installation URL |
+| HiveOS | `supr-meow-tsc-<v>.tar.gz` — use as the Installation URL |
 | MMPOS | `supr-meow-tsc-<v>-mmpos.tar.gz` |
 | SimpleMining (SMOS) | `supr-meow-tsc-<v>-smos.tar.gz` |
 | Any Linux rig | `supr-meow-tsc-<v>-linux-x86_64.tar.gz` |
