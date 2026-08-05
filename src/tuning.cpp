@@ -83,7 +83,43 @@ TuningProfile tuning_for(int sm, size_t vram_bytes, size_t model_bytes) {
     // 3.35 TB/s. It also sat AT its 400 W limit throughout (413 W draw), unlike
     // the H200 which idled at 476 W of 700 W. Nothing here is worth retuning:
     // a 25% slot change moves throughput by ~1 w/s.
-    if (sm == 80 && vram_gb > 60.0)
+    // NVIDIA CMP 170HX, UNLOCKED (sm_80, GA100 silicon, 64GB HBM2e). Measured
+    // 2026-08-05 on a 5-card rig. Distinguished from the A100 80GB purely by
+    // VRAM: the CMP reports 63.5 GB usable, the A100 79.2 GB. Both are GA100 so
+    // sm alone cannot tell them apart.
+    //
+    // 14.7 w/s per card uncontended — about 71% of an A100 at the same settings,
+    // which is the shader-count cut, not a memory one.
+    //
+    // COMPUTE-BOUND, measured, not assumed: locking the core to 900 MHz gave
+    // 11.08 w/s against 14.66 at a ~1190 MHz effective stock clock. That is
+    // 0.756x throughput for 0.756x clock — linear to three digits. The HBM2e
+    // bandwidth is therefore SURPLUS on this workload and buys nothing; do not
+    // pay a premium for these over cheaper sm_80 cards on bandwidth grounds.
+    // Consistent with the H200-vs-H100 result higher up (43% more bandwidth,
+    // identical throughput).
+    //
+    // Settings are inherited from the A100 and all three were re-measured here:
+    // slots 256 -> 11.1, 512 -> 12.2 (still climbing at 512, unlike the A100's
+    // flat curve), 640 -> will not fit; groups FLAT across 3/6/12/24; double
+    // buffer will not fit at 512 slots. Nothing left to tune — do not re-sweep.
+    //
+    // Raising the 250 W cap to 300 W measured NO gain, so the 1695 MHz max
+    // clock is not reachable by giving it more power. Not worth the risk.
+    //
+    // Host RAM, not VRAM, is the real limit on multi-card CMP rigs: each
+    // instance holds ~2.8 GB resident, so 5 cards need ~14 GB of RAM before the
+    // OS and anything else. A 30 GB box swapped the miners and throughput
+    // collapsed to 2 w/s with 252-second batches. Size RAM at >=4 GB per card.
+    if (sm == 80 && vram_gb > 55.0 && vram_gb < 70.0)
+        return { "CMP 170HX 64GB", 512, 12, false,
+                 "14.7 w/s per card at 512 slots, uncontended (x4 link); ~12.2 in a 5-card rig "
+                 "on x1 risers. COMPUTE-bound: 900MHz->11.08 vs ~1190MHz->14.66, i.e. throughput "
+                 "is linear in core clock, so the HBM2e bandwidth is surplus. slots 256->11.1, "
+                 "512->12.2, 640 OOM; groups flat 3..24; double-buffer OOM; 300W power cap "
+                 "measured no gain. Needs >=4GB HOST RAM per card or the miners swap." };
+
+    if (sm == 80 && vram_gb > 70.0)
         return { "A100 80GB", 512, 12, false,
                  "20.7 w/s at 512 slots, 0 rejects; curve nearly flat (256->19.9, 384->19.6, "
                  "512->20.8/20.7) so the card saturates early and slot count barely matters. "
