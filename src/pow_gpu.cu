@@ -564,6 +564,46 @@ __global__ void k_topk_unpack_snap(const uint64_t* __restrict__ sortedk, int cap
     }
 }
 
+// ---------------------------------------------------------------------------
+// 32-BIT SORTPAIRS PATH (MEOW_SORT32=1).
+//
+// The 56-bit flat key costs 7 radix passes; the sort is bandwidth-bound at 85%
+// of peak, so passes ARE the cost. A 32-bit key (transform_val of the SNAPPED
+// value) is 4 passes = 57% of the traffic. The token id rides along as the
+// 32-bit VALUE of a SortPairs, and the segment field is not needed at all
+// because DeviceSegmentedRadixSort scopes each segment via b.d_offs.
+//
+// CORRECTNESS RESTS ON STABILITY: CUB's radix sort is stable, input order
+// within a segment is ascending id (we pack i = seg*n + id in order), so equal
+// keys keep ascending id — which IS the normative tie rule (value DESC via
+// transform_val, id ASC). The snap must happen BEFORE the transform: the
+// snapped value is what the proof commits to, and two floats that snap to the
+// same bf16 MUST compare equal here or the tiebreak never engages.
+__global__ void k_pack32_snap(const float* __restrict__ vals,
+                              uint32_t* __restrict__ key32,
+                              uint32_t* __restrict__ val32,
+                              int n, int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        key32[i] = transform_val(snap_bf16_reg(vals[i]));
+        val32[i] = static_cast<uint32_t>(i % n);          // token id in segment
+    }
+}
+
+__global__ void k_unpack32_snap(const uint32_t* __restrict__ val32_sorted,
+                                const float*    __restrict__ vals,
+                                uint32_t*       __restrict__ idx_out,
+                                float*          __restrict__ val_out,
+                                int n, int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        const int seg = i / n;
+        const uint32_t id = val32_sorted[i];
+        idx_out[i] = id;
+        val_out[i] = snap_bf16_reg(vals[static_cast<size_t>(seg) * n + id]);
+    }
+}
+
 __global__ void k_unpack_flat_snap(const uint64_t* __restrict__ keys,
                                    const float*    __restrict__ vals,
                                    uint32_t*       __restrict__ idx_out,
@@ -759,12 +799,19 @@ struct BatchScratch {
             if (!topk_ready) cudaGetLastError();   // optional path; full sort still works
         }
         if (ok) {
-            size_t b1 = 0, b2 = 0;
+            size_t b1 = 0, b2 = 0, b3 = 0;
             cub::DeviceSegmentedRadixSort::SortKeys(nullptr, b1, d_keys_in, d_keys_out,
                                                     total, S, d_offs, d_offs+1, 0, 64, stream);
             cub::DeviceRadixSort::SortKeys(nullptr, b2, d_keys_in, d_keys_out,
                                            total, 0, 56, stream);
-            const size_t bytes = b1 > b2 ? b1 : b2;
+            // 32-bit SortPairs path (MEOW_SORT32): key32/val32 alias the halves
+            // of the existing 8 B/elem key buffers, so no extra VRAM.
+            cub::DeviceSegmentedRadixSort::SortPairs(
+                nullptr, b3,
+                reinterpret_cast<uint32_t*>(d_keys_in),  reinterpret_cast<uint32_t*>(d_keys_out),
+                reinterpret_cast<uint32_t*>(d_keys_in)+total, reinterpret_cast<uint32_t*>(d_keys_out)+total,
+                total, S, d_offs, d_offs+1, 0, 32, stream);
+            size_t bytes = b1 > b2 ? b1 : b2; if (b3 > bytes) bytes = b3;
             ok = cudaMalloc(&d_temp, bytes) == cudaSuccess;
             temp_bytes = bytes;
         }
@@ -956,8 +1003,20 @@ extern "C" bool pow_gpu_sort_and_stats_device_k(
     const bool dprof = [](){ const char* e = std::getenv("POW_GPU_EVPROF"); return e && *e == '1'; }();
     if (dprof && !dev_ready) { for (auto& e : dev) cudaEventCreate(&e); dev_ready = true; }
     #define DEVR(i) if (dprof) cudaEventRecord(dev[i], b.stream)
+    // 32-bit SortPairs path: 4 radix passes instead of 7. See kernel comments
+    // for the stability-based correctness argument. Mutually exclusive with the
+    // top-K select (both are alternative sorts).
+    static const bool sort32 = [](){
+        const char* e = std::getenv("MEOW_SORT32");
+        return e && *e == '1';
+    }();
+    uint32_t* k32i = reinterpret_cast<uint32_t*>(b.d_keys_in);
+    uint32_t* k32o = reinterpret_cast<uint32_t*>(b.d_keys_out);
     DEVR(0);
-    k_pack_flat_snap<<<G, T, 0, b.stream>>>(d_logits, b.d_keys_in, n, total);
+    if (sort32)
+        k_pack32_snap<<<G, T, 0, b.stream>>>(d_logits, k32i, k32i + total, n, total);
+    else
+        k_pack_flat_snap<<<G, T, 0, b.stream>>>(d_logits, b.d_keys_in, n, total);
     DEVR(1);
 
     // ---- top-K radix select on the DEVICE path -------------------------
@@ -973,7 +1032,7 @@ extern "C" bool pow_gpu_sort_and_stats_device_k(
         return e && *e == '1';
     }();
     bool dsel = false;
-    if (dev_select && b.topk_ready && topk > 0 && topk <= b.cand_cap && n > 4 * b.cand_cap) {
+    if (!sort32 && dev_select && b.topk_ready && topk > 0 && topk <= b.cand_cap && n > 4 * b.cand_cap) {
         cudaMemsetAsync(b.d_hist, 0, sizeof(uint32_t)*(size_t)S*TOPK_HIST_BINS, b.stream);
         cudaMemsetAsync(b.d_cnt,  0, sizeof(int)*S, b.stream);
         dim3 hg(64, S);
@@ -1011,11 +1070,18 @@ extern "C" bool pow_gpu_sort_and_stats_device_k(
                 std::fprintf(stderr, "[pow_gpu] device top-K select fell back to full sort\n");
         }
     }
-    if (!dsel)
+    if (sort32) {
+        size_t tb = b.temp_bytes;
+        cub::DeviceSegmentedRadixSort::SortPairs(
+            b.d_temp, tb, k32i, k32o, k32i + total, k32o + total,
+            total, S, b.d_offs, b.d_offs + 1, 0, 32, b.stream);
+    } else if (!dsel)
         cub::DeviceRadixSort::SortKeys(b.d_temp, b.temp_bytes, b.d_keys_in, b.d_keys_out,
                                        total, 0, 56, b.stream);
     DEVR(2);
-    if (!dsel)
+    if (sort32)
+        k_unpack32_snap<<<G, T, 0, b.stream>>>(k32o + total, d_logits, b.d_idx, b.d_sorted, n, total);
+    else if (!dsel)
         k_unpack_flat_snap<<<G, T, 0, b.stream>>>(b.d_keys_out, d_logits, b.d_idx, b.d_sorted, n, total);
     DEVR(3);
     const size_t dstride = dsel ? (size_t)topk : (size_t)n;
