@@ -119,11 +119,8 @@ PoiMiner::~PoiMiner() = default;
 
 bool PoiMiner::init(int window_tokens, std::string& error, int n_streams,
                     int egress_port) {
-    // Partition the nonce space per instance: the pool dedups on (job, nonce),
-    // and two devices both counting 1,2,3… collide on every share the second
-    // one submits ("duplicate share"). The egress port is already unique per
-    // instance, so it doubles as the partition key.
-    nonce_seq_ = static_cast<uint64_t>(egress_port) << 32;
+    // Nonce partition is seeded from the port we actually bind, further down —
+    // NOT from the requested one. See the bind loop for why the two must agree.
     n_streams_ = std::max(1, n_streams);
     window_tokens_ = window_tokens;
     if (window_tokens != 256) {
@@ -142,19 +139,53 @@ bool PoiMiner::init(int window_tokens, std::string& error, int n_streams,
     ::setenv("POW_EGRESS_MODE", "broker", 1);      // broker mode emits shares AND solutions
     ::setenv("POW_PROXY_ENABLE", "false", 1);      // ...and carries pow_blob_hash
     ::setenv("ZMQ_PUSH_HOST", "127.0.0.1", 1);
-    // Per-instance: the writer reads this env at initialize(), so two
-    // PoiMiners must init SEQUENTIALLY, each setting its own port first.
-    ::setenv("ZMQ_PUSH_PORT", std::to_string(egress_port).c_str(), 1);
 
     impl_->zmq_ctx = zmq_ctx_new();
     if (!impl_->zmq_ctx) { error = "zmq_ctx_new failed"; return false; }
     impl_->zmq_pull = zmq_socket(impl_->zmq_ctx, ZMQ_PULL);
     if (!impl_->zmq_pull) { error = "zmq_socket failed"; return false; }
-    const std::string ep = "tcp://127.0.0.1:" + std::to_string(egress_port);
-    if (zmq_bind(impl_->zmq_pull, ep.c_str()) != 0) {
-        error = std::string("cannot bind proof egress on ") + ep + ": " + zmq_strerror(zmq_errno());
+
+    // A busy port is NOT fatal: another miner process on this host (one per GPU
+    // is a normal bare-metal layout) already owns it, so walk up until one is
+    // free. Docker never hits this — each container has its own netns — which
+    // is why it went unnoticed until a five-GPU rig ran five processes.
+    //
+    // The port must stay the single source of truth for three things that have
+    // to agree, so all three are derived from the port actually BOUND:
+    //   1. the PULL socket here,
+    //   2. ZMQ_PUSH_PORT, which the upstream writer reads at initialize(),
+    //   3. the nonce partition — the pool dedups on (job, nonce), and two
+    //      instances counting 1,2,3… collide on every share the second submits.
+    // Seeding the nonce from the REQUESTED port would hand the same partition
+    // to two processes whenever one of them got bumped, so it is seeded below.
+    // bind() is exclusive, so distinct instances necessarily end on distinct
+    // ports and therefore distinct partitions.
+    // Window must cover EVERY coordinator on the host, not just this one:
+    // one process per GPU x n_groups each, all scanning from the same default
+    // base. A 5-GPU rig at 12 groups already needs 60, so 64 would strand an
+    // 8-GPU rig. 512 is far past any real rig and costs only failed binds.
+    constexpr int kPortScan = 512;
+    int bound_port = -1;
+    std::string bind_err;
+    for (int off = 0; off < kPortScan; ++off) {
+        const std::string ep = "tcp://127.0.0.1:" + std::to_string(egress_port + off);
+        if (zmq_bind(impl_->zmq_pull, ep.c_str()) == 0) { bound_port = egress_port + off; break; }
+        bind_err = zmq_strerror(zmq_errno());
+    }
+    if (bound_port < 0) {
+        error = "cannot bind proof egress on any port in [" + std::to_string(egress_port)
+              + ", " + std::to_string(egress_port + kPortScan - 1) + "]: " + bind_err
+              + " — pass --egress-base to pick a free range";
         return false;
     }
+    if (bound_port != egress_port) {
+        std::fprintf(stderr,
+                     "notice: proof egress port %d busy, using %d instead "
+                     "(another miner on this host?)\n",
+                     egress_port, bound_port);
+    }
+    ::setenv("ZMQ_PUSH_PORT", std::to_string(bound_port).c_str(), 1);
+    nonce_seq_ = static_cast<uint64_t>(bound_port) << 32;
     int timeo = 0;   // non-blocking receive; mining must never wait on this
     zmq_setsockopt(impl_->zmq_pull, ZMQ_RCVTIMEO, &timeo, sizeof(timeo));
 

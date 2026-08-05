@@ -6,3 +6,4 @@ build/
 CONTINUE-HERE-MINER.md
 dist/
 vendor/llama-src.tar.gz
+build80/
