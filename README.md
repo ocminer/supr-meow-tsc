@@ -148,6 +148,45 @@ PRO 6000 narrows from ~12% to ~5%. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Local JSON stats API + HiveOS package (`docs/hiveos/`) | **done** |
 | v3 Argon2id admission grinding | optional band, not mined |
 
+## Download
+
+Prebuilt packages for each release are on the
+[GitHub releases page](https://github.com/ocminer/supr-meow-tsc/releases) —
+pick the one matching your rig:
+
+| package | for |
+|---|---|
+| `supr-meow-tsc-<v>-linux-x86_64.tar.gz` | any Linux rig — unpack and run |
+| `supr-meow-tsc-<v>-hiveos.tar.gz` | HiveOS custom miner (Installation URL) |
+| `supr-meow-tsc-<v>-mmpos.tar.gz` | MMPOS custom miner |
+| `supr-meow-tsc-<v>-smos.tar.gz` | SimpleMining (SMOS) custom miner |
+
+All are built against Ubuntu 22.04 (glibc 2.35), so they run on 22.04 and
+newer — a 24.04 build fails on older rigs with `GLIBC_2.38 not found`.
+The 16.4 GB model is **not** bundled; each package fetches it once and verifies
+`MODEL_SHA256` before mining.
+
+### Docker
+
+```bash
+docker pull ocminersupr/supr-meow-tsc:latest
+
+docker run -d --name meow0 --restart unless-stopped \
+  --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0 \
+  -v /path/to/models:/models \
+  -e POOL_URL=stratum+tcp://tsc.suprnova.cc:3310 \
+  -e WALLET=tc1q… -e WORKER=rig01 \
+  -e MODEL_URL=https://huggingface.co/ocminer/Qwen3-8B-9c925d64-bf16-GGUF/resolve/main/Qwen3-8B-9c925d64-bf16.gguf \
+  -e MODEL_SHA256=fef5847c18f860086007cec0b08960f206c13c5cba69e3ed6292ee1e02ed7e44 \
+  ocminersupr/supr-meow-tsc:latest
+```
+
+Tags: `:latest` tracks the newest release, or pin a version like `:0.3.4`.
+One container per GPU — set `NVIDIA_VISIBLE_DEVICES` and a distinct `WORKER`
+for each. `SSH_PUBKEY` (or `SSH_PASSWORD`) starts an sshd for platforms like
+OctaSpace that give you no other shell; it comes up **before** the model
+download, so you can log in while that runs.
+
 ## Build
 
 Needs a CUDA toolkit (13.x tested) and an NVIDIA driver with NVML.

@@ -96,6 +96,12 @@ WORKDIR /out
 COPY --from=build /src/build/supr-meow-tsc       /out/supr-meow-tsc/supr-meow-tsc
 COPY --from=build /src/build/bin/*.so*           /out/supr-meow-tsc/lib/
 COPY hiveos/                                     /out/supr-meow-tsc/
+# MMPOS / SMOS launchers plus the shared logic they exec. One package is built
+# and the release script strips the wrappers each platform does not need, so a
+# fix to the model fetch reaches all three instead of three drifting forks.
+COPY mmpos/mmpos-run.sh                          /out/supr-meow-tsc/
+COPY smos/smos-run.sh                            /out/supr-meow-tsc/
+COPY tools/meow-common.sh                        /out/supr-meow-tsc/
 
 # The CUDA runtime libraries. HiveOS ships the DRIVER (libcuda, libnvidia-ml)
 # but not the toolkit, so cudart/cublas must travel with us. libcuda.so.1 is

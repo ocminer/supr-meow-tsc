@@ -979,8 +979,21 @@ extern "C" bool pow_gpu_sort_and_stats_device_k(
     // sampler is fully hidden behind decode and NO amount of sort/stats work
     // will ever help, which closes that line of investigation for good.
     // Never enable on a real pool.
-    static const bool stub = [](){ const char* e = std::getenv("MEOW_SAMPLER_STUB"); return e && *e == '1'; }();
+    // RELEASE GUARD: this returns garbage, so a public binary must not let a
+    // user turn it on against a real pool by accident — the shares would be
+    // rejected and look like a miner bug. Requires the extra confirmation
+    // token, which is documented nowhere a miner would find casually.
+    static const bool stub = [](){
+        const char* e = std::getenv("MEOW_SAMPLER_STUB");
+        const char* c = std::getenv("MEOW_I_UNDERSTAND_THIS_MINES_INVALID_SHARES");
+        return e && *e == '1' && c && *c == '1';
+    }();
     if (stub) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr,
+                "\n[pow_gpu] *** SAMPLER STUB ACTIVE — EVERY SHARE IS INVALID ***\n"
+                "          This is a benchmark instrument. Unset MEOW_SAMPLER_STUB to mine.\n\n");
         for (int sg = 0; sg < S; ++sg) {
             for (int r = 0; r < topk; ++r) {
                 h_idx[(size_t)sg*topk + r] = (uint32_t)r;
