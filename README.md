@@ -4,6 +4,11 @@ A self-contained GPU miner for **TensorCash (TSC)** — one binary, no Docker, n
 Python, no service install. Built for real rigs: drop it in a folder, point it
 at a pool, run it.
 
+> **Will my card work?** See **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)**.
+> Short version: NVIDIA **Ampere or newer** (bf16 is mandatory — Turing/RTX
+> 20-series can *never* mine TSC) and **24 GB VRAM** on one card, or several
+> smaller cards combined with `--split-model`.
+
 **Mining.** The full pipeline is in: embedded inference engine
 (llama.cpp/CUDA), GPU-offloaded proof-of-inference sampler with GPU-resident
 logits, chiavdf VDF, TSC Stratum client with failover, local JSON stats API,
@@ -18,12 +23,16 @@ GPU ran a real forward pass of a chain-registered LLM (currently `Qwen3-8B` on
 mainnet, `Qwen3-0.6B` on testnet). The consequences for a miner:
 
 - **The model must be on disk and in VRAM.** ~1.5 GB for the testnet 0.6B model,
-  ~16 GB for the mainnet 8B one. A 24 GB card is the practical mainnet minimum.
+  ~16 GB for the mainnet 8B one. A 24 GB card is the practical mainnet minimum;
+  smaller cards can be combined with `--split-model`. Full card-by-card list:
+  **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)**.
 - **Rates are PoI/s** (proofs per second), not hashes. Expect single or double
   digits, not megahashes. This is normal.
 - **bf16 is mandatory** — the proof declares its compute precision and the
   network's verifier checks it against the model checkpoint. Quantised weights
-  would be faster and every proof would be rejected.
+  would be faster and every proof would be rejected. This also rules out GPUs
+  without bf16 hardware entirely: **Turing (RTX 2080 Ti and older) cannot mine
+  TSC at all**, no matter how it is configured.
 - Pools speak **TSC Stratum** (`stratum+tcp://`, line-delimited JSON-RPC —
   spec in `docs/STRATUM-TSC.md`). The upstream WebSocket broker dialect is a
   different protocol; `ws://` and `wss://` URLs are **rejected** with an
@@ -160,6 +169,9 @@ pick the one matching your rig:
 | `supr-meow-tsc-<v>-hiveos.tar.gz` | HiveOS custom miner (Installation URL) |
 | `supr-meow-tsc-<v>-mmpos.tar.gz` | MMPOS custom miner |
 | `supr-meow-tsc-<v>-smos.tar.gz` | SimpleMining (SMOS) custom miner |
+
+Check **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)** before downloading —
+it lists which GPUs work, the VRAM each needs, and the driver version.
 
 All are built against Ubuntu 22.04 (glibc 2.35), so they run on 22.04 and
 newer — a 24.04 build fails on older rigs with `GLIBC_2.38 not found`.
