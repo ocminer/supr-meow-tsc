@@ -40,7 +40,7 @@ extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 
 namespace {
 
-const char* kVersion = "0.3.4";
+const char* kVersion = "0.3.5";
 
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop = true; }
@@ -721,6 +721,36 @@ int main(int argc, char** argv) {
             client.stop();
             dm.restore_all();
             return 0;
+        }
+
+        // ---- refuse hardware that CANNOT produce a valid proof ------------
+        // The chain fixes compute precision at bf16 and the verifier checks it,
+        // so a GPU without bf16 can never make a valid share. Turing (sm_75)
+        // is the case that actually bites: the release packages contain sm_75
+        // code, so the miner would happily START on a 2080 Ti, look healthy,
+        // and have every share rejected — which reads as a miner bug rather
+        // than unusable hardware. Say so plainly instead, and name the card.
+        {
+            std::vector<const meow::DeviceInfo*> too_old;
+            for (const auto& d : dm.devices())
+                if (d.sm_major < 8) too_old.push_back(&d);
+            if (!too_old.empty()) {
+                std::fprintf(stderr,
+                    "\nerror: this GPU cannot mine TensorCash — it has no bf16 support.\n\n");
+                for (const auto* d : too_old)
+                    std::fprintf(stderr, "         GPU %d  %s  (%s)\n", d->index, d->name.c_str(),
+                                 meow::DeviceManager::sm_arch_name(d->sm_major, d->sm_minor).c_str());
+                std::fprintf(stderr,
+                    "\n       TSC proofs declare bf16 as their compute precision and the network's\n"
+                    "       verifier checks it, so a card without bf16 hardware produces shares that\n"
+                    "       are always rejected. This is a chain rule: no flag, setting or future\n"
+                    "       version changes it.\n\n"
+                    "       You need an NVIDIA GPU of the Ampere generation or newer (RTX 30-series,\n"
+                    "       A-series, RTX 40/50-series, or datacentre A100/H100/B200).\n"
+                    "       See docs/COMPATIBILITY.md.\n\n");
+                std::fflush(stderr);
+                return 2;
+            }
         }
 
         // ---- real mining -------------------------------------------------
