@@ -548,6 +548,22 @@ __global__ void k_pack_flat_snap(const float* __restrict__ vals, uint64_t* __res
     }
 }
 
+// Snapping variant for the DEVICE path: values are read straight from llama's
+// output tensor, so the bf16 snap must be applied in-register exactly as
+// k_unpack_flat_snap does — the snapped value is what the proof commits to.
+__global__ void k_topk_unpack_snap(const uint64_t* __restrict__ sortedk, int cap, int K,
+                                   const float* __restrict__ vals, int n,
+                                   uint32_t* __restrict__ idx_out, float* __restrict__ val_out) {
+    const int seg = blockIdx.y;
+    const uint64_t* src = sortedk + static_cast<size_t>(seg) * cap;
+    for (int r = blockIdx.x * blockDim.x + threadIdx.x; r < K; r += blockDim.x * gridDim.x) {
+        const uint32_t id = static_cast<uint32_t>(src[r] & 0x3FFFFull);
+        idx_out[static_cast<size_t>(seg) * K + r] = id;
+        val_out[static_cast<size_t>(seg) * K + r] =
+            snap_bf16_reg(vals[static_cast<size_t>(seg) * n + id]);
+    }
+}
+
 __global__ void k_unpack_flat_snap(const uint64_t* __restrict__ keys,
                                    const float*    __restrict__ vals,
                                    uint32_t*       __restrict__ idx_out,
@@ -943,24 +959,89 @@ extern "C" bool pow_gpu_sort_and_stats_device_k(
     DEVR(0);
     k_pack_flat_snap<<<G, T, 0, b.stream>>>(d_logits, b.d_keys_in, n, total);
     DEVR(1);
-    cub::DeviceRadixSort::SortKeys(b.d_temp, b.temp_bytes, b.d_keys_in, b.d_keys_out,
-                                   total, 0, 56, b.stream);
+
+    // ---- top-K radix select on the DEVICE path -------------------------
+    // The sort is 1.47 of 2.07 ms of sampler GPU time (71%, POW_GPU_EVPROF).
+    // Select ~39k candidates instead of sorting all 151,936 keys per stream.
+    // This was previously implemented ONLY in the host-logits function, which
+    // device-logits mode never calls — so MEOW_TOPK_SELECT measured nothing.
+    // Proof-safety is unchanged from that implementation: selection uses the
+    // SAME packed key, buckets are taken whole so ties never split, and the
+    // top-K ordering is bit-identical to the full sort's prefix.
+    static const bool dev_select = [](){
+        const char* e = std::getenv("MEOW_TOPK_SELECT");
+        return e && *e == '1';
+    }();
+    bool dsel = false;
+    if (dev_select && b.topk_ready && topk > 0 && topk <= b.cand_cap && n > 4 * b.cand_cap) {
+        cudaMemsetAsync(b.d_hist, 0, sizeof(uint32_t)*(size_t)S*TOPK_HIST_BINS, b.stream);
+        cudaMemsetAsync(b.d_cnt,  0, sizeof(int)*S, b.stream);
+        dim3 hg(64, S);
+        k_topk_hist<<<hg, 256, 0, b.stream>>>(b.d_keys_in, n, total, b.d_hist);
+        k_topk_cutoff<<<S, 32, 0, b.stream>>>(b.d_hist, topk, b.cand_cap, b.d_cut, b.d_ovf);
+        k_topk_compact<<<hg, 256, 0, b.stream>>>(b.d_keys_in, n, b.cand_cap, b.d_cut, b.d_cand, b.d_cnt);
+        k_topk_offsets<<<(S + 63) / 64, 64, 0, b.stream>>>(b.d_cnt, S, b.cand_cap, b.d_kbeg, b.d_kend);
+        static thread_local int* ho = nullptr; static thread_local int ho_cap = 0;
+        if (ho_cap < S) {
+            if (ho) cudaFreeHost(ho);
+            ho = nullptr; ho_cap = 0;
+            if (cudaMallocHost(&ho, sizeof(int)*S) == cudaSuccess) ho_cap = S; else cudaGetLastError();
+        }
+        bool ovf = true;
+        if (ho_cap >= S &&
+            cudaMemcpyAsync(ho, b.d_ovf, sizeof(int)*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess &&
+            cudaStreamSynchronize(b.stream) == cudaSuccess) {
+            ovf = false;
+            for (int i = 0; i < S; ++i) if (ho[i]) { ovf = true; break; }
+        }
+        if (!ovf) {
+            size_t tb = b.temp_bytes;
+            if (cub::DeviceSegmentedRadixSort::SortKeys(
+                    b.d_temp, tb, b.d_cand, b.d_cand_sorted,
+                    S * b.cand_cap, S, b.d_kbeg, b.d_kend, 0, 56, b.stream) == cudaSuccess) {
+                dim3 ug((topk + 255) / 256, S);
+                k_topk_unpack_snap<<<ug, 256, 0, b.stream>>>(b.d_cand_sorted, b.cand_cap, topk,
+                                                             d_logits, n, b.d_idx, b.d_sorted);
+                dsel = true;
+            }
+        }
+        if (!dsel) {
+            static std::atomic<bool> once{false};
+            if (!once.exchange(true))
+                std::fprintf(stderr, "[pow_gpu] device top-K select fell back to full sort\n");
+        }
+    }
+    if (!dsel)
+        cub::DeviceRadixSort::SortKeys(b.d_temp, b.temp_bytes, b.d_keys_in, b.d_keys_out,
+                                       total, 0, 56, b.stream);
     DEVR(2);
-    k_unpack_flat_snap<<<G, T, 0, b.stream>>>(b.d_keys_out, d_logits, b.d_idx, b.d_sorted, n, total);
+    if (!dsel)
+        k_unpack_flat_snap<<<G, T, 0, b.stream>>>(b.d_keys_out, d_logits, b.d_idx, b.d_sorted, n, total);
     DEVR(3);
-    if (cudaMemcpy2DAsync(b.d_heads, sizeof(float), b.d_sorted, sizeof(float)*(size_t)n,
+    const size_t dstride = dsel ? (size_t)topk : (size_t)n;
+    if (cudaMemcpy2DAsync(b.d_heads, sizeof(float), b.d_sorted, sizeof(float)*dstride,
                           sizeof(float), S, cudaMemcpyDeviceToDevice, b.stream) != cudaSuccess)
         return false;
     if (!meow_stats_1blk() && cudaMemsetAsync(b.d_stats, 0, sizeof(double)*6*S, b.stream) != cudaSuccess) return false;
     dim3 grid(meow_stats_1blk() ? 1 : 64, S);
     DEVR(4);
+    // With the select engaged the sorted array holds only topk ranks, so the
+    // rank buckets come from it while the order-independent full-vocabulary
+    // terms are taken from llama's raw tensor (k_stats_topk), exactly as on
+    // the host path.
+    if (dsel) {
+        cudaMemsetAsync(b.d_stats, 0, sizeof(double)*6*S, b.stream);
+        dim3 sg(64, S);
+        k_stats_topk<<<sg, 256, 0, b.stream>>>(b.d_sorted, topk, d_logits, n,
+                                               inv_temp, b.d_heads, b.d_stats);
+    } else
     k_stats_seg<<<grid, 256, 0, b.stream>>>(b.d_sorted, n, inv_temp, b.d_heads, b.d_stats);
     DEVR(5);
     k_probes_snap<<<(S*20 + 63)/64, 64, 0, b.stream>>>(d_logits, S, n, b.d_probes);
     DEVR(6);
-    bool ok = cudaMemcpy2DAsync(h_idx, sizeof(uint32_t)*topk, b.d_idx, sizeof(uint32_t)*(size_t)n,
+    bool ok = cudaMemcpy2DAsync(h_idx, sizeof(uint32_t)*topk, b.d_idx, sizeof(uint32_t)*dstride,
                                 sizeof(uint32_t)*topk, S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
-           && cudaMemcpy2DAsync(h_val, sizeof(float)*topk, b.d_sorted, sizeof(float)*(size_t)n,
+           && cudaMemcpy2DAsync(h_val, sizeof(float)*topk, b.d_sorted, sizeof(float)*dstride,
                                 sizeof(float)*topk, S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
            && cudaMemcpyAsync(h_head, b.d_heads, sizeof(float)*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
            && cudaMemcpyAsync(h_stats, b.d_stats, sizeof(double)*6*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
