@@ -68,10 +68,23 @@ miner never receives a job it cannot interpret.
 
 ```json
 {"id":1,"method":"mining.subscribe",
- "params":["supr-meow-tsc/0.1.0", null, {"compression":["deflate"],"protocol":"tsc/1.0"}]}
+ "params":["supr-meow-tsc/0.1.0", null, {"compression":["deflate"],"protocol":"tsc/1.0",
+                                          "prompt_seed":true,"pool_vdf":true}]}
 ```
 
 `params`: `[user_agent, session_id_to_resume|null, options]`.
+
+**Capability flags in `options`.** A miner advertises what optional job fields it
+understands. Both are opt-in and a pool MUST keep working with miners that send
+neither:
+
+| flag | meaning |
+|---|---|
+| `prompt_seed` | miner accepts seed-derived prompts (notify field 9, §4.5) |
+| `pool_vdf` | miner accepts a pool-issued VDF (notify fields 10 and 11, §4.5) |
+
+A pool SHOULD only populate those fields for miners that advertised the matching
+flag; a miner that did not advertise one MUST ignore the field if sent anyway.
 
 Result:
 
@@ -149,9 +162,16 @@ wants a target change to apply to an in-flight job MUST send a new job.
   545259519,                                             // nBits
   11238,                                                 // height
   1785165301,                                            // expires_at (unix)
-  true                                                   // clean_jobs
+  true,                                                  // clean_jobs
+  "3f8a…64 hex…",                                        // 9  prompt_seed   (optional)
+  "0a1b2c…hex…",                                         // 10 pool VDF      (optional)
+  315000                                                 // 11 pool VDF tick (optional)
 ]}
 ```
+
+Fields 1–7 are mandatory. Fields 9–11 are **optional extensions**; a pool that
+omits them is fully conformant, and a miner MUST treat a short `params` array as
+"not offered" rather than an error.
 
 `clean_jobs=true` means the parent block changed: the miner MUST abandon
 in-flight work, because a proof for a dead parent can never be accepted. When
@@ -161,6 +181,31 @@ in-flight work, because a proof for a dead parent can never be accepted. When
 `header_prefix` is exactly 152 hex characters. Its bytes are
 `version | prev_hash | merkle_root | ntime | nAdjBits`; the miner appends the
 4-byte nonce derived from its sampling transcript.
+
+**Field 9 — `prompt_seed` (optional, 64 hex chars).** Instead of the miner
+choosing its own prompt, the prompt for window *w* is derived deterministically
+from `(seed, w)`. This lets a pool precompute the expected step-0 output for any
+window and check a submitted proof against it cheaply, without replaying the
+whole transcript. A miner that advertised `prompt_seed` and receives a field
+that is not exactly 64 hex characters MUST ignore it and fall back to its own
+prompts.
+
+**Fields 10 and 11 — pool-issued VDF (optional).** Field 10 is a hex VDF proof
+for this job; field 11 is the tick count it was proved to. When present the
+miner uses them instead of proving locally, which removes seconds of VDF work
+from every window. Rules that matter for interoperability:
+
+- A **malformed** field 10 (odd length, non-hex, empty) MUST be treated as
+  absent, not as an error. The miner then proves locally and the job is simply
+  not precomputable for that pool.
+- If field 10 is present but field 11 is absent, the tick is unspecified and the
+  miner SHOULD fall back to local proving rather than guess — an incorrectly
+  assumed tick produces a proof the network rejects.
+- **Tick choice is a propagation concern, not a validity one.** A proof is valid
+  at any tick, but a block found with too few ticks is held under an
+  announcement embargo by the chain's relay rules and can be orphaned. Pools
+  SHOULD issue, and self-proving miners SHOULD use, a tick at or above the
+  network's prompt-relay threshold. `supr-meow-tsc` self-proves at 315000.
 
 ### 4.6 `mining.submit` (miner → pool)
 

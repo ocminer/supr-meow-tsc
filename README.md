@@ -4,6 +4,10 @@ A self-contained GPU miner for **TensorCash (TSC)** — one binary, no Docker, n
 Python, no service install. Built for real rigs: drop it in a folder, point it
 at a pool, run it.
 
+> **Pool or miner author?** The wire protocol is specified in
+> **[docs/STRATUM-TSC.md](docs/STRATUM-TSC.md)** — open, operator-neutral, and
+> free for anyone to implement.
+>
 > **Will my card work?** See **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)**.
 > Short version: NVIDIA **Ampere or newer** (bf16 is mandatory — Turing/RTX
 > 20-series can *never* mine TSC) and **24 GB VRAM** on one card, or several
