@@ -338,6 +338,168 @@ __device__ __forceinline__ uint32_t transform_val(float v) {
     return ~u;                                   // ascending sort => value DESC
 }
 
+// ---------------------------------------------------------------------------
+// TOP-K RADIX SELECT (opt-in: MEOW_TOPK_SELECT=1)
+//
+// nsys on a 5090 at 128 slots: the full-vocabulary radix sort is 40.7% of ALL
+// GPU time, plus 6.0% histogram and 1.2% exclusive-sum — while poi.cpp only
+// ever reads the top K=2048 columns back. We were sorting 151,936 keys per
+// stream and discarding 98.7% of the result.
+//
+// Instead: histogram the top HIST_BITS of the transformed value, walk buckets
+// ascending until the cumulative count covers K, then compact only the keys at
+// or above that bucket and sort THOSE. Typically ~4k candidates instead of
+// 152k — a ~35x smaller sort.
+//
+// WHY THIS IS PROOF-SAFE. The key is [55..50]=seg | [49..18]=value | [17..0]=id
+// and sorts ascending, i.e. value DESC with id ASC on ties — the chain's
+// normative rule (pow_v3 §4.1). Selection is by the SAME key, so the surviving
+// candidate set is exactly the true top-|cand| and its sorted order is
+// bit-identical to the full sort's first |cand| entries. Ties are never split:
+// a bucket is taken whole, so two equal values always land on the same side.
+// The verifier replays from the top-50 support (pow_utils.py:139 caps top_k at
+// 50 when top_p<1.0), which is far inside K.
+//
+// If a degenerate distribution puts more than the candidate capacity in range,
+// the caller falls back to the full sort — correctness never depends on the
+// histogram being well behaved.
+// 16 bits, not 11: the field is a TRANSFORMED float, so the high bits are
+// sign+exponent and logits sit in a narrow exponent range — at 11 bits the
+// first bucket reaching K already held >8192 keys and every step fell back to
+// the full sort (measured: ratio 1.023, i.e. no gain at all). 16 bits gives
+// sign+exponent+7 mantissa bits, which actually separates the head of the
+// distribution. 65536 bins x 4 B exceeds shared memory, so the histogram is
+// global — it is a streaming pass and was only ~6% of GPU time anyway.
+#define TOPK_HIST_BITS 16
+#define TOPK_HIST_BINS (1 << TOPK_HIST_BITS)
+
+// Bucket of a packed key = the top TOPK_HIST_BITS of its 32-bit value field.
+__device__ __forceinline__ uint32_t topk_bin_of(uint64_t key) {
+    return static_cast<uint32_t>((key >> (18 + 32 - TOPK_HIST_BITS)) & (TOPK_HIST_BINS - 1));
+}
+
+__global__ void k_topk_hist(const uint64_t* __restrict__ keys, int n, int total,
+                            uint32_t* __restrict__ hist /* [S][BINS] */) {
+    const int seg = blockIdx.y;
+    const size_t base = static_cast<size_t>(seg) * n;
+    uint32_t* g = hist + static_cast<size_t>(seg) * TOPK_HIST_BINS;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x)
+        atomicAdd(&g[topk_bin_of(keys[base + i])], 1u);
+    (void)total;
+}
+
+// One block per segment: walk buckets ascending (= value descending) until the
+// running count covers K, and publish that bucket as the cutoff.
+__global__ void k_topk_cutoff(const uint32_t* __restrict__ hist, int K, int cap,
+                              uint32_t* __restrict__ cutoff /* [S] */,
+                              int* __restrict__ overflow /* [S] */) {
+    const int seg = blockIdx.x;
+    if (threadIdx.x != 0) return;
+    const uint32_t* g = hist + static_cast<size_t>(seg) * TOPK_HIST_BINS;
+    uint32_t acc = 0, b = 0;
+    for (; b < TOPK_HIST_BINS; ++b) {
+        acc += g[b];
+        if (acc >= static_cast<uint32_t>(K)) break;
+    }
+    if (b >= TOPK_HIST_BINS) b = TOPK_HIST_BINS - 1;
+    cutoff[seg]   = b;
+    // acc is exactly how many keys the compaction will emit for this segment.
+    // Publish it: a fallback must be able to say HOW badly it overflowed,
+    // otherwise widening the histogram is guesswork.
+    overflow[seg] = (acc > static_cast<uint32_t>(cap)) ? static_cast<int>(acc) : 0;
+}
+
+// Compact keys whose bucket <= cutoff into a per-segment slot of fixed stride
+// `cap`. Order within the slot is arbitrary; the sort that follows fixes it.
+__global__ void k_topk_compact(const uint64_t* __restrict__ keys, int n, int cap,
+                               const uint32_t* __restrict__ cutoff,
+                               uint64_t* __restrict__ out, int* __restrict__ cnt) {
+    const int seg = blockIdx.y;
+    const size_t base = static_cast<size_t>(seg) * n;
+    const uint32_t cut = cutoff[seg];
+    uint64_t* dst = out + static_cast<size_t>(seg) * cap;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
+        const uint64_t k = keys[base + i];
+        if (topk_bin_of(k) <= cut) {
+            const int slot = atomicAdd(&cnt[seg], 1);
+            if (slot < cap) dst[slot] = k;
+        }
+    }
+}
+
+// Segment offsets for the compacted array: [seg*cap, seg*cap + cnt[seg]).
+__global__ void k_topk_offsets(const int* __restrict__ cnt, int S, int cap,
+                               int* __restrict__ beg, int* __restrict__ end) {
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s < S) {
+        beg[s] = s * cap;
+        int c = cnt[s]; if (c > cap) c = cap;
+        end[s] = s * cap + c;
+    }
+}
+
+// Stats for the select path. The rank buckets [0,50) [50,500) [500,2000) all
+// live inside K, so they come from the sorted top-K. The remaining terms are
+// ORDER-INDEPENDENT and are taken over the raw unsorted values:
+//   out[0] logsumexp accumulator, out[5] whole-vocabulary sum,
+//   out[4] = out[5] - sum(top 2000)   (ranks [2000,n))
+// Summation order differs from the full-sort path, which is safe for exactly
+// the reason documented at k_stats: these bucket means feed a Mahalanobis
+// distance against the protocol's Sigma_err, not an equality test.
+__global__ void k_stats_topk(const float* __restrict__ topv, int K,
+                             const float* __restrict__ raw, int n, float inv_temp,
+                             const float* __restrict__ heads,
+                             double* __restrict__ out /* [S][6] */) {
+    const int seg = blockIdx.y;
+    const double max_scaled = static_cast<double>(heads[seg]) * static_cast<double>(inv_temp);
+    const float* tv = topv + static_cast<size_t>(seg) * K;
+    const float* rv = raw  + static_cast<size_t>(seg) * n;
+    __shared__ double sh[6][32];
+    double acc[6] = {0,0,0,0,0,0};
+    // full-vocabulary, order-independent terms
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
+        const double v = static_cast<double>(rv[i]);
+        acc[0] += exp(v * static_cast<double>(inv_temp) - max_scaled);
+        acc[5] += v;
+    }
+    // rank buckets from the sorted top-K
+    for (int r = blockIdx.x * blockDim.x + threadIdx.x; r < K; r += blockDim.x * gridDim.x) {
+        const double v = static_cast<double>(tv[r]);
+        if      (r < 50)   acc[1] += v;
+        else if (r < 500)  acc[2] += v;
+        else if (r < 2000) acc[3] += v;
+    }
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int j = 0; j < 6; ++j) {
+        double x = acc[j];
+        for (int off = 16; off > 0; off >>= 1) x += __shfl_down_sync(0xFFFFFFFFu, x, off);
+        if (lane == 0) sh[j][warp] = x;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        const int nw = (blockDim.x + 31) >> 5;
+        for (int j = 0; j < 6; ++j) {
+            double x = (threadIdx.x < nw) ? sh[j][threadIdx.x] : 0.0;
+            for (int off = 16; off > 0; off >>= 1) x += __shfl_down_sync(0xFFFFFFFFu, x, off);
+            if (threadIdx.x == 0 && x != 0.0) atomicAdd(&out[seg*6 + j], x);
+        }
+    }
+}
+
+// Unpack the first K of each compacted+sorted segment into the [S][K] outputs.
+__global__ void k_topk_unpack(const uint64_t* __restrict__ sortedk, int cap, int K,
+                              const float* __restrict__ vals, int n,
+                              uint32_t* __restrict__ idx_out, float* __restrict__ val_out) {
+    const int seg = blockIdx.y;
+    const uint64_t* src = sortedk + static_cast<size_t>(seg) * cap;
+    for (int r = blockIdx.x * blockDim.x + threadIdx.x; r < K; r += blockDim.x * gridDim.x) {
+        const uint64_t k = src[r];
+        const uint32_t id = static_cast<uint32_t>(k & 0x3FFFFull);
+        idx_out[static_cast<size_t>(seg) * K + r] = id;
+        val_out[static_cast<size_t>(seg) * K + r] = vals[static_cast<size_t>(seg) * n + id];
+    }
+}
+
 __global__ void k_pack_flat(const float* __restrict__ vals, uint64_t* __restrict__ keys,
                             int n, int total) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -428,6 +590,26 @@ __global__ void k_unpack_seg(const uint64_t* __restrict__ keys,
     }
 }
 
+// One block per segment writes its stats directly (see k_stats_seg), so the
+// zeroing pass is unnecessary. That memset was 309,010 calls and 6% of ALL
+// CUDA API time in the nsys trace. MEOW_STATS_1BLK=0 restores the old
+// 64-block + memset path for A/B.
+// MEASURED WORSE — default OFF. Removing the 309k cudaMemsetAsync calls (6% of
+// CUDA API time) by giving each segment ONE block that writes instead of
+// accumulates costs 10%: one block cannot saturate the GPU for a 151,936-entry
+// reduction, and the sampler tail goes 3.4 -> 6.6 ms. Bracketed on a solo 5090:
+//   64-block+memset 18.60 | 1-block 16.70 | 1-block 16.66
+// Kept as an opt-in (MEOW_STATS_1BLK=1) only because it may win on a card where
+// the sampler is not the parallelism-limited path. Launch-count reduction is
+// not free when it trades away occupancy.
+static inline bool meow_stats_1blk() {
+    static const bool v = [](){
+        const char* e = std::getenv("MEOW_STATS_1BLK");
+        return e && *e == '1';
+    }();
+    return v;
+}
+
 __global__ void k_stats_seg(const float* __restrict__ sorted, int n, float inv_temp,
                             const float* __restrict__ heads,
                             double* __restrict__ out /* [S][6] */) {
@@ -456,7 +638,14 @@ __global__ void k_stats_seg(const float* __restrict__ sorted, int n, float inv_t
         const int nwarp = (blockDim.x + 31) / 32;
         double t = 0.0;
         for (int w = 0; w < nwarp; ++w) t += sh[threadIdx.x][w];
-        atomicAdd(&out[seg * 6 + threadIdx.x], t);
+        // gridDim.x == 1 means this block owns the whole segment, so it can
+        // WRITE instead of accumulate — which lets the caller drop the
+        // per-call cudaMemsetAsync(d_stats). That memset was 309,010 calls and
+        // 6% of ALL CUDA API time in the nsys trace; at ~23 us of host time
+        // each it cost more than the work it prepared. Multi-block grids keep
+        // the atomic path and still need the memset.
+        if (gridDim.x == 1) out[seg * 6 + threadIdx.x] = t;
+        else                atomicAdd(&out[seg * 6 + threadIdx.x], t);
     }
 }
 
@@ -473,6 +662,17 @@ struct BatchScratch {
     double*   d_stats = nullptr;
     float*    d_probes = nullptr;   // [S][20] telemetry probes (device-logits mode)
     int*      d_offs = nullptr;
+    // top-K select scratch (MEOW_TOPK_SELECT=1)
+    uint32_t* d_hist = nullptr;     // [S][BINS]
+    uint32_t* d_cut  = nullptr;     // [S]
+    int*      d_cnt  = nullptr;     // [S]
+    int*      d_ovf  = nullptr;     // [S]
+    uint64_t* d_cand = nullptr;     // [S][cand_cap]
+    uint64_t* d_cand_sorted = nullptr;
+    int*      d_kbeg = nullptr;     // [S]
+    int*      d_kend = nullptr;     // [S]
+    int       cand_cap = 0;
+    bool      topk_ready = false;
     void*     d_temp = nullptr;
     size_t    temp_bytes = 0;
     cudaStream_t stream = nullptr;
@@ -522,6 +722,26 @@ struct BatchScratch {
                                  cudaMemcpyHostToDevice, stream) == cudaSuccess
               && cudaStreamSynchronize(stream) == cudaSuccess;
         }
+        // top-K select scratch. cand_cap bounds the compaction; a distribution
+        // that overflows it falls back to the full sort rather than truncating.
+        if (ok) {
+            // 65536, not a guess: the instrumented fallback reported
+            // worst_candidates=39303 for a real Qwen3-8B logit distribution at
+            // 16-bit buckets. Logits cluster tightly, so even fine buckets pull
+            // ~39k candidates — still a ~3.9x smaller sort than 151,936, which
+            // is the whole point. Sized with headroom above the measurement.
+            cand_cap = 65536;
+            topk_ready =
+                   cudaMalloc(&d_hist, sizeof(uint32_t)*(size_t)S*TOPK_HIST_BINS) == cudaSuccess
+                && cudaMalloc(&d_cut,  sizeof(uint32_t)*S) == cudaSuccess
+                && cudaMalloc(&d_cnt,  sizeof(int)*S) == cudaSuccess
+                && cudaMalloc(&d_ovf,  sizeof(int)*S) == cudaSuccess
+                && cudaMalloc(&d_cand, sizeof(uint64_t)*(size_t)S*cand_cap) == cudaSuccess
+                && cudaMalloc(&d_cand_sorted, sizeof(uint64_t)*(size_t)S*cand_cap) == cudaSuccess
+                && cudaMalloc(&d_kbeg, sizeof(int)*S) == cudaSuccess
+                && cudaMalloc(&d_kend, sizeof(int)*S) == cudaSuccess;
+            if (!topk_ready) cudaGetLastError();   // optional path; full sort still works
+        }
         if (ok) {
             size_t b1 = 0, b2 = 0;
             cub::DeviceSegmentedRadixSort::SortKeys(nullptr, b1, d_keys_in, d_keys_out,
@@ -540,8 +760,13 @@ struct BatchScratch {
     }
     void release() {
         for (void* p : {(void*)d_vals,(void*)d_wire,(void*)d_keys_in,(void*)d_keys_out,(void*)d_idx,
-                        (void*)d_sorted,(void*)d_heads,(void*)d_stats,(void*)d_probes,(void*)d_offs,(void*)d_temp})
+                        (void*)d_sorted,(void*)d_heads,(void*)d_stats,(void*)d_probes,(void*)d_offs,(void*)d_temp,
+                        (void*)d_hist,(void*)d_cut,(void*)d_cnt,(void*)d_ovf,(void*)d_cand,
+                        (void*)d_cand_sorted,(void*)d_kbeg,(void*)d_kend})
             if (p) cudaFree(p);
+        d_hist=nullptr; d_cut=nullptr; d_cnt=nullptr; d_ovf=nullptr;
+        d_cand=nullptr; d_cand_sorted=nullptr; d_kbeg=nullptr; d_kend=nullptr;
+        cand_cap=0; topk_ready=false;
         d_vals=nullptr; d_wire=nullptr; d_keys_in=nullptr; d_keys_out=nullptr; d_idx=nullptr;
         d_sorted=nullptr; d_heads=nullptr; d_stats=nullptr; d_probes=nullptr; d_offs=nullptr; d_temp=nullptr;
         temp_bytes=0; cap_total=0; cap_seg=0;
@@ -581,8 +806,8 @@ extern "C" bool pow_gpu_sort_and_stats_batched(
     if (cudaMemcpy2DAsync(b.d_heads, sizeof(float), b.d_sorted, sizeof(float)*(size_t)n,
                           sizeof(float), S, cudaMemcpyDeviceToDevice, b.stream) != cudaSuccess)
         return false;
-    if (cudaMemsetAsync(b.d_stats, 0, sizeof(double)*6*S, b.stream) != cudaSuccess) return false;
-    dim3 grid(64, S);
+    if (!meow_stats_1blk() && cudaMemsetAsync(b.d_stats, 0, sizeof(double)*6*S, b.stream) != cudaSuccess) return false;
+    dim3 grid(meow_stats_1blk() ? 1 : 64, S);
     k_stats_seg<<<grid, 256, 0, b.stream>>>(b.d_sorted, n, inv_temp, b.d_heads, b.d_stats);
     bool ok = cudaMemcpyAsync(h_idx, b.d_idx, sizeof(uint32_t)*total, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
            // Sorted VALUES ride back too: filling pretemp_desc_ from these is
@@ -684,17 +909,55 @@ extern "C" bool pow_gpu_sort_and_stats_device_k(
     auto& b = g_batch;
     const int total = S * n;
     const int T = 256, G = (total + T - 1) / T;
+    // CEILING PROBE (MEOW_SAMPLER_STUB=1): skip ALL sampler GPU work and return
+    // structurally-valid garbage. Shares are invalid by construction — this is
+    // ONLY for measuring the upper bound of any sampler optimisation. If the
+    // step rate does not rise with the sampler removed entirely, then the
+    // sampler is fully hidden behind decode and NO amount of sort/stats work
+    // will ever help, which closes that line of investigation for good.
+    // Never enable on a real pool.
+    static const bool stub = [](){ const char* e = std::getenv("MEOW_SAMPLER_STUB"); return e && *e == '1'; }();
+    if (stub) {
+        for (int sg = 0; sg < S; ++sg) {
+            for (int r = 0; r < topk; ++r) {
+                h_idx[(size_t)sg*topk + r] = (uint32_t)r;
+                h_val[(size_t)sg*topk + r] = 100.0f - (float)r * 0.01f;
+            }
+            h_head[sg] = 100.0f;
+            for (int j = 0; j < 6; ++j) h_stats[(size_t)sg*6 + j] = 1.0;
+            for (int j = 0; j < 20; ++j) h_probes[(size_t)sg*20 + j] = 0.0f;
+        }
+        return true;
+    }
+
+    // Per-stage GPU timers for the path that ACTUALLY runs. The existing
+    // [evprof] probes are in the host-logits function; device-logits mode uses
+    // this one, so the sampler's internal breakdown was never visible — which
+    // is why five optimisation attempts had to guess at which stage dominates.
+    // POW_GPU_EVPROF=1 enables; costs two event records per stage otherwise.
+    static thread_local cudaEvent_t dev[8] = {};
+    static thread_local bool dev_ready = false;
+    const bool dprof = [](){ const char* e = std::getenv("POW_GPU_EVPROF"); return e && *e == '1'; }();
+    if (dprof && !dev_ready) { for (auto& e : dev) cudaEventCreate(&e); dev_ready = true; }
+    #define DEVR(i) if (dprof) cudaEventRecord(dev[i], b.stream)
+    DEVR(0);
     k_pack_flat_snap<<<G, T, 0, b.stream>>>(d_logits, b.d_keys_in, n, total);
+    DEVR(1);
     cub::DeviceRadixSort::SortKeys(b.d_temp, b.temp_bytes, b.d_keys_in, b.d_keys_out,
                                    total, 0, 56, b.stream);
+    DEVR(2);
     k_unpack_flat_snap<<<G, T, 0, b.stream>>>(b.d_keys_out, d_logits, b.d_idx, b.d_sorted, n, total);
+    DEVR(3);
     if (cudaMemcpy2DAsync(b.d_heads, sizeof(float), b.d_sorted, sizeof(float)*(size_t)n,
                           sizeof(float), S, cudaMemcpyDeviceToDevice, b.stream) != cudaSuccess)
         return false;
-    if (cudaMemsetAsync(b.d_stats, 0, sizeof(double)*6*S, b.stream) != cudaSuccess) return false;
-    dim3 grid(64, S);
+    if (!meow_stats_1blk() && cudaMemsetAsync(b.d_stats, 0, sizeof(double)*6*S, b.stream) != cudaSuccess) return false;
+    dim3 grid(meow_stats_1blk() ? 1 : 64, S);
+    DEVR(4);
     k_stats_seg<<<grid, 256, 0, b.stream>>>(b.d_sorted, n, inv_temp, b.d_heads, b.d_stats);
+    DEVR(5);
     k_probes_snap<<<(S*20 + 63)/64, 64, 0, b.stream>>>(d_logits, S, n, b.d_probes);
+    DEVR(6);
     bool ok = cudaMemcpy2DAsync(h_idx, sizeof(uint32_t)*topk, b.d_idx, sizeof(uint32_t)*(size_t)n,
                                 sizeof(uint32_t)*topk, S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
            && cudaMemcpy2DAsync(h_val, sizeof(float)*topk, b.d_sorted, sizeof(float)*(size_t)n,
@@ -702,7 +965,20 @@ extern "C" bool pow_gpu_sort_and_stats_device_k(
            && cudaMemcpyAsync(h_head, b.d_heads, sizeof(float)*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
            && cudaMemcpyAsync(h_stats, b.d_stats, sizeof(double)*6*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
            && cudaMemcpyAsync(h_probes, b.d_probes, sizeof(float)*20*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess;
+    if (dprof) cudaEventRecord(dev[7], b.stream);
     ok = ok && cudaStreamSynchronize(b.stream) == cudaSuccess;
+    if (dprof && ok) {
+        static thread_local uint64_t dn = 0; static thread_local float da[7] = {};
+        float dt = 0;
+        for (int i = 0; i < 7; ++i) { cudaEventElapsedTime(&dt, dev[i], dev[i+1]); da[i] += dt; }
+        if (++dn % 256 == 0) {
+            std::fprintf(stderr,
+                "[devprof] pack=%.3f sort=%.3f unpack=%.3f heads+memset=%.3f "
+                "stats=%.3f probes=%.3f d2h=%.3f ms/step\n",
+                da[0]/dn, da[1]/dn, da[2]/dn, da[3]/dn, da[4]/dn, da[5]/dn, da[6]/dn);
+            std::fflush(stderr);
+        }
+    }
     const cudaError_t ce = cudaGetLastError();
     if (!ok || ce != cudaSuccess) {
         // The device path has no host fallback (llama's D2H is skipped), so
@@ -927,6 +1203,75 @@ extern "C" bool pow_gpu_sort_and_stats_batched_k(
     const int T = 256, G = (total + T - 1) / T;
     if (snap_bf16) k_snap_bf16<<<G, T, 0, b.stream>>>(b.d_vals, total);
     EVR(1);
+
+    // ---- top-K radix select (opt-in) -------------------------------------
+    // Sorts ~4k candidates instead of 151,936 per stream. Falls through to the
+    // full sort on ANY doubt: not enabled, no scratch, or a segment whose
+    // candidate set overflowed cand_cap.
+    static const bool topk_select = [](){
+        const char* e = std::getenv("MEOW_TOPK_SELECT");
+        return e && *e == '1';
+    }();
+    bool selected = false;
+    if (topk_select && b.topk_ready && topk > 0 && topk <= b.cand_cap && n > 4 * b.cand_cap) {
+        k_pack_seg<<<G, T, 0, b.stream>>>(b.d_vals, b.d_keys_in, n, total);
+        cudaMemsetAsync(b.d_hist, 0, sizeof(uint32_t)*(size_t)S*TOPK_HIST_BINS, b.stream);
+        cudaMemsetAsync(b.d_cnt,  0, sizeof(int)*S, b.stream);
+        dim3 hg(64, S);
+        k_topk_hist<<<hg, 256, 0, b.stream>>>(
+            b.d_keys_in, n, total, b.d_hist);
+        k_topk_cutoff<<<S, 32, 0, b.stream>>>(b.d_hist, topk, b.cand_cap, b.d_cut, b.d_ovf);
+        k_topk_compact<<<hg, 256, 0, b.stream>>>(b.d_keys_in, n, b.cand_cap, b.d_cut,
+                                                 b.d_cand, b.d_cnt);
+        k_topk_offsets<<<(S + 63) / 64, 64, 0, b.stream>>>(b.d_cnt, S, b.cand_cap,
+                                                           b.d_kbeg, b.d_kend);
+        // One tiny D2H: did any segment overflow? Cheaper than being wrong.
+        static thread_local int* h_ovf = nullptr;
+        static thread_local int  h_ovf_cap = 0;
+        if (h_ovf_cap < S) {
+            if (h_ovf) cudaFreeHost(h_ovf);
+            h_ovf = nullptr; h_ovf_cap = 0;
+            if (cudaMallocHost(&h_ovf, sizeof(int)*S) == cudaSuccess) h_ovf_cap = S;
+            else cudaGetLastError();
+        }
+        bool overflowed = true;
+        if (h_ovf_cap >= S &&
+            cudaMemcpyAsync(h_ovf, b.d_ovf, sizeof(int)*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess &&
+            cudaStreamSynchronize(b.stream) == cudaSuccess) {
+            overflowed = false;
+            for (int i = 0; i < S; ++i) if (h_ovf[i]) { overflowed = true; break; }
+        }
+        if (!overflowed) {
+            size_t tb = b.temp_bytes;
+            if (cub::DeviceSegmentedRadixSort::SortKeys(
+                    b.d_temp, tb, b.d_cand, b.d_cand_sorted,
+                    S * b.cand_cap, S, b.d_kbeg, b.d_kend, 0, 56, b.stream) == cudaSuccess) {
+                dim3 ug((topk + 255) / 256, S);
+                k_topk_unpack<<<ug, 256, 0, b.stream>>>(b.d_cand_sorted, b.cand_cap, topk,
+                                                        b.d_vals, n, b.d_idx, b.d_sorted);
+                // head = rank-0 value of each segment, now at stride topk
+                cudaMemcpy2DAsync(b.d_heads, sizeof(float), b.d_sorted, sizeof(float)*(size_t)topk,
+                                  sizeof(float), S, cudaMemcpyDeviceToDevice, b.stream);
+                if (!meow_stats_1blk()) cudaMemsetAsync(b.d_stats, 0, sizeof(double)*6*S, b.stream);
+                dim3 sg(meow_stats_1blk() ? 1 : 64, S);
+                k_stats_topk<<<sg, 256, 0, b.stream>>>(b.d_sorted, topk, b.d_vals, n,
+                                                       inv_temp, b.d_heads, b.d_stats);
+                selected = true;
+            }
+        }
+        if (!selected) {
+            static std::atomic<bool> once{false};
+            if (!once.exchange(true)) {
+                int worst = 0;
+                if (h_ovf_cap >= S) for (int i = 0; i < S; ++i) if (h_ovf[i] > worst) worst = h_ovf[i];
+                std::fprintf(stderr,
+                    "[pow_gpu] top-K select fell back: ready=%d topk=%d cap=%d n=%d "
+                    "worst_candidates=%d (0 => not an overflow)\n",
+                    (int)b.topk_ready, topk, b.cand_cap, n, worst);
+            }
+        }
+    }
+    if (!selected)
     if (S <= 64 && n <= (1 << 18)) {
         // Flat combined-key sort: one radix pass over all S*n keys.
         k_pack_flat<<<G, T, 0, b.stream>>>(b.d_vals, b.d_keys_in, n, total);
@@ -942,19 +1287,24 @@ extern "C" bool pow_gpu_sort_and_stats_batched_k(
                                                 total, S, b.d_offs, b.d_offs + 1, 0, 64, b.stream);
         k_unpack_seg<<<G, T, 0, b.stream>>>(b.d_keys_out, b.d_vals, b.d_idx, b.d_sorted, n, total);
     }
-    if (cudaMemcpy2DAsync(b.d_heads, sizeof(float), b.d_sorted, sizeof(float)*(size_t)n,
-                          sizeof(float), S, cudaMemcpyDeviceToDevice, b.stream) != cudaSuccess)
-        return false;
-    if (cudaMemsetAsync(b.d_stats, 0, sizeof(double)*6*S, b.stream) != cudaSuccess) return false;
-    dim3 grid(64, S);
-    EVR(5);
-    k_stats_seg<<<grid, 256, 0, b.stream>>>(b.d_sorted, n, inv_temp, b.d_heads, b.d_stats);
-    EVR(6);
-    // Top-`topk` of each stream only: src stride n, dst stride topk, height S.
+    // The select path already produced heads/stats and packs at stride topk;
+    // the full-sort path packs at stride n and needs them computed here.
+    if (!selected) {
+        if (cudaMemcpy2DAsync(b.d_heads, sizeof(float), b.d_sorted, sizeof(float)*(size_t)n,
+                              sizeof(float), S, cudaMemcpyDeviceToDevice, b.stream) != cudaSuccess)
+            return false;
+        if (!meow_stats_1blk() && cudaMemsetAsync(b.d_stats, 0, sizeof(double)*6*S, b.stream) != cudaSuccess) return false;
+        dim3 grid(meow_stats_1blk() ? 1 : 64, S);
+        EVR(5);
+        k_stats_seg<<<grid, 256, 0, b.stream>>>(b.d_sorted, n, inv_temp, b.d_heads, b.d_stats);
+        EVR(6);
+    }
+    const size_t src_stride = selected ? (size_t)topk : (size_t)n;
+    // Top-`topk` of each stream only: src stride src_stride, dst stride topk.
     const auto tB = std::chrono::steady_clock::now();
-    bool ok = cudaMemcpy2DAsync(h_idx, sizeof(uint32_t)*topk, b.d_idx, sizeof(uint32_t)*(size_t)n,
+    bool ok = cudaMemcpy2DAsync(h_idx, sizeof(uint32_t)*topk, b.d_idx, sizeof(uint32_t)*src_stride,
                                 sizeof(uint32_t)*topk, S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
-           && cudaMemcpy2DAsync(h_val, sizeof(float)*topk, b.d_sorted, sizeof(float)*(size_t)n,
+           && cudaMemcpy2DAsync(h_val, sizeof(float)*topk, b.d_sorted, sizeof(float)*src_stride,
                                 sizeof(float)*topk, S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
            && cudaMemcpyAsync(h_head, b.d_heads, sizeof(float)*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess
            && cudaMemcpyAsync(h_stats, b.d_stats, sizeof(double)*6*S, cudaMemcpyDeviceToHost, b.stream) == cudaSuccess;

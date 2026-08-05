@@ -761,7 +761,20 @@ bool SamplerPool::sample_step(const std::vector<const float*>& logits,
                               std::vector<int>& out_tokens) {
     {
         const int S = impl_->n_streams;
-        const int K = std::min(2048, n_vocab);   // CPU tail reads only top-k
+        // The CPU tail provably reads at most rank top_k-1 (=49) of the
+        // presorted prefix: the survivor scan is a strict-> prefix inside
+        // [0, kpos), and every deeper statistic arrives via gpu_stats_ (see
+        // pow_utils.cpp step 4/5). 2048 was legacy margin, and it is not
+        // free — it is a 2 MB D2H on the step's critical path (S x 2048 x
+        // 8 B) plus a 262k-entry host fill. 64 covers top_k=50 with margin.
+        // MEOW_SORT_K overrides for A/B or if a future chain param raises
+        // top_k; values below top_k+8 are clamped up defensively at use.
+        static const int k_env = [](){
+            const char* e = std::getenv("MEOW_SORT_K");
+            const int v = e ? std::atoi(e) : 64;
+            return v > 0 ? v : 64;
+        }();
+        const int K = std::min(k_env, n_vocab);
         impl_->sort_stride = K;
         if (!impl_->ensure_sort_bufs(S, K)) { impl_->sort_ok = false; return false; }
         // sort_ok now means "receive buffers ready"; the sort itself moved
