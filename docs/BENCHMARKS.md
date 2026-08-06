@@ -19,6 +19,7 @@ last column is the number that actually matters when you are renting.
 |---|---|---|---|---|---|
 | **RTX A6000** | 48 GB | `--slots 361 --groups 12` | 9.5 | **0.187** | **50.8** ★ |
 | **RTX PRO 6000 Blackwell** | 96 GB | `--slots 512 --groups 12` | 25.6 | 0.579 | **44.2** |
+| **L40S** | 48 GB | `--slots 403 --groups 12` | 15.3 | 0.599 | **25.5** |
 | **RTX 6000 Ada** | 48 GB | `--slots 403 --groups 12` | 12.5 | 0.319 | **39.2** |
 | **H100 80GB HBM3** | 80 GB | `--slots 512 --groups 12` | 40.5 | 0.996 | 40.7 |
 | **A100 80GB SXM** | 80 GB | `--slots 512 --groups 12` | 20.7 | 0.549 | 37.7 |

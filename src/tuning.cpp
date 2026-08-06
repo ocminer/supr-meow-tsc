@@ -125,18 +125,34 @@ TuningProfile tuning_for(int sm, size_t vram_bytes, size_t model_bytes) {
                  "512->20.8/20.7) so the card saturates early and slot count barely matters. "
                  "Power-limited: 413 W against a 400 W cap." };
 
-    // RTX 6000 Ada 48GB (sm_89). Same VRAM class as the A6000 but the curve is
-    // FLAT rather than rising — 320 -> 12.4, 403 -> 12.5/12.6 — so unlike the
-    // A6000 it is not gaining from slots at the top; it saturates by ~320.
-    // 403 is what the VRAM heuristic picks and it is fine, but it leaves only
-    // ~1.3 GB spare: MEOW_UBATCH=4096 OOMs at this slot count. Do not enable
-    // the CPU-tail tuning here — util is 92-98%, so there is nothing to
-    // reclaim (see docs/BENCHMARKS.md), and the larger ubatch does not fit.
+    // RTX 6000 Ada AND L40S, both 48GB sm_89. They CANNOT be told apart here:
+    // both report exactly 49140 MiB on the same compute capability, so there is
+    // no (sm, vram) split to make and one branch must serve both. That is fine —
+    // 403 slots is optimal on each — but the THROUGHPUT differs a lot and the
+    // name in the log line is therefore approximate. Do not "fix" that by
+    // guessing; it would need a device-name argument to tuning_for().
+    //
+    // RTX 6000 Ada: 12.5 w/s, curve FLAT (320 -> 12.4, 403 -> 12.5/12.6), so it
+    // saturates by ~320 and 403 only costs headroom.
+    //
+    // L40S: 15.3 w/s — 22% FASTER than the RTX 6000 Ada despite LOWER memory
+    // bandwidth (864 vs 960 GB/s), which is the same lesson as the CMP 170HX and
+    // the H200: this workload is not bandwidth-bound in this regime. The L40S's
+    // 350 W board power against the Ada's 300 W is the likelier cause. Measured
+    // 2026-08-06 on 8 cards, six at default plus two concurrent controls:
+    // 256 -> 14.5, 403 -> 15.3 (still climbing, NOT flat like the Ada),
+    // 512 -> OOM (needs a 36.9 GiB KV buffer; cudaMalloc fails). So 403 is both
+    // the optimum and effectively the ceiling here.
+    //
+    // Either way 403 leaves only ~1.3 GB spare, so MEOW_UBATCH=4096 OOMs, and the
+    // CPU-tail tuning is pointless at 79-94% util — nothing to reclaim.
     if (sm == 89 && vram_gb > 40.0)
-        return { "RTX 6000 Ada 48GB", 403, 12, false,
-                 "12.5 w/s at 403 slots (47.8 GB of 49.1 — only ~1.3 GB spare, and "
-                 "MEOW_UBATCH=4096 OOMs here). Curve is flat: 320->12.4, 403->12.5/12.6, so "
-                 "320 is equally good with 6 GB more headroom. Util 92-98%, sampler tail 20 ms." };
+        return { "RTX 6000 Ada / L40S 48GB", 403, 12, false,
+                 "RTX 6000 Ada 12.5 w/s at 403 slots, curve flat (320->12.4, 403->12.5/12.6). "
+                 "L40S 15.3 w/s at the same 403 (256->14.5, 403->15.3 still climbing, 512 OOMs "
+                 "on a 36.9 GiB KV alloc) — 22% faster than the Ada on LESS bandwidth, so not "
+                 "bandwidth-bound. Same 49140 MiB and sm_89 on both: indistinguishable here. "
+                 "403 leaves ~1.3 GB spare, MEOW_UBATCH=4096 OOMs." };
 
     // RTX A6000 48GB (sm_86, also A40). The cheapest card tested and the best
     // value of any of them. Unlike the big cards this one is VRAM-bound, and

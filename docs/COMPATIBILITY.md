@@ -110,6 +110,7 @@ benchmark. Full curves and the reasoning are in [BENCHMARKS.md](BENCHMARKS.md).
 | RTX PRO 6000 Blackwell | 96 GB | 25.6 |
 | A100 | 80 GB | 20.7 |
 | RTX 5090 | 32 GB | ~18.6 |
+| L40S | 48 GB | 15.3 |
 | RTX 6000 Ada | 48 GB | 12.5 |
 | RTX A6000 / A40 | 48 GB | 9.5 |
 | 2 × RTX 5080 (split) | 2 × 16 GB | 7.5 |
