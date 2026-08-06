@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <utility>
 #include <stdexcept>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
@@ -521,6 +522,47 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
                 }
             }
             if (share->achieved_hex.empty()) { zmq_msg_close(&msg); return static_cast<int>(r.token_id); }
+
+            // ---- v3 B_cred gate: never submit a share that cannot be a block --
+            // Consensus (TIP-0003) credits each of the 256 steps with
+            // ~-log2(interval mass of the sampled token) and requires
+            // B_cred >= B_FREE (70 bits) for a share to count; below B_FLOOR
+            // (45 bits) it is invalid outright. We do not claim an admission
+            // nonce (POW_V3_ADMISSION_MODE is deliberately "off" above), so the
+            // [45,70) band is worthless to us too — the bar is 70.
+            //
+            // SOUNDNESS: sum(-log2 p(chosen)) is an UPPER BOUND on the credit
+            // consensus computes, because ATOL widens the interval mass and a
+            // larger mass earns LESS credit. So estimate < 70 implies actual
+            // < 70, and dropping here can never discard a share that would have
+            // been accepted. The converse is not true, which is why this only
+            // ever drops — it never vouches for a share.
+            //
+            // Why it matters: the pool measured 6.09% of shares below the floor
+            // on 2026-08-06. Those cost bandwidth and pool CPU and earn nothing,
+            // and a sub-floor proof is dead even when it MEETS the difficulty
+            // target — a real block was lost that way.
+            {
+                const auto* mrp = flatbuffers::GetRoot<proof::MiningResponse>(data);
+                const auto* pf  = mrp ? mrp->pow_blob() : nullptr;
+                const auto* cp  = pf ? pf->chosen_probs() : nullptr;
+                if (cp && cp->size() > 0) {
+                    double bits = 0.0;
+                    for (flatbuffers::uoffset_t i = 0; i < cp->size(); ++i) {
+                        const float p = cp->Get(i);
+                        // p<=0 would be an infinite-surprisal step; treat it as
+                        // the 32-bit per-step cap consensus applies rather than
+                        // letting inf sail through the comparison.
+                        bits += (p > 0.0f && p <= 1.0f) ? -std::log2(static_cast<double>(p)) : 32.0;
+                    }
+                    last_bcred_bits_.store(bits);
+                    if (bits < 70.0) {
+                        dropped_lowcred_.fetch_add(1);
+                        zmq_msg_close(&msg);
+                        return static_cast<int>(r.token_id);   // silently not submitted
+                    }
+                }
+            }
             {
                 std::lock_guard<std::mutex> lk(impl_->mtx);
                 impl_->pending_q.push_back(std::move(share));

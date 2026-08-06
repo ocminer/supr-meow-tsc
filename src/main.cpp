@@ -40,7 +40,7 @@ extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 
 namespace {
 
-const char* kVersion = "0.3.6";
+const char* kVersion = "0.3.7";
 
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop = true; }
@@ -1014,11 +1014,25 @@ int main(int argc, char** argv) {
                 // a factual "explain X" request is highly confident — low
                 // entropy, guard fires. Style 1 asks for open-ended invention,
                 // where many continuations are equally plausible.
-                //   0 = legacy factual (testnet default; 3.9% RED on 8B)
-                //   1 = open-ended creative
+                //   0 = legacy factual  — DO NOT USE ON MAINNET, see below
+                //   1 = open-ended creative (DEFAULT)
+                //
+                // Default flipped to 1 on 2026-08-06. Style 0 was costing real
+                // money: the pool measured 6.09% of shares BELOW B_FLOOR and
+                // rejected outright, plus 1.53% stuck in the admission band and
+                // a stream of entropy_score_failure — all one bug, low
+                // transcript entropy. B_cred is the summed surprisal of the
+                // 256 sampled tokens (~= sum of -log2 p(chosen)); consensus
+                // needs >=70 bits, healthy shares run ~1.18 bits/step, and the
+                // failures came in as low as 0.013 bits/step. An 8B model
+                // answering "Explain distributed consensus in detail" is
+                // simply too confident to earn credit, exactly as the comment
+                // above always said — the default just never followed it.
+                // A share below the floor cannot become a block even when it
+                // meets the difficulty target, so this was pure waste.
                 static const int prompt_style = [](){
                     const char* e = std::getenv("POW_PROMPT_STYLE");
-                    return e ? std::atoi(e) : 0;
+                    return e ? std::atoi(e) : 1;
                 }();
                 auto make_prompts = [&](const char* tag) {
                     std::vector<std::string> prompts;

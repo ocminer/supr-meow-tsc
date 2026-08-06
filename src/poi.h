@@ -9,6 +9,7 @@
 // =============================================================================
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -101,6 +102,15 @@ private:
     int         n_streams_ = 1;
     int         window_tokens_ = 256;
     uint64_t    nonce_seq_ = 0;     // pool dedup key, one per emitted share      // to detect the start of a new window
+
+public:
+    // v3 B_cred gate telemetry. `dropped_lowcred_` counts shares withheld
+    // because their summed surprisal could not reach B_FREE (70 bits) — those
+    // are proofs consensus would reject, so withholding them costs nothing and
+    // keeps the pool reject rate honest. `last_bcred_bits_` is the most recent
+    // estimate, for the status line: healthy transcripts run ~300 bits.
+    std::atomic<uint64_t> dropped_lowcred_{0};
+    std::atomic<double>   last_bcred_bits_{0.0};
 };
 
 // A pool of PoiMiner coordinators that samples one decode step for ALL streams
