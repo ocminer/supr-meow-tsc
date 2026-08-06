@@ -111,9 +111,15 @@ start_sshd() {
 # Degrades to a single stream whenever anything is unclear — no Content-Length,
 # no Accept-Ranges, a failed part. A slow download is an annoyance; a wrong one
 # is a rig mining garbage, and MODEL_SHA256 is checked either way.
-fetch_model() {   # <url> <destination>
-  local url="$1" out="$2" jobs="${MODEL_DL_JOBS:-8}"
-  local hdr size ranges
+fetch_model() {   # <url> <destination> [mirror]
+  # Ranges are split across BOTH sources CONCURRENTLY, not primary-then-fallback.
+  # Measured 2026-08-06: Hugging Face opens at ~21 MB/s and decays to 0.6-5 MB/s
+  # under sustained parallel load (per-source throttling), while the suprnova
+  # mirror holds ~6.8 MB/s flat. Pulling from both at once adds their bandwidth
+  # instead of queueing behind the slower one. On churn-heavy spot instances the
+  # 16.4 GB fetch is pure unpaid setup time, so this is the highest-value knob.
+  local url="$1" out="$2" mirror="${3:-}" jobs="${MODEL_DL_JOBS:-8}"
+  local size=""
 
   single_stream() {
     echo "[entrypoint] downloading model (single stream): $1"
@@ -122,16 +128,45 @@ fetch_model() {   # <url> <destination>
     mv "$2.part" "$2"
   }
 
-  hdr=$(curl -fsSLI --retry 2 --max-time 60 "$url" 2>/dev/null) || { single_stream "$url" "$out"; return $?; }
-  size=$(printf '%s' "$hdr"   | tr -d '\r' | awk 'tolower($1)=="content-length:"{v=$2} END{print v}')
-  ranges=$(printf '%s' "$hdr" | tr -d '\r' | awk 'tolower($1)=="accept-ranges:"{v=tolower($2)} END{print v}')
+  # Probe EVERY source independently. A single failed HEAD must not cost the
+  # 8-way path: measured 2026-08-06, one flaky HEAD dropped the fetch to a
+  # single ~1 MB/s stream — a 4.5 HOUR download for a file the ranged path
+  # pulls in minutes. On a spot box that churns in ~20 minutes that is the
+  # difference between earning and never starting. So the size may come from
+  # whichever source answers; they are cross-checked below.
+  probe_size() {   # <url> -> "<size> <ranges>" on stdout, empty on failure
+    local h
+    h=$(curl -fsSLI --retry 3 --retry-delay 2 --max-time 45 "$1" 2>/dev/null) || return 1
+    printf '%s %s' \
+      "$(printf '%s' "$h" | tr -d '\r' | awk 'tolower($1)=="content-length:"{v=$2} END{print v}')" \
+      "$(printf '%s' "$h" | tr -d '\r' | awk 'tolower($1)=="accept-ranges:"{v=tolower($2)} END{print v}')"
+  }
 
-  if [[ -z "$size" || ! "$size" =~ ^[0-9]+$ || "$size" -lt 1048576 || "$ranges" != "bytes" || "$jobs" -lt 2 ]]; then
-    echo "[entrypoint] server does not advertise byte ranges — falling back"
+  local -a srcs=() cand=("$url"); [[ -n "$mirror" ]] && cand+=("$mirror")
+  local u psize pranges
+  for u in "${cand[@]}"; do
+    read -r psize pranges <<<"$(probe_size "$u")"
+    [[ -z "$psize" || ! "$psize" =~ ^[0-9]+$ || "$psize" -lt 1048576 || "$pranges" != "bytes" ]] && {
+      echo "[entrypoint] no usable byte-range support from $u"; continue; }
+    if [[ -z "$size" ]]; then
+      size="$psize"; srcs+=("$u")
+    elif [[ "$psize" == "$size" ]]; then
+      # Identical length is the ONLY admission test. Splicing ranges from two
+      # different builds yields a file corrupt in a way nothing but the final
+      # sha256 would catch, after the whole download has been paid for.
+      srcs+=("$u")
+    else
+      echo "[entrypoint] size mismatch from $u ($psize vs $size) — excluded"
+    fi
+  done
+
+  if (( ${#srcs[@]} == 0 )) || (( jobs < 2 )); then
+    echo "[entrypoint] no ranged source available — falling back to a single stream"
     single_stream "$url" "$out"; return $?
   fi
+  (( ${#srcs[@]} > 1 )) && echo "[entrypoint] ${#srcs[@]} sources agree on size — fetching in parallel"
 
-  echo "[entrypoint] downloading model: $((size/1048576)) MiB over $jobs ranges"
+  echo "[entrypoint] downloading model: $((size/1048576)) MiB over $jobs ranges from ${#srcs[@]} source(s)"
   rm -f "$out.part"
   fallocate -l "$size" "$out.part" 2>/dev/null || truncate -s "$size" "$out.part" || { single_stream "$url" "$out"; return $?; }
 
@@ -140,18 +175,32 @@ fetch_model() {   # <url> <destination>
   for (( i=0; i<jobs; i++ )); do
     lo=$(( i * chunk )); hi=$(( lo + chunk - 1 ))
     (( hi >= size )) && hi=$(( size - 1 ))
-    # -L is MANDATORY here: Hugging Face resolve/ URLs answer 302 to the CDN,
-    # and `-f` does NOT treat 302 as an error — without -L every range
-    # "succeeds" instantly with a ~1 KB redirect body and the file stays
-    # zeros. The size check below catches it and falls back, but that turns
-    # the fast path into a silent no-op for exactly the URLs it exists for.
-    ( curl -fsSL --retry 5 --retry-delay 3 --max-time 3600 -r "${lo}-${hi}" "$url" \
-        | dd of="$out.part" bs=4M seek="$lo" oflag=seek_bytes conv=notrunc status=none ) &
+    # Alternate ranges across sources so both links are saturated at once.
+    local pri="${srcs[i % ${#srcs[@]}]}" alt=""
+    (( ${#srcs[@]} > 1 )) && alt="${srcs[(i + 1) % ${#srcs[@]}]}"
+    (
+      # pipefail is REQUIRED: without it the subshell reports dd's status, and
+      # dd happily "succeeds" on curl's empty output. The old size check could
+      # never catch that either, because .part is pre-allocated to the full
+      # length — so a dead range slipped through to the sha256 and killed the
+      # whole fetch. With pipefail a failed range is seen here and retried on
+      # the OTHER source, which is exactly what a second source is for.
+      set -o pipefail
+      # -L is MANDATORY: Hugging Face resolve/ URLs answer 302 to the CDN, and
+      # -f does NOT treat 302 as an error — without -L every range "succeeds"
+      # instantly with a ~1 KB redirect body and the file stays zeros.
+      curl -fsSL --retry 3 --retry-delay 3 --max-time 3600 -r "${lo}-${hi}" "$pri" \
+        | dd of="$out.part" bs=4M seek="$lo" oflag=seek_bytes conv=notrunc status=none && exit 0
+      [[ -n "$alt" ]] || exit 1
+      echo "[entrypoint] range ${lo}-${hi} failed on primary — retrying on mirror" >&2
+      curl -fsSL --retry 3 --retry-delay 3 --max-time 3600 -r "${lo}-${hi}" "$alt" \
+        | dd of="$out.part" bs=4M seek="$lo" oflag=seek_bytes conv=notrunc status=none
+    ) &
     pids+=("$!")
   done
   for p in "${pids[@]}"; do wait "$p" || rc=1; done
 
-  if (( rc != 0 )) || [[ "$(stat -c %s "$out.part" 2>/dev/null)" != "$size" ]]; then
+  if (( rc != 0 )); then
     echo "[entrypoint] ranged fetch incomplete — falling back to a single stream"
     single_stream "$url" "$out"; return $?
   fi
@@ -187,9 +236,13 @@ if [[ -z "${MODEL_PATH:-}" ]]; then
     fname="$(basename "${MODEL_URL%%\?*}")"
     MODEL_PATH="$MODEL_DIR/$fname"
     if [[ ! -s "$MODEL_PATH" ]]; then
-      fetch_model "$MODEL_URL" "$MODEL_PATH" \
+      # MODEL_URL2 is passed IN so its ranges run concurrently with the
+      # primary's, not merely as a retry after the primary has already
+      # burned minutes failing. The whole-mirror retry stays as the last
+      # resort for the case where the primary is unusable outright.
+      fetch_model "$MODEL_URL" "$MODEL_PATH" "${MODEL_URL2:-}" \
         || { [[ -n "${MODEL_URL2:-}" ]] \
-               && echo "[entrypoint] primary failed — trying MODEL_URL2" \
+               && echo "[entrypoint] primary failed — trying MODEL_URL2 alone" \
                && fetch_model "$MODEL_URL2" "$MODEL_PATH"; } \
         || die "model download failed"
     else
