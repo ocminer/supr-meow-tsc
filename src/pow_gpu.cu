@@ -1520,6 +1520,16 @@ extern "C" void* pow_gpu_device_alloc(size_t bytes) {
     return p;
 }
 extern "C" void pow_gpu_device_free(void* p) { if (p) cudaFree(p); }
+// Debug helper: pull a device range to host so the device tensor's row order
+// can be compared against llama's (reordered) host buffer. Used to prove
+// whether the split device path reads the rows it thinks it does.
+extern "C" bool pow_gpu_copy_to_host(void* dst, const void* src, size_t bytes) {
+    static thread_local cudaStream_t s = nullptr;
+    if (!s && cudaStreamCreate(&s) != cudaSuccess) { cudaGetLastError(); return false; }
+    return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, s) == cudaSuccess
+        && cudaStreamSynchronize(s) == cudaSuccess;
+}
+
 extern "C" bool pow_gpu_d2d_copy_sync(void* dst, const void* src, size_t bytes) {
     static thread_local cudaStream_t s = nullptr;
     if (!s && cudaStreamCreate(&s) != cudaSuccess) { cudaGetLastError(); return false; }

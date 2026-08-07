@@ -785,6 +785,23 @@ struct SamplerPool::Impl {
                         sort_stats + (size_t)lo * 6);
             }
 #endif
+            // MEOW_DUMP_SORT=<file>: append this group's sorted top-K values and
+            // the 6 per-step stats for stream 0. Logits are proven identical
+            // single-vs-split, so if these differ the miscomputation is in the
+            // sampler's sort/stats, which is the last unmeasured link before the
+            // proof. Only group 0 (lo==0) writes, first window only.
+            if (gsort && lo == 0) {
+                static const char* ds = std::getenv("MEOW_DUMP_SORT");
+                static std::atomic<int> nrec{0};
+                if (ds && *ds && nrec.load() < 2048) {
+                    nrec.fetch_add(1);
+                    if (FILE* sf = std::fopen(ds, "ab")) {
+                        std::fwrite(sort_val, sizeof(float), (size_t)K, sf);
+                        std::fwrite(sort_stats, sizeof(double), 6, sf);
+                        std::fclose(sf);
+                    }
+                }
+            }
             if (dev && !gsort) {
                 // No host fallback exists in device mode — the host logits are
                 // stale. Fail the step (aborts the window batch) rather than

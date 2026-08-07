@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,11 +17,13 @@ extern "C" bool pow_gpu_is_device_ptr(const void* p);
 extern "C" void* pow_gpu_device_alloc(size_t bytes);
 extern "C" void  pow_gpu_device_free(void* p);
 extern "C" bool  pow_gpu_d2d_copy_sync(void* dst, const void* src, size_t bytes);
+extern "C" bool  pow_gpu_copy_to_host(void* dst, const void* src, size_t bytes);
 #else
 static inline bool pow_gpu_is_device_ptr(const void*) { return false; }
 static inline void* pow_gpu_device_alloc(size_t) { return nullptr; }
 static inline void  pow_gpu_device_free(void*) {}
 static inline bool  pow_gpu_d2d_copy_sync(void*, const void*, size_t) { return false; }
+static inline bool  pow_gpu_copy_to_host(void*, const void*, size_t) { return false; }
 #endif
 
 namespace meow {
@@ -494,9 +497,54 @@ int InferenceEngine::generate_windows_stepwise_tok(int device_slot,
         // single-vs-split forward pass can be diffed at the source, before any
         // top-k or sampling. Step 0 always uses the host path above, both modes.
         {
+            // MEOW_DEBUG_ROWMAP: does device row r hold stream r's logits?
+            // Run with POW_GPU_DEVICE_LOGITS=0 so llama's host copy stays live,
+            // then pull device rows and find which host stream each matches.
+            // If row r matches stream != r, the device path is reading permuted
+            // rows (llama reorders the HOST buffer via output_swaps; the device
+            // tensor is never reordered) — valid numbers, wrong stream.
+            if (step_i == 1 && all_logits[0] && std::getenv("MEOW_DEBUG_ROWMAP")) {
+                int32_t nd = 0;
+                void* dp = llama_get_logits_device(in.ctx, &nd);
+                if (dp && nd == S) {
+                    std::vector<float> buf((size_t)n_vocab);
+                    const int probe = S < 6 ? S : 6;
+                    for (int r = 0; r < probe; ++r) {
+                        if (!pow_gpu_copy_to_host(buf.data(),
+                                (const float*)dp + (size_t)r * n_vocab,
+                                (size_t)n_vocab * sizeof(float))) break;
+                        int best = -1; double bestd = 1e30;
+                        for (int s2 = 0; s2 < S; ++s2) {
+                            double d = 0;
+                            for (int v = 0; v < n_vocab; v += 101) d += std::fabs(buf[v] - all_logits[s2][v]);
+                            if (d < bestd) { bestd = d; best = s2; }
+                        }
+                        std::fprintf(stderr, "[rowmap] device row %d -> host stream %d (dist %.5f)%s\n",
+                                     r, best, bestd, (best == r ? "" : "   *** MISMATCH ***"));
+                    }
+                } else {
+                    std::fprintf(stderr, "[rowmap] no device pointer (nd=%d S=%d)\n", nd, S);
+                }
+            }
             static const char* dump_all = std::getenv("MEOW_DUMP_ALL_LOGITS");
+            static const int dump_steps = [](){ const char* e=std::getenv("MEOW_DUMP_STEPS"); return e?std::atoi(e):32; }();
             static std::atomic<int> dump_win{0};
-            if (dump_all && *dump_all && all_logits[0] && step_i < 32 && dump_win.load() == 0) {
+            // MEOW_DUMP_STREAMS=N: dump the first N streams per step, not just
+            // stream 0. My earlier single-vs-split proof only covered stream 0,
+            // which cannot detect corruption confined to other streams.
+            static const int dump_streams = [](){ const char* e=std::getenv("MEOW_DUMP_STREAMS"); return e?std::atoi(e):1; }();
+            if (dump_all && *dump_all && all_logits[0] && step_i < dump_steps && dump_win.load() == 0
+                && dump_streams > 1) {
+                FILE* rf = std::fopen(dump_all, "ab");
+                if (rf) {
+                    for (int s2 = 0; s2 < dump_streams && s2 < S; ++s2)
+                        if (all_logits[s2]) std::fwrite(all_logits[s2], sizeof(float), (size_t)n_vocab, rf);
+                    std::fclose(rf);
+                }
+                if (step_i == dump_steps-1) { dump_win.fetch_add(1);
+                    std::fprintf(stderr, "[dbg] dumped %d steps x %d streams to %s\n", dump_steps, dump_streams, dump_all); }
+            }
+            else if (dump_all && *dump_all && all_logits[0] && step_i < dump_steps && dump_win.load() == 0) {
                 // Append stream-0 full-vocab logits for steps 0..31 of the FIRST
                 // window to one file. Combined with MEOW_FORCE_GREEDY (stream 0
                 // forced to argmax) this keeps single and split in lockstep, so
@@ -504,8 +552,8 @@ int InferenceEngine::generate_windows_stepwise_tok(int device_slot,
                 // no noisy proxy.
                 FILE* rf = std::fopen(dump_all, "ab");
                 if (rf) { std::fwrite(all_logits[0], sizeof(float), (size_t)n_vocab, rf); std::fclose(rf); }
-                if (step_i == 31) { dump_win.fetch_add(1);
-                    std::fprintf(stderr, "[dbg] dumped 32 steps of stream0 logits to %s\n", dump_all); }
+                if (step_i == dump_steps-1) { dump_win.fetch_add(1);
+                    std::fprintf(stderr, "[dbg] dumped %d steps of stream0 logits to %s\n", dump_steps, dump_all); }
             }
         }
         const auto t0 = std::chrono::steady_clock::now();
@@ -522,10 +570,18 @@ int InferenceEngine::generate_windows_stepwise_tok(int device_slot,
         // used with MEOW_DUMP_ALL_LOGITS to compare forward passes step-by-step.
         {
             static const bool force_greedy = [](){ const char* e=std::getenv("MEOW_FORCE_GREEDY"); return e && e[0]=='1'; }();
-            if (force_greedy && all_logits[0]) {
-                int best = 0; float bv = all_logits[0][0];
-                for (int v = 1; v < n_vocab; ++v) if (all_logits[0][v] > bv) { bv = all_logits[0][v]; best = v; }
-                chosen[0] = best;
+            // Force greedy on EVERY stream, not just stream 0: with only stream 0
+            // pinned, all other streams sample randomly and diverge between two
+            // runs by construction, so a single-vs-split comparison of them is
+            // meaningless. Pinning all of them makes the whole batch
+            // deterministic, so any difference that remains is real.
+            if (force_greedy) {
+                for (int s2 = 0; s2 < S; ++s2) {
+                    if (!all_logits[s2]) continue;
+                    int best = 0; float bv = all_logits[s2][0];
+                    for (int v = 1; v < n_vocab; ++v) if (all_logits[s2][v] > bv) { bv = all_logits[s2][v]; best = v; }
+                    chosen[s2] = best;
+                }
             }
         }
         for (int s = 0; s < S; ++s) {
