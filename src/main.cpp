@@ -40,7 +40,7 @@ extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 
 namespace {
 
-const char* kVersion = "0.3.9";
+const char* kVersion = "0.4.0";
 
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop = true; }
@@ -236,6 +236,14 @@ bool parse_args(int argc, char** argv, Options& o) {
         // group ids), so an env var of that name is silently replaced by "0"
         // and `--groups ${GROUPS}` becomes `--groups 0`.
         else if (a == "--groups")          { if (!need_value(i, argc, "--groups")) return false; o.groups = std::atoi(argv[++i]); o.groups_set = o.groups > 0; }
+        // --split-model is REFUSED by default: it produces proofs that pass every
+        // share-level check at 0% reject and then FAIL the chain's model replay,
+        // so a share is credited and any block it wins is ORPHANED. That is not
+        // hypothetical — it cost block 21074. See the refusal message below and
+        // SPLIT-MODEL-BUG-HANDOFF.md. Root cause is NOT yet found; every
+        // miner-side quantity measured (logits, top-k, per-step stats) is
+        // identical to a healthy single-GPU run, yet the pool's GPU replay
+        // reliably reds split proofs and greens single ones.
         else if (a == "--split-model")     { o.split_model = true; }
         else if (a == "--split-rows")      { o.split_model = true; o.split_rows = true; }
         else if (a == "--egress-base")     { if (!need_value(i, argc, "--egress-base")) return false; o.egress_base = std::atoi(argv[++i]); }
@@ -734,6 +742,30 @@ int main(int argc, char** argv) {
         // code, so the miner would happily START on a 2080 Ti, look healthy,
         // and have every share rejected — which reads as a miner bug rather
         // than unusable hardware. Say so plainly instead, and name the card.
+        // --split-model is DISABLED. It produces model-invalid proofs: they pass
+        // every share-level check (0% reject) and then fail the chain's full
+        // model replay, so the share is credited and any block it wins is
+        // ORPHANED. Block 21074 was lost exactly this way. Refuse loudly rather
+        // than let a rig mine work that cannot become a block — a miner cannot
+        // detect this itself, which is what makes it dangerous.
+        if (o.split_model && !std::getenv("MEOW_ALLOW_BROKEN_SPLIT")) {
+            std::fprintf(stderr,
+                "\nerror: --split-model is disabled — it produces INVALID proofs.\n\n"
+                "  Shares from a split miner are accepted by the pool (0%% reject) but FAIL\n"
+                "  the chain's model replay, so any block they win is ORPHANED. This has\n"
+                "  already cost a real block. The cause is not yet found: the logits, top-k\n"
+                "  and per-step statistics are all bit-identical to a healthy single-GPU\n"
+                "  run, yet the chain's GPU replay rejects split proofs and accepts\n"
+                "  single-GPU ones.\n\n"
+                "  What to do instead:\n"
+                "    - Mine on cards that fit the model alone: 24 GB VRAM or more.\n"
+                "    - Run ONE miner process per GPU (that is the normal layout and is\n"
+                "      fully valid) rather than splitting one model across cards.\n\n"
+                "  Cards under 24 GB cannot currently mine TSC. Splitting them would only\n"
+                "  produce work that is thrown away.\n\n"
+                "  Details: https://github.com/ocminer/supr-meow-tsc — SPLIT-MODEL-BUG-HANDOFF\n\n");
+            return 2;
+        }
         {
             std::vector<const meow::DeviceInfo*> too_old;
             for (const auto& d : dm.devices())

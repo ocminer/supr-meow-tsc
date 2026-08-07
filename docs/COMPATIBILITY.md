@@ -61,7 +61,7 @@ Per GPU, to hold the model alone:
 | 32 GB+ | **yes** | comfortable; 5090 runs 128 slots |
 | 24 GB | **yes** | the practical minimum — 3090, 4090, A5000 |
 | 20 GB | marginal | fits, but very few slots and low throughput |
-| 16 GB | **no** | model + buffers do not fit — use `--split-model` |
+| 16 GB | **no** | model + buffers do not fit; splitting is disabled (see below) |
 | 8–12 GB | **no** | single card impossible — see splitting |
 
 **A note on the most common question:** an RTX 3070 / 3070 Ti (8 GB) or 3080
@@ -71,32 +71,24 @@ cards split together.
 
 ---
 
-## Splitting one model across several GPUs
+## Splitting one model across several GPUs — DISABLED
 
-`--split-model` spreads a single model over several cards and mines them as one
-worker. It **aggregates VRAM; it does not add throughput** — two cards are not
-twice as fast, they just let the model fit at all.
+**`--split-model` is disabled and the miner refuses to start with it.**
 
-```bash
-supr-meow-tsc -o stratum+tcp://pool:3310 -u <address> \
-              -d 0,1 --split-model --model Qwen3-8B-9c925d64-bf16.gguf
-```
+It produced proofs that were *accepted as shares* (0% reject) but **failed the
+chain's model replay**, so any block such a miner won was **orphaned**. That is
+not theoretical — it cost a real block. A split miner cannot detect this itself:
+its own logs look perfectly healthy, which is exactly what makes it dangerous.
 
-| configuration | total VRAM | works? |
-|---|---|---|
-| 2 × 16 GB (e.g. 2× RTX 5080) | 32 GB | **yes** — measured |
-| 4 × 8 GB (e.g. 4× RTX 3070) | 32 GB | **yes** |
-| 2 × 12 GB | 24 GB | yes, tight |
-| **2 × 8 GB** | **16 GB** | **no** — refuses to start, correctly |
+The cause is still under investigation. Everything measurable on the miner side —
+the logits, the top-k, the per-step statistics — is bit-identical to a healthy
+single-GPU run, yet the chain's GPU replay rejects split proofs and accepts
+single-GPU ones. Until that is understood, refusing is the only honest option.
 
-The 2 × 8 GB case is rejected on purpose: 16 GB total minus the model's 15.3 GiB
-leaves nothing for the KV cache, so it could never mine. The miner tells you
-instead of failing later.
-
-Cards in a split should be the **same model**. Mixing generations works only if
-your build contains code for both, and the slowest card sets the pace.
-
----
+**What this means for you:** a card with less than 24 GB of VRAM cannot currently
+mine TSC. Combining several small cards is not a workaround — the work would be
+thrown away. Run **one miner process per GPU** on cards that hold the model
+alone; that is the normal layout and is fully valid.
 
 ## Measured throughput
 
@@ -168,7 +160,8 @@ The download is checksum-verified. If the hash does not match, the miner
 ## Quick answers
 
 **"Can I mine with my 3070 Ti?"** Not alone — 8 GB is too small for a 15.3 GiB
-model. Four of them with `--split-model` will work.
+model, and `--split-model` is disabled because it produced invalid proofs.
+A 3070 cannot currently mine TSC.
 
 **"Can I mine with my 2080 Ti?"** No. Turing has no bf16 and the chain requires
 it. It is not a performance question; the proofs would be invalid.
@@ -176,7 +169,8 @@ it. It is not a performance question; the proofs would be invalid.
 **"Can I mine with my 3090?"** Yes — 24 GB, Ampere, bf16. Works on its own.
 
 **"Do two GPUs mine twice as fast?"** Two *separate* miners on two cards, yes.
-`--split-model` across two cards, no — that only makes the model fit.
+`--split-model` is disabled entirely (it produced invalid proofs), so two
+small cards cannot be combined at all.
 
 **"Is my card too slow to be worth it?"** Check [BENCHMARKS.md](BENCHMARKS.md)
 for w/s per euro. The cheapest card measured is also the best value per euro,

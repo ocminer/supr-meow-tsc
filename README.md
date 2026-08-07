@@ -11,7 +11,8 @@ at a pool, run it.
 > **Will my card work?** See **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)**.
 > Short version: NVIDIA **Ampere or newer** (bf16 is mandatory — Turing/RTX
 > 20-series can *never* mine TSC) and **24 GB VRAM** on one card, or several
-> smaller cards combined with `--split-model`.
+> Cards under 24 GB cannot mine: `--split-model` is disabled (it produced
+> invalid proofs — see docs/COMPATIBILITY.md).
 
 **Mining.** The full pipeline is in: embedded inference engine
 (llama.cpp/CUDA), GPU-offloaded proof-of-inference sampler with GPU-resident
@@ -28,7 +29,8 @@ mainnet, `Qwen3-0.6B` on testnet). The consequences for a miner:
 
 - **The model must be on disk and in VRAM.** ~1.5 GB for the testnet 0.6B model,
   ~16 GB for the mainnet 8B one. A 24 GB card is the practical mainnet minimum;
-  smaller cards can be combined with `--split-model`. Full card-by-card list:
+  Cards under 24 GB cannot mine — `--split-model` is disabled (it produced
+  invalid proofs). Full card-by-card list:
   **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)**.
 - **Rates are PoI/s** (proofs per second), not hashes. Expect single or double
   digits, not megahashes. This is normal.
@@ -93,7 +95,6 @@ supr-meow-tsc -o stratum+tcp://tsc.suprnova.cc:3310 -u tc1qexample -d 0,1 --pl 4
 
 # cards too small to hold the model alone (2x12GB, 4x8GB): split it across them
 supr-meow-tsc -o stratum+tcp://tsc.suprnova.cc:3310 -u tc1qexample -d 0,1 \
-  --split-model --model Qwen3-8B-9c925d64-bf16.gguf
 
 # verify device setup and watch telemetry without mining
 supr-meow-tsc --dry-run --log-interval 5
