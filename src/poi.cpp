@@ -345,6 +345,7 @@ extern "C" bool pow_gpu_sort_and_stats_device_k(
 extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 extern "C" int  pow_gpu_device_of_ptr(const void* p);
 extern "C" void pow_gpu_reset_device_scratch();
+extern "C" void pow_gpu_device_sync();
 extern "C" bool pow_gpu_register_host_range(const void* p, size_t bytes);
 extern "C" bool pow_gpu_corrupt_device(float* d_logits, int S, int n, int mode,
                                        float sigma, uint64_t seed);
@@ -490,6 +491,37 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
             // it at 0 makes every share after the first a "duplicate".
             share->nonce        = ++nonce_seq_;
             share->proof_b64    = base64(data, static_cast<size_t>(n));
+
+            // MEOW_DUMP_PROOFS=<dir>: write raw proof bytes locally so a miner
+            // can diagnose its own output without needing the pool to capture
+            // and audit for it. Off unless the variable is set; capped so a
+            // forgotten setting cannot fill a rig's disk.
+            //
+            // Added while chasing a --split-model fault the pool could see and
+            // we could not: split proofs replay RED against the real model
+            // while single-GPU proofs pass, and the visible signature is in the
+            // logit tail (70th logit median ~5.2 split vs ~1.1 single). Having
+            // the proofs locally turns a cross-machine round trip into a diff.
+            {
+                static const char* dump_dir = std::getenv("MEOW_DUMP_PROOFS");
+                static std::atomic<int> dumped{0};
+                static const int dump_max = [](){
+                    const char* m = std::getenv("MEOW_DUMP_PROOFS_MAX");
+                    return m ? std::atoi(m) : 32;
+                }();
+                if (dump_dir && *dump_dir && dumped.load() < dump_max) {
+                    const int idx = dumped.fetch_add(1);
+                    if (idx < dump_max) {
+                        char path[512];
+                        std::snprintf(path, sizeof(path), "%s/proof-%s-%d.bin",
+                                      dump_dir, share->job_id.c_str(), idx);
+                        if (FILE* f = std::fopen(path, "wb")) {
+                            std::fwrite(data, 1, static_cast<size_t>(n), f);
+                            std::fclose(f);
+                        }
+                    }
+                }
+            }
             share->vdf_tick     = vdf_tick_;
             // The claim the pool judges is the HEADER HASH —
             // SHA256d(header76 || digest[:4]) — because that is what consensus
@@ -722,6 +754,20 @@ struct SamplerPool::Impl {
                         }
                     }
                 }
+            // Under --split-model the logits tensor is produced on the other
+            // GPU. llama's ctx->synchronize() did not fully order our direct
+            // read against its producing stream, and the device-path proofs
+            // came out with a noise-lifted tail that failed model replay. A
+            // device barrier on the owner GPU before we read closes it. Only on
+            // the split path (bound_device changed) so single-GPU pays nothing.
+            // MEOW_SPLIT_SYNC=0 disables for A/B.
+            if (dev && bound_device != cuda_device) {
+                static const bool split_sync = [](){
+                    const char* e = std::getenv("MEOW_SPLIT_SYNC");
+                    return !(e && e[0] == '0');
+                }();
+                if (split_sync) pow_gpu_device_sync();
+            }
             if (dev)
                     gsort = pow_gpu_sort_and_stats_device_k(
                         dev + (size_t)lo * nvoc, hi - lo, nvoc, K, 1.0f,

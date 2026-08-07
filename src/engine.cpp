@@ -1,3 +1,4 @@
+#include <atomic>
 #include "engine.h"
 
 #include "llama.h"
@@ -433,12 +434,27 @@ int InferenceEngine::generate_windows_stepwise_tok(int device_slot,
     // path exists to avoid, but split mode is for cards that cannot hold the
     // model at all, where correctness is the whole point.
     const bool want_dev_logits = [this](){
-        // Split mode CAN use device logits now: the sampler asks CUDA which
-        // card owns the pointer and rebinds itself (see poi.cpp worker). Kept
-        // behind an escape hatch because the fallback is what made split mode
-        // work at all, and a rig that trips over cross-device access should be
-        // able to get back to a correct-but-slower path without a rebuild.
-        if (cfg_.split_model && std::getenv("MEOW_SPLIT_HOST_LOGITS")) return false;
+        // UNDER --split-model THE DEVICE PATH IS DISABLED BY DEFAULT — it
+        // produces MODEL-INVALID proofs. Measured 2026-08-07 on 2x 5090
+        // (model fits on one card, so single-vs-split is a clean A/B): reading
+        // llama's device logits tensor DIRECTLY under a layer split gives a
+        // noise-lifted distribution (70th-logit median ~2.6 vs ~0.8 single)
+        // that fails the chain's Mahalanobis model replay — it cost real block
+        // 21074. The host path (llama_get_logits_ith, which applies llama's
+        // output-row mapping and ggml_backend_tensor_get extraction) is correct
+        // under split (70th ~1.0). Raw `t_logits->data` is only valid f32-
+        // contiguous on a single device; under split the tensor's layout is not
+        // what the direct read assumes, and a device sync does NOT fix it (the
+        // corruption is structural, not a race). The forward pass itself is
+        // fine — step-0 logits are bit-identical single-vs-split.
+        //
+        // Single-GPU is UNAFFECTED and keeps the fast device path.
+        // MEOW_SPLIT_DEVICE_LOGITS=1 re-enables the device path under split for
+        // experiments only — it will mine invalid shares. Do not set it.
+        if (cfg_.split_model) {
+            const char* d = std::getenv("MEOW_SPLIT_DEVICE_LOGITS");
+            return d && d[0] == '1';
+        }
         const char* e = std::getenv("POW_GPU_DEVICE_LOGITS");
         return !(e && *e == '0');
     }();
@@ -473,6 +489,25 @@ int InferenceEngine::generate_windows_stepwise_tok(int device_slot,
                 if (!all_logits[s]) { llama_batch_free(nb); error = "no logits returned"; return -1; }
             }
         }
+        // MEOW_DUMP_RAW_LOGITS=<file>: write stream 0's FULL-vocab logits at
+        // step 0 (deterministic — no sampled predecessor) exactly once, so the
+        // single-vs-split forward pass can be diffed at the source, before any
+        // top-k or sampling. Step 0 always uses the host path above, both modes.
+        {
+            static const char* dump_all = std::getenv("MEOW_DUMP_ALL_LOGITS");
+            static std::atomic<int> dump_win{0};
+            if (dump_all && *dump_all && all_logits[0] && step_i < 32 && dump_win.load() == 0) {
+                // Append stream-0 full-vocab logits for steps 0..31 of the FIRST
+                // window to one file. Combined with MEOW_FORCE_GREEDY (stream 0
+                // forced to argmax) this keeps single and split in lockstep, so
+                // the dumps are directly comparable step-by-step — ground truth,
+                // no noisy proxy.
+                FILE* rf = std::fopen(dump_all, "ab");
+                if (rf) { std::fwrite(all_logits[0], sizeof(float), (size_t)n_vocab, rf); std::fclose(rf); }
+                if (step_i == 31) { dump_win.fetch_add(1);
+                    std::fprintf(stderr, "[dbg] dumped 32 steps of stream0 logits to %s\n", dump_all); }
+            }
+        }
         const auto t0 = std::chrono::steady_clock::now();
         std::vector<int> chosen(S, -1);
         if (!step(all_logits, dev_logits, n_vocab, ctxv, chosen)) {
@@ -481,6 +516,18 @@ int InferenceEngine::generate_windows_stepwise_tok(int device_slot,
             error = "sampler step failed"; return -1;
         }
         t_sample += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        // MEOW_FORCE_GREEDY: override stream 0's token with argmax of its logits
+        // so single and split follow an IDENTICAL trajectory for stream 0 (its
+        // sequence is independent of the others in the KV cache). Debug only —
+        // used with MEOW_DUMP_ALL_LOGITS to compare forward passes step-by-step.
+        {
+            static const bool force_greedy = [](){ const char* e=std::getenv("MEOW_FORCE_GREEDY"); return e && e[0]=='1'; }();
+            if (force_greedy && all_logits[0]) {
+                int best = 0; float bv = all_logits[0][0];
+                for (int v = 1; v < n_vocab; ++v) if (all_logits[0][v] > bv) { bv = all_logits[0][v]; best = v; }
+                chosen[0] = best;
+            }
+        }
         for (int s = 0; s < S; ++s) {
             if (chosen[s] < 0) { llama_batch_free(nb); error = "sampler aborted a window"; return -1; }
             ctxv[s].push_back((int64_t)chosen[s]);

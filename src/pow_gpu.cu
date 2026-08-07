@@ -1162,6 +1162,17 @@ extern "C" bool pow_gpu_bind_device(int cuda_ordinal) {
     return cudaSetDevice(cuda_ordinal) == cudaSuccess;
 }
 
+// Full-device barrier on the CURRENTLY bound device. Under --split-model the
+// logits tensor is produced on the last-layer GPU; llama_get_logits_device()
+// calls ctx->synchronize(), but that did NOT fully order our direct read of
+// that tensor against llama's producing stream on the other device — the
+// device-path proofs came out with a noise-lifted logit tail (70th ~2.6 vs
+// ~0.8 single) and failed model replay. A device sync on the owner GPU before
+// we read closes that gap.
+extern "C" void pow_gpu_device_sync() {
+    cudaDeviceSynchronize();
+}
+
 // Drop this thread's device scratch so the next ensure() reallocates on
 // whatever GPU is bound NOW. Required when --split-model makes a sampler
 // thread rebind: the buffers were allocated on the old card, and launching

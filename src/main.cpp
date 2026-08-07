@@ -40,7 +40,7 @@ extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 
 namespace {
 
-const char* kVersion = "0.3.7";
+const char* kVersion = "0.3.8";
 
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop = true; }
@@ -921,7 +921,13 @@ int main(int argc, char** argv) {
             return 300;
         }();
         const auto t_start = std::chrono::steady_clock::now();
-        const uint64_t prompt_salt = std::random_device{}();
+        // MEOW_FIXED_SALT pins the prompt salt so two processes generate an
+        // identical prompt set — used to compare raw logits single-vs-split
+        // deterministically. Random per process otherwise.
+        const uint64_t prompt_salt = [](){
+            const char* e = std::getenv("MEOW_FIXED_SALT");
+            return e ? (uint64_t)std::strtoull(e, nullptr, 10) : (uint64_t)std::random_device{}();
+        }();
 
         // Canary jobs (CANARY-JOBS-SPEC): w is a DENSE counter over
         // (session, seed) — ONE atomic across all streams and workers of this
