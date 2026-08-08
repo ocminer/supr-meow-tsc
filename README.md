@@ -113,7 +113,9 @@ Sample telemetry:
 Measured end-to-end against the live pool, not in a synthetic harness. Full
 curves, the cost-per-GPU-hour table and the reasoning behind each setting are
 in **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**; operational notes are in
-**[docs/OPERATIONS.md](docs/OPERATIONS.md)**.
+**[docs/OPERATIONS.md](docs/OPERATIONS.md)**. If you are deploying several rigs,
+read **[docs/DEPLOYMENT-NOTES.md](docs/DEPLOYMENT-NOTES.md)** — hard-won lessons
+on pinning image tags, verifying the model, and measuring the rate correctly.
 
 | GPU | best config | w/s | €/GPU/h | w/s per €/h |
 |---|---|---|---|---|

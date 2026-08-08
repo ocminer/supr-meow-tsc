@@ -1,8 +1,9 @@
 # Hardware compatibility
 
-Short version: **you need an NVIDIA GPU of the Ampere generation or newer, and
-at least 24 GB of VRAM on one card — or several smaller cards that together
-have more than ~20 GB.**
+Short version: **you need an NVIDIA GPU of the Ampere generation or newer with
+at least 24 GB of VRAM on a single card.** Combining several smaller cards is
+**not** an option: `--split-model` is disabled because it produced invalid
+proofs (see "Splitting one model across several GPUs" below).
 
 Two independent requirements, and both are hard:
 
@@ -62,12 +63,12 @@ Per GPU, to hold the model alone:
 | 24 GB | **yes** | the practical minimum — 3090, 4090, A5000 |
 | 20 GB | marginal | fits, but very few slots and low throughput |
 | 16 GB | **no** | model + buffers do not fit; splitting is disabled (see below) |
-| 8–12 GB | **no** | single card impossible — see splitting |
+| 8–12 GB | **no** | cannot mine — splitting is disabled, see below |
 
 **A note on the most common question:** an RTX 3070 / 3070 Ti (8 GB) or 3080
-(10–12 GB) **cannot mine on its own.** The card is fine — Ampere has bf16 —
-but the model does not fit. You need either a 24 GB card, or several of these
-cards split together.
+(10–12 GB) **cannot mine.** The card is fine — Ampere has bf16 — but the model
+does not fit, and combining several of them is not a workaround: `--split-model`
+is disabled because it produced invalid proofs. You need a single 24 GB card.
 
 ---
 
@@ -80,10 +81,19 @@ chain's model replay**, so any block such a miner won was **orphaned**. That is
 not theoretical — it cost a real block. A split miner cannot detect this itself:
 its own logs look perfectly healthy, which is exactly what makes it dangerous.
 
-The cause is still under investigation. Everything measurable on the miner side —
-the logits, the top-k, the per-step statistics — is bit-identical to a healthy
-single-GPU run, yet the chain's GPU replay rejects split proofs and accepts
-single-GPU ones. Until that is understood, refusing is the only honest option.
+**The cause is now known, and it is upstream.** Under a layer split, llama.cpp's
+forward pass itself returns wrong logits when two conditions hold together:
+
+1. the context is **reused for a second window** — the first window after a fresh
+   context is always correct — and
+2. the **slot count is high** (a large KV cache).
+
+The corruption is per-stream, spreads to more streams as slots rise, and is
+deterministic. Judged against a CPU reference, 1–32 slots were clean, 64 was
+marginal, 96 was mixed, and 112+ were corrupt from the second window onward —
+while production ran far above that. It is not the sampler, not the proof
+format, and not this miner's split configuration; disabling is containment
+until the upstream KV/compute path is fixed.
 
 **What this means for you:** a card with less than 24 GB of VRAM cannot currently
 mine TSC. Combining several small cards is not a workaround — the work would be
@@ -105,7 +115,7 @@ benchmark. Full curves and the reasoning are in [BENCHMARKS.md](BENCHMARKS.md).
 | L40S | 48 GB | 15.3 |
 | RTX 6000 Ada | 48 GB | 12.5 |
 | RTX A6000 / A40 | 48 GB | 9.5 |
-| 2 × RTX 5080 (split) | 2 × 16 GB | 7.5 |
+| ~~2 × RTX 5080 (split)~~ | ~~2 × 16 GB~~ | ~~7.5~~ — **split is disabled, do not use** |
 
 Cards not listed have no measured profile yet — the miner sizes them from VRAM
 automatically and they work fine, you just do not get a hand-tuned config.
