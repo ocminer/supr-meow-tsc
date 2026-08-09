@@ -9,10 +9,12 @@ at a pool, run it.
 > free for anyone to implement.
 >
 > **Will my card work?** See **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)**.
+> **New:** two matched ~16 GB cards (e.g. 2x RTX 5080) can now mine via the
+> **[vLLM backend](vllm-miner/)** — chain-verified (71 proofs audited, 0 rejected).
 > Short version: NVIDIA **Ampere or newer** (bf16 is mandatory — Turing/RTX
-> 20-series can *never* mine TSC) and **24 GB VRAM** on one card, or several
-> Cards under 24 GB cannot mine: `--split-model` is disabled (it produced
-> invalid proofs — see docs/COMPATIBILITY.md).
+> 20-series can *never* mine TSC) and **24 GB VRAM** on one card, or two
+> matched ~16 GB cards via the vLLM backend. llama's own `--split-model` stays
+> disabled (it produced invalid proofs — see docs/COMPATIBILITY.md).
 
 **Mining.** The full pipeline is in: embedded inference engine
 (llama.cpp/CUDA), GPU-offloaded proof-of-inference sampler with GPU-resident
@@ -28,9 +30,10 @@ GPU ran a real forward pass of a chain-registered LLM (currently `Qwen3-8B` on
 mainnet, `Qwen3-0.6B` on testnet). The consequences for a miner:
 
 - **The model must be on disk and in VRAM.** ~1.5 GB for the testnet 0.6B model,
-  ~16 GB for the mainnet 8B one. A 24 GB card is the practical mainnet minimum;
-  Cards under 24 GB cannot mine — `--split-model` is disabled (it produced
-  invalid proofs). Full card-by-card list:
+  ~16 GB for the mainnet 8B one. A 24 GB card is the practical mainnet minimum
+  for this (llama.cpp) miner; two matched ~16 GB cards can instead run the
+  **[vLLM backend](vllm-miner/)**. llama's `--split-model` is disabled (it
+  produced invalid proofs). Full card-by-card list:
   **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)**.
 - **Rates are PoI/s** (proofs per second), not hashes. Expect single or double
   digits, not megahashes. This is normal.
@@ -93,8 +96,8 @@ supr-meow-tsc -o stratum+tcp://tsc.suprnova.cc:3310 -u tc1qexample.rig01 -p x \
 supr-meow-tsc -o stratum+tcp://tsc.suprnova.cc:3310 -u tc1qexample -d 0,1 --pl 400 \
   --model Qwen3-8B-9c925d64-bf16.gguf
 
-# cards too small to hold the model alone (2x12GB, 4x8GB): split it across them
-supr-meow-tsc -o stratum+tcp://tsc.suprnova.cc:3310 -u tc1qexample -d 0,1 \
+# cards too small to hold the model alone: use the vLLM backend instead
+# (see vllm-miner/ — llama's --split-model is disabled and refuses to start)
 
 # verify device setup and watch telemetry without mining
 supr-meow-tsc --dry-run --log-interval 5

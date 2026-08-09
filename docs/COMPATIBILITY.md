@@ -1,9 +1,11 @@
 # Hardware compatibility
 
-Short version: **you need an NVIDIA GPU of the Ampere generation or newer with
-at least 24 GB of VRAM on a single card.** Combining several smaller cards is
-**not** an option: `--split-model` is disabled because it produced invalid
-proofs (see "Splitting one model across several GPUs" below).
+Short version: **you need an NVIDIA GPU of the Ampere generation or newer —
+either one card with at least 24 GB of VRAM (llama.cpp miner, fastest), or two
+matched cards of ~16 GB each via the [vLLM backend](../vllm-miner/)** (pipeline-
+parallel; validated end-to-end against the chain's full verification).
+The llama.cpp `--split-model` flag remains disabled — multi-GPU is served by
+the vLLM backend instead (see "Splitting one model across several GPUs" below).
 
 Two independent requirements, and both are hard:
 
@@ -62,19 +64,26 @@ Per GPU, to hold the model alone:
 | 32 GB+ | **yes** | comfortable; 5090 runs 128 slots |
 | 24 GB | **yes** | the practical minimum — 3090, 4090, A5000 |
 | 20 GB | marginal | fits, but very few slots and low throughput |
-| 16 GB | **no** | model + buffers do not fit; splitting is disabled (see below) |
-| 8–12 GB | **no** | cannot mine — splitting is disabled, see below |
+| 16 GB | no alone | **two matched 16 GB cards mine via the [vLLM backend](../vllm-miner/)** (~3.6 w/s/pair) |
+| 8–12 GB | **no** | too small even paired — per-card share of the model plus buffers does not fit |
 
 **A note on the most common question:** an RTX 3070 / 3070 Ti (8 GB) or 3080
-(10–12 GB) **cannot mine.** The card is fine — Ampere has bf16 — but the model
-does not fit, and combining several of them is not a workaround: `--split-model`
-is disabled because it produced invalid proofs. You need a single 24 GB card.
+(10–12 GB) **still cannot mine, even paired** — pipeline-parallel puts roughly
+half the model (~7.7 GiB) plus buffers and KV cache on each card, which does
+not fit in 8–12 GB. The smallest validated multi-GPU config is **two matched
+~16 GB cards** (tested: 2x RTX 5080) via the [vLLM backend](../vllm-miner/).
 
 ---
 
-## Splitting one model across several GPUs — DISABLED
+## Splitting one model across several GPUs
 
-**`--split-model` is disabled and the miner refuses to start with it.**
+**Use the [vLLM backend](../vllm-miner/) for multi-GPU rigs.** It splits the
+model across two matched cards with pipeline parallelism and produces proofs
+that pass the chain's full verification (validated at 71 audited / 0 rejected).
+Expect ~3.6 w/s per 2x16 GB pair on PCIe; NVLink rigs auto-select
+tensor-parallel instead.
+
+**The llama.cpp `--split-model` flag remains disabled and refuses to start.**
 
 It produced proofs that were *accepted as shares* (0% reject) but **failed the
 chain's model replay**, so any block such a miner won was **orphaned**. That is
@@ -95,10 +104,9 @@ while production ran far above that. It is not the sampler, not the proof
 format, and not this miner's split configuration; disabling is containment
 until the upstream KV/compute path is fixed.
 
-**What this means for you:** a card with less than 24 GB of VRAM cannot currently
-mine TSC. Combining several small cards is not a workaround — the work would be
-thrown away. Run **one miner process per GPU** on cards that hold the model
-alone; that is the normal layout and is fully valid.
+**What this means for you:** on single cards that hold the model (>= 24 GB),
+run one llama.cpp miner per GPU — the fastest path. On a pair of matched
+~16 GB cards, run the vLLM backend. Do not attempt llama `--split-model`.
 
 ## Measured throughput
 
@@ -115,7 +123,7 @@ benchmark. Full curves and the reasoning are in [BENCHMARKS.md](BENCHMARKS.md).
 | L40S | 48 GB | 15.3 |
 | RTX 6000 Ada | 48 GB | 12.5 |
 | RTX A6000 / A40 | 48 GB | 9.5 |
-| ~~2 × RTX 5080 (split)~~ | ~~2 × 16 GB~~ | ~~7.5~~ — **split is disabled, do not use** |
+| 2 × RTX 5080 ([vLLM backend](../vllm-miner/), PP=2) | 2 × 16 GB | 3.6 per pair |
 
 Cards not listed have no measured profile yet — the miner sizes them from VRAM
 automatically and they work fine, you just do not get a hand-tuned config.
@@ -169,18 +177,18 @@ The download is checksum-verified. If the hash does not match, the miner
 
 ## Quick answers
 
-**"Can I mine with my 3070 Ti?"** Not alone — 8 GB is too small for a 15.3 GiB
-model, and `--split-model` is disabled because it produced invalid proofs.
-A 3070 cannot currently mine TSC.
+**"Can I mine with my 3070 Ti?"** No — 8 GB is too small even paired: each
+card in a pipeline-parallel pair needs ~7.7 GiB of weights plus buffers and
+KV. The smallest working multi-GPU config is two matched ~16 GB cards.
 
 **"Can I mine with my 2080 Ti?"** No. Turing has no bf16 and the chain requires
 it. It is not a performance question; the proofs would be invalid.
 
 **"Can I mine with my 3090?"** Yes — 24 GB, Ampere, bf16. Works on its own.
 
-**"Do two GPUs mine twice as fast?"** Two *separate* miners on two cards, yes.
-`--split-model` is disabled entirely (it produced invalid proofs), so two
-small cards cannot be combined at all.
+**"Do two GPUs mine twice as fast?"** Two *separate* llama.cpp miners on two
+>=24 GB cards, yes. Two ~16 GB cards combine via the vLLM backend at ~3.6 w/s
+for the pair — slower than one big card, but mining where none was possible.
 
 **"Is my card too slow to be worth it?"** Check [BENCHMARKS.md](BENCHMARKS.md)
 for w/s per euro. The cheapest card measured is also the best value per euro,
