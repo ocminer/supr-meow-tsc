@@ -17,7 +17,7 @@ chiavdf. prompt_seed (field 8) is absent on suprnova, so prompts are self-salted
 LOCAL/TEST use: point --pool at the fake pool. Do NOT point at production until
 the pool full-tier audit is arranged.
 """
-import argparse, socket, json, threading, time, hashlib, base64, os, sys, itertools, queue
+import argparse, socket, json, threading, time, hashlib, base64, os, sys, itertools, queue, random
 import zmq
 sys.path.insert(0, os.path.expanduser('~/src-meow/vendor/tensorcash/shared-utils/fb-schemas'))
 from proof.MiningResponse import MiningResponse
@@ -70,6 +70,19 @@ class Bridge:
         # TimeoutError after 30s of no pool traffic (idle gaps between jobs are
         # normal), the reader thread dies, pongs stop, and the pool drops us.
         self.sock.settimeout(None)
+        # v2 (drain-stall fix, 2026-08-09): a half-open pool socket used to
+        # block the drain thread forever inside send() -> no submits -> the
+        # pool idle-dropped us every ~2.5min. SO_SNDTIMEO bounds only writes
+        # (recv stays blocking for the reader): a stuck write now raises
+        # OSError -> send() drops the line -> supervisor reconnects.
+        import struct as _struct
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO,
+                             _struct.pack("ll", 30, 0))
+        # keepalive: detect a dead peer during idle gaps (75s idle, 4x15s probes)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 75)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4)
         # Separate read/write handles — a single rwb makefile shared across the
         # reader thread and send() drops/garbles the submit responses.
         self.rfile = self.sock.makefile("rb")
@@ -123,8 +136,11 @@ class Bridge:
                 pass
             if self.stop:
                 break
-            print("[conn] reconnecting in 3s...", flush=True)
-            time.sleep(3)
+            # v2: jittered backoff — when a pool restart cycles every miner at
+            # once, fixed 3s delays herd the reconnects; jitter desynchronizes.
+            _d = random.uniform(2.0, 5.0)
+            print(f"[conn] reconnecting in {_d:.1f}s...", flush=True)
+            time.sleep(_d)
 
     def on_message(self, m):
         method = m.get("method")
@@ -316,8 +332,13 @@ class Bridge:
             print(f"[stats] proofs={self.proofs} submitted={self.submitted} "
                   f"accepted={self.accepted} stale={self.stale} rejected={self.rejected} "
                   f"below_floor={self.below_floor}", flush=True)
-            _el=max(time.time()-self._t0,1e-9); _ws=self.accepted/_el
-            print(f"prof-e2e accepted={self.accepted} in {_el:.0f}s -> {_ws:.2f} windows/s", flush=True)
+            _el=max(time.time()-self._t0,1e-9)
+            # v2: label fixed — this is the accepted-share rate (share difficulty
+            # gates emission), NOT the generation windows/s. Report both honestly:
+            # proofs = every window pulled off the engine (emission-gated), so
+            # proofs/el is the nearest observable to end-to-end proof rate.
+            print(f"prof-e2e accepted={self.accepted} ({self.accepted/_el:.2f}/s) "
+                  f"proofs={self.proofs} ({self.proofs/_el:.2f}/s) in {_el:.0f}s", flush=True)
 
     def run(self):
         threading.Thread(target=self.supervisor, daemon=True).start()

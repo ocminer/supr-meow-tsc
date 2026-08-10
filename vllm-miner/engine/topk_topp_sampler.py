@@ -6,6 +6,7 @@ import os
 import time
 import types
 
+import os as _os
 import torch
 import torch.nn as nn
 from packaging import version
@@ -49,8 +50,21 @@ try:
         from vllm.sampling.common_sampler_helper import CommonSamplerHelper
 
     _POW_AVAILABLE = True
-except ImportError:
+except ImportError as _pow_import_err:
     POW_WINDOW_SIZE = 256  # default fallback
+    # LOUD-FAIL TRIPWIRE: a fresh checkout without the sampling overlay used to
+    # boot a healthy-looking engine that mined NOTHING (observed: full-speed
+    # generation, zero proofs, zero errors). If the operator asked for PoW,
+    # refuse to run as a silent no-op miner.
+    if os.environ.get("VLLM_ENABLE_POW", "0") in ("1", "true", "True"):
+        raise RuntimeError(
+            "VLLM_ENABLE_POW=1 but the PoW sampling overlay failed to import "
+            f"({_pow_import_err!r}). The vllm/sampling/ overlay modules "
+            "(pow_utils, common_sampler_helper, zmq_pow_writer, ...) are "
+            "missing or broken — this engine would generate tokens but mine "
+            "nothing. Restore the overlay (tracked since commit a222aa6) or "
+            "unset VLLM_ENABLE_POW."
+        ) from _pow_import_err
 
 logger = init_logger(__name__)
 
@@ -518,6 +532,85 @@ class PowTopKTopPSampler(TopKTopPSampler):
     # Forward
     # ------------------------------------------------------------------ #
 
+    # ── compact top-50 CDF (AriaBrain v1.8.1, Apache-2.0) ──────────────
+    _compact_cdf_enabled = _os.environ.get(
+        "POW_COMPACT_CDF", "1").lower() in ("1", "true", "yes")
+
+    def _can_use_compact_cdf(self, seq_ids) -> bool:
+        """True only when every row samples from the canonical top-50 support.
+
+        TSC mining pins top_k <= 50 and temperature preserves rank order, so the
+        snapshot's stable top-50 IS the sampling support provided top_p and the
+        repetition penalty are neutral. Fresh rows still carry None params — the
+        backend only ever sends the canonical values, so None means "canonical".
+        Anything else falls back to the full-vocab path rather than guessing.
+        """
+        if not self._compact_cdf_enabled:
+            return False
+        for sid in seq_ids:
+            params = self.seq_params.get(sid)
+            if params is None:
+                return False
+            top_p = params.get("top_p")
+            top_k = params.get("top_k")
+            rep = params.get("repetition_penalty")
+            if top_p is not None and top_p != 1.0:
+                return False
+            if top_k is not None and not 1 <= top_k <= 50:
+                return False
+            if rep is not None and rep != 1.0:
+                return False
+        return True
+
+    @staticmethod
+    def _compact_topk_cdf(logits, stable_top_indices, k):
+        """CDF over the top-50 support, ordered by token id.
+
+        Returns (cdfs[B,50], token_ids[B,50], normalizers[B]). Float sums are
+        identical to the full-vocab path: the excluded entries are -inf, so
+        their probability is exactly 0 and adding zeros changes no partial sum.
+        """
+        batch_size, vocab_size = logits.shape
+        support_idx = stable_top_indices.to(torch.long)
+        support_logits = logits.gather(1, support_idx)
+        support_size = support_idx.shape[1]
+
+        if k is None:
+            k_flat = torch.full((batch_size,), support_size,
+                                device=logits.device, dtype=torch.long)
+        else:
+            k_flat = k.to(device=logits.device, dtype=torch.long).reshape(-1)
+            if k_flat.numel() == 1:
+                k_flat = k_flat.expand(batch_size)
+        thr_slot = (k_flat - 1).clamp_(0, support_size - 1)
+        thresholds = support_logits.gather(1, thr_slot.unsqueeze(1))
+
+        # Canonical top-k EXCLUDES values equal to the k-th; if that empties the
+        # row, keep the first (stable argmax), matching apply_topk_topp_mask.
+        keep = support_logits > thresholds
+        empty = ~keep.any(dim=-1)
+        keep[:, 0] |= empty
+
+        sentinel = torch.full_like(support_idx, vocab_size)
+        sort_keys = torch.where(keep, support_idx, sentinel)
+        ordered_keys, order = torch.sort(sort_keys, dim=-1)
+        ordered_logits = support_logits.gather(1, order)
+        valid = ordered_keys != vocab_size
+        ordered_logits.masked_fill_(~valid, -float("inf"))
+
+        probabilities = torch.softmax(ordered_logits, dim=-1,
+                                      dtype=torch.float32)
+        cdfs = torch.cumsum(probabilities, dim=-1)
+        normalizers = torch.logsumexp(ordered_logits, dim=-1)
+
+        # u can round to 1.0 while the last CDF entry rounds just below, so
+        # point padding slots at the last valid token and let the searchsorted
+        # clamp land correctly.
+        last_slot = valid.sum(dim=-1).sub_(1).unsqueeze(1)
+        last_ids = ordered_keys.gather(1, last_slot)
+        token_ids = torch.where(valid, ordered_keys, last_ids)
+        return cdfs, token_ids, normalizers
+
     def _pow_forward(
         self,
         logits: torch.Tensor,
@@ -536,20 +629,11 @@ class PowTopKTopPSampler(TopKTopPSampler):
         proof_logits = pre_temp_logits if pre_temp_logits is not None else logits
         proof_logits = proof_logits.detach().to(torch.float32)
 
-        # -INF LOGIT FIX (2026-08-09). vLLM masks a few IN-VOCAB token positions to
-        # -inf (reserved/disallowed tokens; measured: 2 of 151936 for Qwen3-8B —
-        # NOT trailing padding, the tensor is already true-vocab-wide). Those -inf
-        # entries poison the proof's PLAIN-MEAN stats: logsumexp_stats[4]=
-        # mean(sorted[2000:]) and [5]=mean(all) become -inf (logsumexp[0] is
-        # immune, which is why only 4/5 were -inf). Our verifier replays raw HF
-        # logits (finite everywhere) and expects finite stats; -inf -> infinite
-        # Mahalanobis -> p=0 every step -> RED (R2-R5). llama.cpp emits raw finite
-        # logits and is unaffected. Fix: replace -inf with the per-row FINITE
-        # minimum before any PoW computation so every field (snapshot bucket
-        # means, logsumexp_full, top-k/top-p, sampling, probes) is finite. Effect
-        # on the means is negligible (a couple already-lowest tokens out of
-        # 151936), keeping the feature vector inside the verifier envelope. No-op
-        # when all finite.
+        # -INF LOGIT FIX (ported from tc-vllm 27f9cee / sha 50f2fdda, 2026-08-09).
+        # vLLM masks a few IN-VOCAB tokens to -inf (2 of 151936 for Qwen3-8B); those
+        # poison logsumexp_stats[4:5] -> verifier p=0 -> RED. MANDATORY even here
+        # (boblabs' own proofs carried these -inf). Replace with per-row finite min
+        # before any PoW/compact-CDF computation. No-op when all finite.
         _inf_mask = torch.isinf(proof_logits)
         if bool(_inf_mask.any()):
             _row_min = torch.nan_to_num(
@@ -562,34 +646,6 @@ class PowTopKTopPSampler(TopKTopPSampler):
                     logits.to(torch.float32).masked_fill(_lmask, float("nan")),
                     nan=float("inf")).min(dim=-1, keepdim=True).values
                 logits = torch.where(_lmask, _lmin.expand_as(logits).to(logits.dtype), logits)
-            if not getattr(self, "_inf_fix_logged", False):
-                self._inf_fix_logged = True
-                try:
-                    self.logger.log(
-                        f"[inf-fix] replaced {int(_inf_mask.sum().item())} -inf "
-                        f"logit entries with per-row finite min", "INIT")
-                except Exception:
-                    pass
-
-        # POW_PROFILE=1: per-section wall-time (cuda-synced), averaged every 128
-        # steps. Diagnostic only — the syncs add overhead, so never leave on.
-        _prof = os.environ.get("POW_PROFILE") == "1"
-        if _prof:
-            import time as _t
-            if not hasattr(self, "_prof_acc"):
-                self._prof_acc = {}
-                self._prof_n = 0
-            torch.cuda.synchronize()
-            self._prof_t = _t.perf_counter()
-
-            def _pp(tag):
-                torch.cuda.synchronize()
-                now = _t.perf_counter()
-                self._prof_acc[tag] = self._prof_acc.get(tag, 0.0) + (now - self._prof_t) * 1000.0
-                self._prof_t = now
-        else:
-            def _pp(tag):
-                pass
 
         batch_req_ids = self._stable_req_ids(metadata, B)
         seq_ids: list[int] = []
@@ -601,11 +657,19 @@ class PowTopKTopPSampler(TopKTopPSampler):
                 self._next_sid += 1
             seq_ids.append(sid)
 
+        # New-sid registration is split in two: the CPU-only fields (ids +
+        # pow_snapshot from extra_args) are written here because ensure_rows
+        # consumes pow_snapshot during row allocation, while the four sampler
+        # params live on GPU tensors and each float()/int() element read is a
+        # D2H sync that drains the still-running forward pass (dominant
+        # sync-wait in the py-spy profile). They are only consumed by the
+        # proof writer at window boundaries, so they are filled in ONE batched
+        # transfer after the sampler's GPU work has been queued (below).
+        pending_param_rows: list[tuple[int, int]] = []
         for batch_row, rid in enumerate(batch_req_ids):
             sid = seq_ids[batch_row]
 
             if sid not in self.seq_params:
-                rep_pen = metadata.repetition_penalties[batch_row]
                 completion_id = None
                 request_item_id_arg = None
                 if metadata.extra_args and batch_row in metadata.extra_args:
@@ -650,20 +714,18 @@ class PowTopKTopPSampler(TopKTopPSampler):
                         }
 
                 self.seq_params[sid] = {
-                    "temperature": float(metadata.temperature[batch_row]),
-                    "top_p": (float(metadata.top_p[batch_row])
-                              if metadata.top_p is not None else 1.0),
-                    "top_k": (int(metadata.top_k[batch_row])
-                              if metadata.top_k is not None
-                              else logits.shape[1]),
-                    "repetition_penalty": (float(rep_pen)
-                                           if rep_pen else 1.0),
+                    # filled by the deferred batched read below
+                    "temperature": None,
+                    "top_p": None,
+                    "top_k": None,
+                    "repetition_penalty": None,
                     "completion_id": (
                         (request_item_id_arg or completion_id) or rid),
                     "request_item_id": (request_item_id_arg or rid),
                     "base_completion_id": completion_id,
                     "pow_snapshot": pow_snapshot,
                 }
+                pending_param_rows.append((sid, batch_row))
 
         # 1. Update PoW params from first real request
         if metadata.extra_args:
@@ -673,72 +735,64 @@ class PowTopKTopPSampler(TopKTopPSampler):
                     self.pow_hasher.update_from_payload(args_i["pow"])
                     break
 
-        _pp("ids")
-        # 2. Row allocation.
-        # prompt_map is consumed ONLY by _ensure_rows, and only for seq_ids that
-        # don't yet have a row (ensure_rows: `if sid in seqid_to_row: continue`).
-        # _safe_prompt_tokens does a per-row `.tolist()` device sync, so building
-        # the whole-batch map every step costs ~B GPU->CPU syncs/step for values
-        # that are discarded on all but a sequence's FIRST step of its lifetime
-        # (prompts are window-invariant). POW_FAST_SETUP=1 computes prompts only
-        # for genuinely new seq_ids. self.row_manager.seqid_to_row is the exact
-        # dict ensure_rows checks, so this is behavior-identical (proof-neutral).
-        if os.environ.get("POW_FAST_SETUP", "0") == "1":
-            _known = self.row_manager.seqid_to_row
-            prompt_map = {sid: self._safe_prompt_tokens(metadata, batch_row)
-                          for batch_row, sid in enumerate(seq_ids)
-                          if sid not in _known}
-        else:
-            prompt_map = {sid: self._safe_prompt_tokens(metadata, batch_row)
-                          for batch_row, sid in enumerate(seq_ids)}
-        _pp("promptmap")
+        # 2. Row allocation. Prompt tokens are only consumed by ensure_rows
+        # when it ALLOCATES a row (same membership test as there), and
+        # _safe_prompt_tokens costs a GPU mask + .tolist() D2H sync per row —
+        # building the full map every step was 27% of EngineCore CPU (py-spy,
+        # 64-seq decode). Build it only for rows about to be allocated.
+        prompt_map = {sid: self._safe_prompt_tokens(metadata, batch_row)
+                      for batch_row, sid in enumerate(seq_ids)
+                      if sid not in self.row_manager.seqid_to_row}
+        # Pre-evict so ensure_rows never runs its own eviction. The helper's
+        # fallback picks the seq with MAX steps over ALL allocated rows — but
+        # dead rows freeze while live ones keep advancing, so under pool
+        # exhaustion it preferentially evicts a member of the CURRENT batch.
+        # That leaves get_row(sid) = None below and torch.as_tensor(rows)
+        # kills the EngineCore (observed: engine restart every ~8-50 min, both
+        # on stock and patched samplers, all night 2026-07-26/27). Freeing
+        # only non-batch rows here makes the helper's allocate always succeed.
+        need = len(prompt_map)
+        short = need - len(self.row_manager.free_rows)
+        if short > 0:
+            batch = set(seq_ids)
+            victims = [(sid, row)
+                       for sid, row in self.row_manager.seqid_to_row.items()
+                       if sid not in batch]
+            if victims:
+                vsteps = self.ring_buffers.steps[
+                    torch.as_tensor([r for _, r in victims],
+                                    device=self.ring_buffers.steps.device)
+                ].cpu().tolist()
+                order = sorted(
+                    range(len(victims)),
+                    key=lambda i: (-vsteps[i],
+                                   self.row_manager.allocation_order.get(
+                                       victims[i][0], 0)))
+                for i in order[:short]:
+                    self._free_sequence(victims[i][0])
         self._ensure_rows(seq_ids, prompt_map)
         rows = [self.row_manager.get_row(s) for s in seq_ids]
 
-        _pp("rows")
         # 3. Top-k / top-p (temperature already applied by Sampler.sample)
-        logits_f32 = logits.detach().clone()
+        #
+        # No eager .clone() here: that was a [B, 151936] fp32 read+write
+        # (~78 MB at B=128) every decode step, and it only ever protected the
+        # in-place mask in _pow_apply_top_k_top_p — which runs solely in the
+        # full-vocab fallback below. The compact-CDF path (production default)
+        # reads logits_f32 via gather/logsumexp only, so an alias is safe; the
+        # fallback clones at its own entry before mutating.
+        logits_f32 = logits.detach()
         logsumexp_full = torch.logsumexp(logits_f32, dim=-1)
 
-        if metadata.top_p is not None or metadata.top_k is not None:
-            logits_f32 = self._pow_apply_top_k_top_p(
-                logits_f32, metadata.top_k, metadata.top_p)
 
-        _pp("mask")
         # 4. Snapshot pre-temperature logits for verifier replay.
-        vocab_size = proof_logits.size(-1)
-        batch_size = proof_logits.size(0)
-        mean_tensor = torch.zeros(
-            (batch_size, 6), dtype=torch.float32, device=device)
-        mean_tensor[:, 0] = logsumexp_full
-        # POW_FAST_STATS: replace the full-vocab STABLE sort (~3.8 ms/step on a
-        # 5090, the dominant per-step PoW cost) with topk(2000)+tail-mean
-        # (~0.5 ms, ~8x). Microbench-verified vs the full sort: top-50 values &
-        # indices byte-identical, bucket means within ~1.5e-8. Opt-in until the
-        # pool full-tier audit confirms the optimized build.
-        if os.environ.get("POW_FAST_STATS", "0") == "1" and vocab_size > 2000:
-            _tv, _ti = torch.topk(proof_logits, 2000, dim=-1, sorted=True)
-            topk_vals = _tv[:, :50]
-            topk_idx = _ti[:, :50]
-            mean_tensor[:, 1] = _tv[:, :50].mean(-1)
-            mean_tensor[:, 2] = _tv[:, 50:500].mean(-1)
-            mean_tensor[:, 3] = _tv[:, 500:2000].mean(-1)
-            mean_tensor[:, 4] = (proof_logits.sum(-1) - _tv.sum(-1)) / (vocab_size - 2000)
-            mean_tensor[:, 5] = proof_logits.mean(-1)
-        else:
-            sorted_logits, sorted_indices = torch.sort(
-                proof_logits, dim=-1, descending=True, stable=True)
-            topk_vals = sorted_logits[:, :50]
-            topk_idx = sorted_indices[:, :50]
-            if vocab_size >= 50:
-                mean_tensor[:, 1] = torch.mean(sorted_logits[:, :50], dim=-1)
-            if vocab_size >= 500:
-                mean_tensor[:, 2] = torch.mean(sorted_logits[:, 50:500], dim=-1)
-            if vocab_size >= 2000:
-                mean_tensor[:, 3] = torch.mean(sorted_logits[:, 500:2000], dim=-1)
-            if vocab_size > 2000:
-                mean_tensor[:, 4] = torch.mean(sorted_logits[:, 2000:], dim=-1)
-            mean_tensor[:, 5] = torch.mean(sorted_logits, dim=-1)
+        sorted_logits, sorted_indices = torch.sort(
+            proof_logits, dim=-1, descending=True, stable=True)
+
+        topk_vals = sorted_logits[:, :50]
+        topk_idx = sorted_indices[:, :50]
+        vocab_size = sorted_logits.size(-1)
+        batch_size = sorted_logits.size(0)
 
         probe_step = max(vocab_size // 20, 1)
         probe_indices_list = torch.arange(
@@ -754,57 +808,150 @@ class PowTopKTopPSampler(TopKTopPSampler):
                 batch_size, -1).to(torch.int32),
         ], dim=1)
 
-        _pp("stats")
-        # 5. Probs & CDF
-        probs = torch.softmax(logits_f32, -1, dtype=torch.float32)
-        cdfs = torch.cumsum(probs, -1)
+        mean_tensor = torch.zeros(
+            (batch_size, 6), dtype=torch.float32, device=device)
+        mean_tensor[:, 0] = logsumexp_full
+        if vocab_size >= 50:
+            mean_tensor[:, 1] = torch.mean(
+                sorted_logits[:, :50], dim=-1)
+        if vocab_size >= 500:
+            mean_tensor[:, 2] = torch.mean(
+                sorted_logits[:, 50:500], dim=-1)
+        if vocab_size >= 2000:
+            mean_tensor[:, 3] = torch.mean(
+                sorted_logits[:, 500:2000], dim=-1)
+        # Tail mean by subtraction: mean(sorted[2000:]) read the full row a
+        # second time (another ~78 MB pass after mean-all). One sum serves
+        # both stats instead. FP reduction order differs from summing the
+        # sorted tail directly — exactly the formulation the k=2000
+        # experiment replay-tested 7/7 GREEN (docs/POW_SAMPLER_OVERHEAD.md
+        # §5); neither value enters the share digest
+        # (powverify._build_step_message).
+        if vocab_size > 2000:
+            total = sorted_logits.sum(dim=-1)
+            mean_tensor[:, 4] = (
+                (total - sorted_logits[:, :2000].sum(dim=-1))
+                / (vocab_size - 2000))
+            mean_tensor[:, 5] = total / vocab_size
+        else:
+            mean_tensor[:, 5] = torch.mean(sorted_logits, dim=-1)
 
-        _pp("cdf")
+        # 5. Probs & CDF.
+        #
+        # The full-vocab path builds a [B, 151936] softmax AND cumsum every
+        # decode step, but sampling only ever draws from the top-50 proof
+        # support: everything else was masked to -inf, so its probability is
+        # exactly 0 and contributes nothing to any partial sum. Restricting the
+        # CDF to those 50 entries is therefore arithmetically the same
+        # reduction, ~3000x narrower.
+        #
+        # Derived from AriaBrain LuckyPool worker v1.8.1 (Apache-2.0).
+        use_compact_cdf = self._can_use_compact_cdf(seq_ids)
+        # instrumentation: count engaged vs fallback steps (verifies the A/B)
+        if not hasattr(self, "_cdf_path_counts"):
+            self._cdf_path_counts = [0, 0]  # [compact, fallback]
+        self._cdf_path_counts[0 if use_compact_cdf else 1] += 1
+        _c, _f = self._cdf_path_counts
+        if (_c + _f) % 200 == 1:
+            self.logger.log(f"[compact-cdf] engaged={_c} fallback={_f}")
+        if use_compact_cdf:
+            cdfs, cdf_token_ids, filtered_logsumexp = self._compact_topk_cdf(
+                logits_f32, extended_indices[:, :50], metadata.top_k)
+        else:
+            # Unchanged full-vocab fallback, including the mask that the
+            # compact path folds into itself. logits_f32 is an alias of the
+            # engine's logits (see step 3) — clone before the in-place mask
+            # so the caller's tensor is never mutated.
+            logits_f32 = logits_f32.clone()
+            if metadata.top_p is not None or metadata.top_k is not None:
+                logits_f32 = self._pow_apply_top_k_top_p(
+                    logits_f32, metadata.top_k, metadata.top_p)
+            probs = torch.softmax(logits_f32, -1, dtype=torch.float32)
+            cdfs = torch.cumsum(probs, -1)
+            cdf_token_ids = None
+            filtered_logsumexp = torch.logsumexp(logits_f32, -1)
+
         # 6. PoW sampling
         rows_tensor = torch.as_tensor(
             rows, device=device, dtype=torch.long)
         steps = (self.ring_buffers.steps[rows_tensor].clone()
                  % self.window_size)
-        contexts = self._get_context_windows(seq_ids).to(device)
+        contexts = self._get_context_windows(seq_ids, rows_tensor).to(device)
 
-        token_ids, u_vals, _digests = self.pow_hasher.batch_sample_tokens(
+        # v3 admission (TIP-0003): rows whose NEXT sampled
+        # token is a window-first step (steps == 0: prefill and every 256
+        # boundary) must have their admission decided — ground and stored in
+        # the ring buffers, or explicitly cleared — BEFORE hashing, since the
+        # nonce enters every u of the window. No-op (and no GPU sync) unless
+        # POW_V3_ADMISSION_MODE=always and POW_PROOF_VERSION >= 3.
+        self._common.ensure_admission_for_rows(
+            seq_ids, rows, steps, contexts,
+            self.proof_writer.compute_precision)
+
+        cdf_positions, u_vals, _digests = self.pow_hasher.batch_sample_tokens(
             contexts, steps, cdfs,
             self.proof_writer.compute_precision,
             ring_buffers=self.ring_buffers,
             rows_tensor=rows_tensor,
+            # rows is already a host-side int list; passing it selects the
+            # host-mirror width lookup instead of the per-step
+            # unique()/item() GPU->CPU sync fallback.
+            rows_host=rows,
         )
+        # Compact CDF indexes the 50-wide support, so the sampler returns a
+        # SLOT; map it back to a real vocab id. Full path already returns one.
+        if cdf_token_ids is None:
+            token_ids = cdf_positions
+        else:
+            token_ids = cdf_token_ids.gather(
+                1, cdf_positions.unsqueeze(1)).squeeze(1)
 
-        _pp("sample")
+        # Deferred fill of the new-sid sampler params (see registration loop):
+        # one batched D2H per tensor, issued after the sampler GPU work is
+        # queued so the transfer overlaps it instead of draining the pipeline
+        # mid-step. Values are byte-identical to the previous per-element
+        # float()/int() reads; consumers (proof writer at window boundaries,
+        # never this step for a brand-new sid) all run later.
+        if pending_param_rows:
+            pidx = torch.as_tensor([r for _, r in pending_param_rows],
+                                   device=metadata.temperature.device,
+                                   dtype=torch.long)
+            temps = metadata.temperature[pidx].cpu().tolist()
+            tps = (metadata.top_p[pidx].cpu().tolist()
+                   if metadata.top_p is not None else None)
+            tks = (metadata.top_k[pidx].cpu().tolist()
+                   if metadata.top_k is not None else None)
+            rps = metadata.repetition_penalties[pidx].cpu().tolist()
+            for j, (sid, _brow) in enumerate(pending_param_rows):
+                params = self.seq_params.get(sid)
+                if params is None:
+                    continue
+                params["temperature"] = float(temps[j])
+                params["top_p"] = float(tps[j]) if tps is not None else 1.0
+                params["top_k"] = (int(tks[j]) if tks is not None
+                                   else logits.shape[1])
+                params["repetition_penalty"] = (float(rps[j])
+                                                if rps[j] else 1.0)
+
         # 7. Ring-buffer writes
         pos = self.ring_buffers.get_positions(rows_tensor)
-        probs_sel = cdfs.gather(1, token_ids[:, None]).squeeze(1)
+        probs_sel = cdfs.gather(1, cdf_positions[:, None]).squeeze(1)
 
-        page_flip = self._update_caches(seq_ids, token_ids)
+        page_flip = self._update_caches(seq_ids, token_ids, rows_tensor)
         self.ring_buffers._write_buffers(
             pos, rows_tensor,
             extended_logits, extended_indices,
             token_ids, probs_sel,
             u_vals, page_flip,
-            torch.logsumexp(logits_f32, -1),
+            filtered_logsumexp,
             mean_tensor)
 
-        self.ring_buffers.increment_steps(rows_tensor)
+        self.ring_buffers.increment_steps(rows_tensor, rows_host=rows)
 
-        _pp("ringwrite")
         # 8. EOS / PoW checks / cleanup
         self._check_eos(seq_ids, token_ids)
         self._check_pow_solutions(seq_ids)
         self._cleanup_stale_sequences()
-
-        _pp("checks")
-        if _prof:
-            self._prof_n += 1
-            if self._prof_n % 128 == 0:
-                tot = sum(self._prof_acc.values())
-                line = " ".join(f"{k}={v/self._prof_n:.2f}"
-                                for k, v in self._prof_acc.items())
-                print(f"[powprof] B={B} avg ms/step: {line} TOTAL={tot/self._prof_n:.2f}",
-                      flush=True)
 
         return token_ids.to(torch.int64), None
 
@@ -843,17 +990,26 @@ class PowTopKTopPSampler(TopKTopPSampler):
     def _init_sequence_cache(self, seq_id, prompt_tokens):
         return self._common.init_sequence_cache(seq_id, prompt_tokens)
 
-    def _get_context_windows(self, seq_ids):
+    def _get_context_windows(self, seq_ids, rows_tensor=None):
+        # our canonical helper (md5 2fb0bfd2) predates the rows_tensor fast
+        # path; same semantics without it (boblabs' shipped runtime also 1-arg)
         return self._common.get_context_windows(seq_ids)
 
     def _ensure_rows(self, seq_ids, prompt_mapping):
         return self._common.ensure_rows(seq_ids, prompt_mapping)
 
-    def _update_caches(self, seq_ids, tokens):
+    def _update_caches(self, seq_ids, tokens, rows_tensor=None):
+        # see _get_context_windows: helper predates the rows_tensor fast path
         return self._common.update_caches(seq_ids, tokens)
 
     def _free_sequence(self, seq_id):
         return self._common.free_sequence(seq_id)
+
+    def _free_request_ids(self, request_ids):
+        # Called per step by the Lucky-Pool vLLM build's gpu_model_runner
+        # with scheduler_output.finished_req_ids; absent attribute = engine
+        # death there. No caller on our stock build.
+        return self._common.free_request_ids(request_ids)
 
     def _check_eos(self, seq_ids, tokens):
         return self._common.check_eos(seq_ids, tokens)
