@@ -1,9 +1,12 @@
 # Hardware compatibility
 
 Short version: **you need an NVIDIA GPU of the Ampere generation or newer —
-either one card with at least 24 GB of VRAM (llama.cpp miner, fastest), or two
-matched cards of ~16 GB each via the [vLLM backend](../vllm-miner/)** (pipeline-
-parallel; validated end-to-end against the chain's full verification).
+either one card with at least 24 GB of VRAM (llama.cpp miner), or two matched
+cards of ~16 GB each via the [vLLM backend](../vllm-miner/)** (pipeline-
+parallel; validated end-to-end against the chain's full verification). On big
+single cards the two engines are now comparable (llama slightly ahead and much
+lighter to deploy — a single binary vs a Python/CUDA stack), so llama.cpp
+remains the recommendation there.
 The llama.cpp `--split-model` flag remains disabled — multi-GPU is served by
 the vLLM backend instead (see "Splitting one model across several GPUs" below).
 
@@ -64,7 +67,7 @@ Per GPU, to hold the model alone:
 | 32 GB+ | **yes** | comfortable; 5090 runs 128 slots |
 | 24 GB | **yes** | the practical minimum — 3090, 4090, A5000 |
 | 20 GB | marginal | fits, but very few slots and low throughput |
-| 16 GB | no alone | **two matched 16 GB cards mine via the [vLLM backend](../vllm-miner/)** (~3.9 w/s/pair) |
+| 16 GB | no alone | **two matched 16 GB cards mine via the [vLLM backend](../vllm-miner/)** (~11.4 w/s/pair) |
 | 8–12 GB | **no** | too small even paired — per-card share of the model plus buffers does not fit |
 
 **A note on the most common question:** an RTX 3070 / 3070 Ti (8 GB) or 3080
@@ -80,7 +83,7 @@ not fit in 8–12 GB. The smallest validated multi-GPU config is **two matched
 **Use the [vLLM backend](../vllm-miner/) for multi-GPU rigs.** It splits the
 model across two matched cards with pipeline parallelism and produces proofs
 that pass the chain's full verification (validated at 71 audited / 0 rejected).
-Expect ~3.9 w/s per 2x16 GB pair on PCIe; NVLink rigs auto-select
+Expect ~11.4 w/s per 2x16 GB pair on PCIe (high-batch defaults); NVLink rigs auto-select
 tensor-parallel instead.
 
 **The llama.cpp `--split-model` flag remains disabled and refuses to start.**
@@ -123,7 +126,7 @@ benchmark. Full curves and the reasoning are in [BENCHMARKS.md](BENCHMARKS.md).
 | L40S | 48 GB | 15.3 |
 | RTX 6000 Ada | 48 GB | 12.5 |
 | RTX A6000 / A40 | 48 GB | 9.5 |
-| 2 × RTX 5080 ([vLLM backend](../vllm-miner/), PP=2) | 2 × 16 GB | 3.9 per pair |
+| 2 × RTX 5080 ([vLLM backend](../vllm-miner/), PP=2) | 2 × 16 GB | 11.4 per pair |
 
 Cards not listed have no measured profile yet — the miner sizes them from VRAM
 automatically and they work fine, you just do not get a hand-tuned config.

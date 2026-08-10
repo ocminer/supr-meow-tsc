@@ -33,6 +33,9 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_CACHE="$HF_MODEL_CACHE" VL
 export VLLM_ENABLE_POW=1 POW_PROOF_VERSION="$POW_PROOF_VERSION" POW_PROCESSOR_MODE="$POW_PROCESSOR_MODE"
 export POW_FAST_SETUP="${POW_FAST_SETUP:-1}"
 export POW_EGRESS_MODE=broker POW_PROXY_ENABLE=false ZMQ_PUSH_HOST=127.0.0.1 ZMQ_PUSH_PORT="$ZMQ_PUSH_PORT"
+# expandable_segments avoids fragmentation OOM at high batch (part of the
+# audited high-batch bundle)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 _engine() {
   cd "$TC_VLLM"
@@ -41,6 +44,7 @@ _engine() {
     $PAR --dtype "$MINING_DTYPE" --load-format safetensors \
     --max-num-seqs "$MAX_NUM_SEQS" --max-model-len "$MAX_MODEL_LEN" \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
+    --compilation-config "{\"max_cudagraph_capture_size\": $MAX_NUM_SEQS}" \
     --enable-prompt-tokens-details --generation-config vllm \
     --host 127.0.0.1 --port 8000 --api-key "$VLLM_API_KEY"
 }

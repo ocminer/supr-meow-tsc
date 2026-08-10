@@ -9,8 +9,9 @@ at a pool, run it.
 > free for anyone to implement.
 >
 > **Will my card work?** See **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)**.
-> **New:** two matched ~16 GB cards (e.g. 2x RTX 5080) can now mine via the
-> **[vLLM backend](vllm-miner/)** — chain-verified (71 proofs audited, 0 rejected).
+> **New:** two matched ~16 GB cards (e.g. 2x RTX 5080) mine ~11.4 w/s via the
+> **[vLLM backend](vllm-miner/)** — chain-verified across three audit rounds
+> (298 proofs, 0 rejected).
 > Short version: NVIDIA **Ampere or newer** (bf16 is mandatory — Turing/RTX
 > 20-series can *never* mine TSC) and **24 GB VRAM** on one card, or two
 > matched ~16 GB cards via the vLLM backend. llama's own `--split-model` stays
