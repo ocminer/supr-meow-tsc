@@ -53,7 +53,7 @@ try:
 except ImportError as _pow_import_err:
     POW_WINDOW_SIZE = 256  # default fallback
     # LOUD-FAIL TRIPWIRE: a fresh checkout without the sampling overlay used to
-    # boot a healthy-looking engine that mined NOTHING (observed: full-speed
+    # boot a healthy-looking engine that mined NOTHING (rig11r arm-B: full-speed
     # generation, zero proofs, zero errors). If the operator asked for PoW,
     # refuse to run as a silent no-op miner.
     if os.environ.get("VLLM_ENABLE_POW", "0") in ("1", "true", "True"):
@@ -786,13 +786,40 @@ class PowTopKTopPSampler(TopKTopPSampler):
 
 
         # 4. Snapshot pre-temperature logits for verifier replay.
-        sorted_logits, sorted_indices = torch.sort(
-            proof_logits, dim=-1, descending=True, stable=True)
-
-        topk_vals = sorted_logits[:, :50]
-        topk_idx = sorted_indices[:, :50]
-        vocab_size = sorted_logits.size(-1)
-        batch_size = sorted_logits.size(0)
+        #
+        # The stats only ever need the top-2000 in order plus whole-row sums,
+        # so the full-vocab STABLE sort ([B,151936] — ~10 ms/step at B=256,
+        # the dominant PoW cost at high batch) is replaced by topk(2000):
+        #  - stable top-50 is reconstructed exactly: torch.sort(stable,desc)
+        #    breaks ties in index order, so re-ordering the topk head by
+        #    (value desc, index asc) reproduces it bit-identically (128-wide
+        #    margin: breaking it needs >78 exactly-equal logits at rank ~50).
+        #  - bucket means [:50]/[50:500]/[500:2000] read the same sorted
+        #    values => bit-identical sums.
+        #  - tail mean & mean-all by subtraction over an unsorted row sum:
+        #    reduction-order fp noise only (~1e-8), the SAME accepted class as
+        #    the tail-by-subtraction below (replay-tested 7/7 GREEN,
+        #    docs/POW_SAMPLER_OVERHEAD.md §5); neither enters the share digest.
+        vocab_size = proof_logits.size(-1)
+        batch_size = proof_logits.size(0)
+        if vocab_size > 2000:
+            snap_k = 2000
+            tk_vals, tk_idx = torch.topk(
+                proof_logits, snap_k, dim=-1, sorted=True)
+            _m = min(128, snap_k)
+            _v, _i = tk_vals[:, :_m], tk_idx[:, :_m]
+            _o = torch.argsort(_i, dim=-1, stable=True)          # index asc
+            _v = torch.gather(_v, 1, _o)
+            _i = torch.gather(_i, 1, _o)
+            _o2 = torch.argsort(-_v, dim=-1, stable=True)        # value desc, ties keep index order
+            topk_vals = torch.gather(_v, 1, _o2)[:, :50]
+            topk_idx = torch.gather(_i, 1, _o2)[:, :50]
+        else:
+            # tiny-vocab fallback (never the mining model): original full sort
+            sorted_logits, sorted_indices = torch.sort(
+                proof_logits, dim=-1, descending=True, stable=True)
+            topk_vals = sorted_logits[:, :50]
+            topk_idx = sorted_indices[:, :50]
 
         probe_step = max(vocab_size // 20, 1)
         probe_indices_list = torch.arange(
@@ -811,29 +838,24 @@ class PowTopKTopPSampler(TopKTopPSampler):
         mean_tensor = torch.zeros(
             (batch_size, 6), dtype=torch.float32, device=device)
         mean_tensor[:, 0] = logsumexp_full
-        if vocab_size >= 50:
-            mean_tensor[:, 1] = torch.mean(
-                sorted_logits[:, :50], dim=-1)
-        if vocab_size >= 500:
-            mean_tensor[:, 2] = torch.mean(
-                sorted_logits[:, 50:500], dim=-1)
-        if vocab_size >= 2000:
-            mean_tensor[:, 3] = torch.mean(
-                sorted_logits[:, 500:2000], dim=-1)
-        # Tail mean by subtraction: mean(sorted[2000:]) read the full row a
-        # second time (another ~78 MB pass after mean-all). One sum serves
-        # both stats instead. FP reduction order differs from summing the
-        # sorted tail directly — exactly the formulation the k=2000
-        # experiment replay-tested 7/7 GREEN (docs/POW_SAMPLER_OVERHEAD.md
-        # §5); neither value enters the share digest
-        # (powverify._build_step_message).
         if vocab_size > 2000:
-            total = sorted_logits.sum(dim=-1)
+            # buckets from the sorted topk head (bit-identical to the sorted
+            # slices); tail & mean-all by subtraction (see note above).
+            mean_tensor[:, 1] = torch.mean(tk_vals[:, :50], dim=-1)
+            mean_tensor[:, 2] = torch.mean(tk_vals[:, 50:500], dim=-1)
+            mean_tensor[:, 3] = torch.mean(tk_vals[:, 500:2000], dim=-1)
+            total = proof_logits.sum(dim=-1)
             mean_tensor[:, 4] = (
-                (total - sorted_logits[:, :2000].sum(dim=-1))
+                (total - tk_vals.sum(dim=-1))
                 / (vocab_size - 2000))
             mean_tensor[:, 5] = total / vocab_size
         else:
+            if vocab_size >= 50:
+                mean_tensor[:, 1] = torch.mean(
+                    sorted_logits[:, :50], dim=-1)
+            if vocab_size >= 500:
+                mean_tensor[:, 2] = torch.mean(
+                    sorted_logits[:, 50:500], dim=-1)
             mean_tensor[:, 5] = torch.mean(sorted_logits, dim=-1)
 
         # 5. Probs & CDF.
@@ -843,8 +865,10 @@ class PowTopKTopPSampler(TopKTopPSampler):
         # support: everything else was masked to -inf, so its probability is
         # exactly 0 and contributes nothing to any partial sum. Restricting the
         # CDF to those 50 entries is therefore arithmetically the same
-        # reduction, ~3000x narrower. Everything outside the top-50 was
-        # masked to -inf (probability exactly 0), so it contributes nothing.
+        # reduction, ~3000x narrower.
+        #
+        # Everything outside the top-50 was masked to -inf (probability 0), so
+        # it contributes nothing to any partial sum.
         use_compact_cdf = self._can_use_compact_cdf(seq_ids)
         # instrumentation: count engaged vs fallback steps (verifies the A/B)
         if not hasattr(self, "_cdf_path_counts"):

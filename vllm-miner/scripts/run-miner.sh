@@ -4,7 +4,7 @@
 # starts the inf-fixed vLLM engine + the hardened stratum bridge, both under a
 # supervised loop. One command; no per-run flags.
 set -u
-PKG="$(cd "$(dirname "$0")/.." && pwd)"
+PKG="${PKG_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 CFG="${1:-$PKG/config/miner.env}"
 [ -f "$CFG" ] || { echo "config not found: $CFG" >&2; exit 1; }
 # shellcheck disable=SC1090
@@ -38,7 +38,6 @@ export POW_EGRESS_MODE=broker POW_PROXY_ENABLE=false ZMQ_PUSH_HOST=127.0.0.1 ZMQ
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 _engine() {
-  cd "$TC_VLLM"
   exec "$VENV/bin/vllm" serve "$SNAP" \
     --served-model-name "$MINING_MODEL_NAME" --revision "$MINING_MODEL_COMMIT" \
     $PAR --dtype "$MINING_DTYPE" --load-format safetensors \
@@ -58,23 +57,37 @@ _bridge() {
     --dump-proof "$PKG/last-submitted-proof.bin"
 }
 
+# vLLM emits engine + EngineCore subprocess logs to its own stdout/stderr; keep
+# them ON the container's streams (do NOT swallow into a file) so crashes are
+# visible in `docker logs`. Persist the compile/cudagraph cache to the model
+# volume so the slow cold boot (CUDA graph capture) happens ONCE.
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$HF_MODEL_CACHE/.vllm_cache}"
+mkdir -p "$VLLM_CACHE_ROOT" 2>/dev/null || true
+
 case "${MODE_RUN:-both}" in
   engine) _engine ;;
   bridge) _bridge ;;
   both)
     echo "[run-miner] starting engine ($PAR) on GPUs $GPUS ..." >&2
-    ( _engine ) > "$PKG/engine.log" 2>&1 &
+    _engine &
     EPID=$!
-    # wait for engine health, then bridge
-    for _ in $(seq 1 90); do
-      grep -qE "Application startup complete|Uvicorn running" "$PKG/engine.log" 2>/dev/null && break
-      kill -0 "$EPID" 2>/dev/null || { echo "[run-miner] engine died; see engine.log" >&2; exit 1; }
-      sleep 4
+    trap 'kill $EPID 2>/dev/null; pkill -f "vllm-stratum-bridge.py"; pkill -9 -f "EngineCore"' TERM INT EXIT
+    # Health-poll (not log-grep): cold first boot captures CUDA graphs for up to
+    # ~15 min. Fail only if the engine PROCESS actually exits.
+    ready=0
+    for _ in $(seq 1 200); do   # 200 x 5s = ~16 min
+      if curl -sf -o /dev/null -H "Authorization: Bearer $VLLM_API_KEY" http://127.0.0.1:8000/health 2>/dev/null; then
+        ready=1; break
+      fi
+      kill -0 "$EPID" 2>/dev/null || { echo "[run-miner] engine process exited during startup" >&2; exit 1; }
+      sleep 5
     done
-    echo "[run-miner] engine up; starting bridge -> $POOL_HOST:$POOL_PORT worker $WALLET.$WORKER_SUFFIX" >&2
-    ( _bridge ) > "$PKG/bridge.log" 2>&1 &
+    [ "$ready" = 1 ] || { echo "[run-miner] engine did not become healthy in time" >&2; exit 1; }
+    echo "[run-miner] engine healthy; starting bridge -> $POOL_HOST:$POOL_PORT worker $WALLET.$WORKER_SUFFIX" >&2
+    _bridge &
     BPID=$!
-    trap 'kill -9 $BPID $EPID 2>/dev/null; pkill -9 -f "VLLM::EngineCore"; pkill -9 -f "VLLM::Worker"' TERM INT
-    wait "$BPID"
+    # exit (and let the entrypoint restart the pair) if EITHER dies
+    while kill -0 "$EPID" 2>/dev/null && kill -0 "$BPID" 2>/dev/null; do sleep 5; done
+    echo "[run-miner] engine or bridge exited; cycling" >&2
     ;;
 esac
