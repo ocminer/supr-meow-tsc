@@ -42,9 +42,9 @@ No stock wheel yet targets sm_120; build vLLM 0.19 from source with
 build once; the resulting env is reusable.
 
 **3. Any arch — per-arch Docker / proot (portable).**
-boblabs ships a precompiled image (`bobponey/tensorcash-pool-miner`) that runs
-their vLLM under proot (userspace, no root/Docker) — verified to run our engine
-path end-to-end. If we publish images, build one per arch (Ada/Ampere wheel;
+A precompiled per-arch image can run the vLLM engine under proot (userspace,
+no root/Docker required) — verified end-to-end. If we publish images, build one
+per arch (Ada/Ampere wheel;
 Blackwell source) and bake the fixed sampler in. The proot native path is the
 fallback for rented/locked containers (≥24 GB there; splitting needs matched
 local cards).

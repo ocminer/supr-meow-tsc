@@ -532,7 +532,7 @@ class PowTopKTopPSampler(TopKTopPSampler):
     # Forward
     # ------------------------------------------------------------------ #
 
-    # ── compact top-50 CDF (AriaBrain v1.8.1, Apache-2.0) ──────────────
+    # ── compact top-50 CDF ────────────────────────────────────────────
     _compact_cdf_enabled = _os.environ.get(
         "POW_COMPACT_CDF", "1").lower() in ("1", "true", "yes")
 
@@ -632,7 +632,7 @@ class PowTopKTopPSampler(TopKTopPSampler):
         # -INF LOGIT FIX (ported from tc-vllm 27f9cee / sha 50f2fdda, 2026-08-09).
         # vLLM masks a few IN-VOCAB tokens to -inf (2 of 151936 for Qwen3-8B); those
         # poison logsumexp_stats[4:5] -> verifier p=0 -> RED. MANDATORY even here
-        # (boblabs' own proofs carried these -inf). Replace with per-row finite min
+        # (observed across every engine variant). Replace with per-row finite min
         # before any PoW/compact-CDF computation. No-op when all finite.
         _inf_mask = torch.isinf(proof_logits)
         if bool(_inf_mask.any()):
@@ -843,9 +843,8 @@ class PowTopKTopPSampler(TopKTopPSampler):
         # support: everything else was masked to -inf, so its probability is
         # exactly 0 and contributes nothing to any partial sum. Restricting the
         # CDF to those 50 entries is therefore arithmetically the same
-        # reduction, ~3000x narrower.
-        #
-        # Derived from AriaBrain LuckyPool worker v1.8.1 (Apache-2.0).
+        # reduction, ~3000x narrower. Everything outside the top-50 was
+        # masked to -inf (probability exactly 0), so it contributes nothing.
         use_compact_cdf = self._can_use_compact_cdf(seq_ids)
         # instrumentation: count engaged vs fallback steps (verifies the A/B)
         if not hasattr(self, "_cdf_path_counts"):
@@ -992,7 +991,7 @@ class PowTopKTopPSampler(TopKTopPSampler):
 
     def _get_context_windows(self, seq_ids, rows_tensor=None):
         # our canonical helper (md5 2fb0bfd2) predates the rows_tensor fast
-        # path; same semantics without it (boblabs' shipped runtime also 1-arg)
+        # path; same semantics without it (the 1-arg form is the portable one)
         return self._common.get_context_windows(seq_ids)
 
     def _ensure_rows(self, seq_ids, prompt_mapping):

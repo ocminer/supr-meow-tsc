@@ -35,7 +35,7 @@ bash scripts/run-miner.sh
 3. **socket-timeout reader fix** — no more reader death dropping the pool conn.
 4. **padded-vocab -inf fix (THE one)** — vLLM masks ~2 in-vocab tokens to -inf,
    poisoning `logsumexp_stats[4:5]` → infinite Mahalanobis → p=0 every step →
-   RED (R2/R3/R4/boblabs, all engines/topologies). Replace -inf with the per-row
+   RED (every engine and topology we tested). Replace -inf with the per-row
    finite min before the PoW snapshot. This closed the entire arc.
 
 ## Verify a proof (offline)
