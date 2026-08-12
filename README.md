@@ -10,8 +10,8 @@ at a pool, run it.
 >
 > **Will my card work?** See **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)**.
 > **New:** two matched ~16 GB cards (e.g. 2x RTX 5080) mine ~12.7 w/s via the
-> **[vLLM backend](vllm-miner/)** — chain-verified across three audit rounds
-> (363 proofs, 0 rejected).
+> **[vLLM backend](vllm-miner/)** — a one-command Docker image, chain-verified:
+> `docker run --gpus all -e WALLET=tc1q... -e POOL=stratum+tcp://host:port ocminersupr/supr-meow-tsc-vllm:latest`
 > Short version: NVIDIA **Ampere or newer** (bf16 is mandatory — Turing/RTX
 > 20-series can *never* mine TSC) and **24 GB VRAM** on one card, or two
 > matched ~16 GB cards via the vLLM backend. llama's own `--split-model` stays

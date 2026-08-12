@@ -1,52 +1,54 @@
-# TensorCash vLLM multi-GPU miner (round-5 GREEN build)
+# supr-meow-tsc — vLLM backend (sub-24 GB multi-GPU tier)
 
-The vLLM backend for the **sub-24 GB multi-GPU** tier that llama.cpp can't serve:
-an 8B bf16 model split across a matched pair of small cards, producing
-chain-verified (full-tier GREEN) PoW proofs. Joined to the existing stratum
-layer, so it mines the same pools as the llama miner.
+The TensorCash miner is **two engines, one stratum layer**:
 
-Status: **cleared** — round-5 pool audit, PP=2 cell 10/10 GREEN + single-GPU
-25/25 GREEN + llama control 24/24 GREEN, 59 audited / 0 RED.
+- **llama.cpp** (the main `supr-meow-tsc` binary) — fastest on a single GPU with
+  ≥24 GB, plus CPU/Apple/edge and all packaged platforms. Use it there.
+- **vLLM** (this backend) — for **two matched ~16 GB cards** (e.g. 2× RTX 5080)
+  that llama.cpp cannot serve, and for 24 GB+ single-GPU vLLM. ~12.7 w/s per
+  16 GB pair, chain-verified.
 
-## Quickstart
-```
-# 1. install the engine for your GPU arch (see docs/DEPLOYMENT.md)
-# 2. edit config/miner.env: WALLET, GPUS (the pair), POOL_HOST, WORKER_SUFFIX
-# 3. run
-bash scripts/run-miner.sh
-```
+## Run it (one command)
 
-## Layout
-- `config/miner.env`   — all operator knobs (model/commit pin, GPUs, parallel
-                         mode, pool, B_cred floor). Code fixes are baked in.
-- `scripts/run-miner.sh` — config-driven launcher: PP/TP auto-select, engine +
-                         bridge, supervised.
-- `scripts/gpu_parallel_select.py` — interconnect detect (PCIe→PP, NVLink→TP).
-- `engine/topk_topp_sampler.py` — PoW sampler WITH the mandatory -inf fix
-                         (sha 50f2fdda…). Overlay onto the vLLM 0.19 tree.
-- `bridge/vllm-stratum-bridge.py` — hardened stratum bridge.
-- `docs/DEPLOYMENT.md`  — per-arch install (wheel / source / docker).
-- `docs/COMPATIBILITY.md` — hardware pointer (full matrix in the repo-level docs).
-
-## The fixes baked in (the R1–R5 arc)
-1. **model-id pin** — proof stamps `Qwen/Qwen3-8B@<40-hex commit>`; unpinned →
-   `@unknown` → verifier hangs (R1).
-2. **B_cred ≥70 pre-submit gate** — drop low-entropy windows before submit.
-3. **socket-timeout reader fix** — no more reader death dropping the pool conn.
-4. **padded-vocab -inf fix (THE one)** — vLLM masks ~2 in-vocab tokens to -inf,
-   poisoning `logsumexp_stats[4:5]` → infinite Mahalanobis → p=0 every step →
-   RED (every engine and topology we tested). Replace -inf with the per-row
-   finite min before the PoW snapshot. This closed the entire arc.
-
-## Verify a proof (offline)
-```
-strings last-submitted-proof.bin | grep 'Qwen/Qwen3-8B@'    # commit, not 'unknown'
-# decode: all 6 logsumexp_stats finite at every step (no -inf)
+```bash
+docker run -d --restart unless-stopped --gpus all --shm-size=4g \
+  -v meow-vllm-models:/models \
+  -e WALLET=tc1qYOUR_ADDRESS \
+  -e WORKER=rig1 \
+  -e POOL=stratum+tcp://tsc.suprnova.cc:3310 \
+  ocminersupr/supr-meow-tsc-vllm:latest
 ```
 
-## Lessons (recorded)
-- **Decode the artifact before theorizing about the system.** Four hypotheses
-  died to reasoning; the truth was in the raw proof bytes.
-- A **from-step-0, p=0.0-everywhere** failure with tiny per-step errors means a
-  **poisoned/degenerate stat** (-inf/NaN), not a subtle model difference. Local
-  drift was never the right proxy — the -inf lived in a stat drift doesn't weight.
+First boot fetches Qwen3-8B and captures CUDA graphs (10–30 min); the model and
+compile cache persist in the named volume across restarts.
+
+**One image, every supported GPU.** The vLLM 0.19 wheel ships native kernels for
+Ampere → Blackwell (incl. RTX 5080/5090, sm_120), so no per-arch build.
+
+## Common options (all `-e`)
+
+| var | default | meaning |
+|---|---|---|
+| `WALLET` | — (required) | your `tc1q…` payout address |
+| `POOL` | — (required) | `stratum+tcp://host:port` |
+| `WORKER` | `vllmrig0` | worker name shown on the pool |
+| `GPUS` | `all` | `all`, `0`, or `2,3` (a 16 GB pair) |
+| `PARALLEL` | `auto` | `auto`\|`pp`\|`tp`\|`single` — auto picks PP on PCIe, TP on NVLink |
+| `MAX_NUM_SEQS` | `256` | batch (audited high-batch default) |
+| `GPU_MEM_UTIL` | `0.84` | measured-safe VRAM fraction |
+
+## What's baked in
+
+The image installs the stock `vllm==0.19.0` wheel and overlays our audited
+proof-of-inference path (compact top-50 CDF, topk-opt snapshot, the `-inf`
+statistics fix, a pre-submit B_cred gate, and a pinned model revision). Every
+change is validated against the pool's full-tier GPU verification before ship.
+
+## Build from source
+
+```bash
+docker build -t supr-meow-tsc-vllm vllm-miner/
+```
+
+`config/miner.env` documents every knob; `docs/DEPLOYMENT.md` covers wheel vs
+source and multi-GPU layouts.
