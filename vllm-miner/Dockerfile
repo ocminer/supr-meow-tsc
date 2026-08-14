@@ -1,5 +1,4 @@
-# supr-meow-tsc vLLM backend — production miner image for the sub-24 GB
-# multi-GPU tier (two matched ~16 GB cards) and 24 GB+ single-GPU vLLM.
+# supr-meow-tsc vLLM backend — SLIM production miner image (v0.5.1).
 #
 #   docker run -d --gpus all --shm-size=4g \
 #     -v meow-vllm-models:/models \
@@ -7,11 +6,14 @@
 #     -e POOL=stratum+tcp://tsc.suprnova.cc:3310 \
 #     ocminersupr/supr-meow-tsc-vllm:latest
 #
-# The vLLM 0.19.0 wheel ships native kernels for sm_80/89/90/100/120, so ONE
-# image serves Ampere through Blackwell (incl. RTX 5080/5090 consumer Blackwell,
-# sm_120) with NO per-arch source build. Our PoW additions are ALL pure-Python,
-# overlaid onto the stock wheel — no recompilation.
-FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+# Identical runtime behaviour to 0.5.0 (same wheel + same PoW overlay, already
+# pool-audited), on the CUDA -runtime base instead of -devel. The devel base
+# only added nvcc + multi-GB CUDA static libs that the running miner never
+# touches: triton bundles its OWN cuda headers + ptxas (backends/nvidia/) and
+# torch ships its own libcudart, so triton's first-boot JIT is self-contained.
+# We still install gcc/g++ + python3.12-dev because triton compiles a small
+# cuda_utils.c driver stub at first boot (needs a C compiler + Python.h).
+FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -27,8 +29,8 @@ ENV PATH=/opt/venv/bin:$PATH
 
 # ── PoW overlay: the COMPLETE set of forked pure-Python files onto the stock
 # wheel (sampler + serving/protocol layer that accepts the pow xarg + runner
-# hooks + support modules). This is the topk-opt / compact-CDF / inf-fixed
-# build that passed the pool full-tier audit (see vllm-miner/docs).
+# hooks + support modules). Same audited topk-opt / compact-CDF / inf-fixed set
+# as 0.5.0 — byte-for-byte identical overlay.
 ARG SITE=/opt/venv/lib/python3.12/site-packages
 COPY overlay/vllm/  ${SITE}/vllm/
 COPY overlay/proof/ ${SITE}/proof/
