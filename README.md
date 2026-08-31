@@ -212,7 +212,29 @@ download, so you can log in while that runs.
 
 ## Build
 
-Needs a CUDA toolkit (13.x tested) and an NVIDIA driver with NVML.
+Needs a CUDA toolkit (13.x tested) and an NVIDIA driver with NVML, plus
+**FlatBuffers v25** (both the `flatc` compiler and its headers), `libzmq`,
+`libargon2` and OpenSSL. The distro FlatBuffers 2.x fails a hard version
+assert, so build v25 and install it somewhere persistent:
+
+```bash
+curl -sSL https://github.com/google/flatbuffers/archive/refs/tags/v25.2.10.tar.gz | tar -xz
+cmake -S flatbuffers-25.2.10 -B flatbuffers-25.2.10/build \
+      -DCMAKE_BUILD_TYPE=Release -DFLATBUFFERS_BUILD_TESTS=OFF \
+      -DCMAKE_INSTALL_PREFIX=$HOME/.local
+cmake --build flatbuffers-25.2.10/build -j && cmake --install flatbuffers-25.2.10/build
+```
+
+`FLATC_EXECUTABLE` and `FLATBUFFERS_INCLUDE_DIR` are **cached** by CMake, so if
+an earlier configure found a copy in a temp directory that has since been
+deleted, the build fails with `flatc: No such file` or a missing
+`flatbuffers/flatbuffers.h` even after you install it. Point them at the real
+paths explicitly when that happens:
+
+```bash
+cmake -B build -DFLATC_EXECUTABLE=$HOME/.local/bin/flatc \
+               -DFLATBUFFERS_INCLUDE_DIR=$HOME/.local/include
+```
 
 **Do not clone with `--recursive`.** `vendor/tensorcash` contains nested
 submodules this project does not use, and at least one of them is unreachable,
