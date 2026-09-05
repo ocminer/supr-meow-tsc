@@ -5,7 +5,7 @@ smaller memory. This release also improves device selection and shutdown.
 
 | Hardware | Mining rate |
 |---|---:|
-| RTX 5090 32 GB | 34.3 windows/s |
+| RTX 5090 32 GB | 34.0 windows/s |
 | 2 × RTX 3070 8 GB, shared model | 7.2 windows/s combined |
 
 Rates vary with hardware, clocks and operating conditions.
@@ -19,6 +19,7 @@ Rates vary with hardware, clocks and operating conditions.
 | SimpleMining | `supr-meow-tsc-0.6.0-smos.tar.gz` |
 | Linux x86-64 | `supr-meow-tsc-0.6.0-linux-x86_64.tar.gz` |
 | Docker | `ocminersupr/supr-meow-tsc:0.6.0` |
+| Checksums | `supr-meow-tsc-0.6.0.sha256` |
 
 Use an NVIDIA Ampere or newer GPU and a compatible current NVIDIA driver.
 The first start downloads the required model; keep the model cache between runs.
@@ -61,10 +62,12 @@ the exact unsuffixed archive name shown above as the installation URL.
 
 ## Docker
 
+Install and configure the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) on the host first.
+
 ```sh
 docker run --rm --gpus '"device=0,1"' \
   -v meow-models:/models \
-  -e POOL='stratum+tcp://YOUR_POOL:PORT' \
+  -e POOL_URL='stratum+tcp://YOUR_POOL:PORT' \
   -e WALLET='YOUR_WALLET' -e WORKER=rig1 \
   -e DEVICES=0,1 -e SPLIT_MODEL=1 \
   ocminersupr/supr-meow-tsc:0.6.0
@@ -72,6 +75,8 @@ docker run --rm --gpus '"device=0,1"' \
 
 For one card, use `--gpus '"device=0"'`, `DEVICES=0` and omit `SPLIT_MODEL`.
 Device numbers inside a restricted container refer to its visible GPUs.
+On hosts using CDI, replace `--gpus` with `--device=nvidia.com/gpu=0`
+(and `--device=nvidia.com/gpu=1` for the second card).
 
 ## Upgrade and pool identification
 

@@ -8,6 +8,19 @@ See [v0.6.0 release notes](RELEASE-v0.6.0.md) for downloads, measured rates and
 upgrade instructions, and [hardware compatibility](docs/COMPATIBILITY.md) for
 requirements.
 
+## Performance
+
+Measured end-to-end during live-pool mining with the current miner.
+
+| GPU | Mining rate |
+|---|---:|
+| RTX 5090 32 GB | approximately 34.0 windows/s |
+| 2 × RTX 3070 8 GB, shared model | approximately 7.2 windows/s combined |
+
+Only recently tested hardware is listed. Other cards will be added after they
+are retested with this version. Rates vary with clocks and operating conditions.
+See [operation notes](docs/OPERATIONS.md) for setup.
+
 ## Quick start
 
 From an extracted Linux package:

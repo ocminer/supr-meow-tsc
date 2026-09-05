@@ -1,21 +1,23 @@
-# Minimal Octa Space / any-Docker-host deployment.
-#   POOL_URL and WALLET are the only required variables.
 services:
   miner:
-    image: supr-meow-tsc:slim
+    image: ocminersupr/supr-meow-tsc:0.6.0
     restart: unless-stopped
-    runtime: nvidia                 # or: deploy.resources.reservations.devices
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
     environment:
-      POOL_URL: "stratum+tcp://POOL_HOST:PORT"
-      WALLET:   "YOUR_PAYOUT_ADDRESS"
-      WORKER:   "rig01"
-      MODEL_URL: "https://YOUR_HOST/Qwen3-8B-<commit>-bf16.gguf"
-      # MODEL_SHA256: "<sha256 of the gguf>"   # recommended
-      # DEVICES: "0"        # omit to use every GPU
-      # SLOTS: "128"        # 8B on 32 GB; lower for smaller cards
-      # GROUPS: "12"
-      # API_BIND: "0.0.0.0:21550"
+      POOL_URL: "stratum+tcp://YOUR_POOL:PORT"
+      WALLET: "YOUR_WALLET"
+      WORKER: "rig1"
+      DEVICES: "0"
+      # For a matching pair, select both device_ids above and use:
+      # DEVICES: "0,1"
+      # SPLIT_MODEL: "1"
     volumes:
-      - model-cache:/models         # keeps the GGUF across restarts
+      - model-cache:/models
 volumes:
   model-cache:
