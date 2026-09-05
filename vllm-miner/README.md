@@ -1,3 +1,6 @@
+> Legacy backend: for the current v0.6.0 packages and shared-card setup, see
+> [the release notes](../RELEASE-v0.6.0.md).
+
 # supr-meow-tsc — vLLM backend (sub-24 GB multi-GPU tier)
 
 The TensorCash miner is **two engines, one stratum layer**:

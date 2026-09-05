@@ -13,12 +13,14 @@
 #include <stdexcept>
 
 #ifdef POW_GPU_SORT_ENABLED
+extern "C" void pow_gpu_unregister_host_range(const void* p);
 extern "C" bool pow_gpu_is_device_ptr(const void* p);
 extern "C" void* pow_gpu_device_alloc(size_t bytes);
 extern "C" void  pow_gpu_device_free(void* p);
 extern "C" bool  pow_gpu_d2d_copy_sync(void* dst, const void* src, size_t bytes);
 extern "C" bool  pow_gpu_copy_to_host(void* dst, const void* src, size_t bytes);
 #else
+static inline void pow_gpu_unregister_host_range(const void*) {}
 static inline bool pow_gpu_is_device_ptr(const void*) { return false; }
 static inline void* pow_gpu_device_alloc(size_t) { return nullptr; }
 static inline void  pow_gpu_device_free(void*) {}
@@ -30,8 +32,12 @@ namespace meow {
 
 struct InferenceEngine::Instance {
     int             device      = -1;
+    int             sampler_device = -1;
     llama_model*    model       = nullptr;   // shared; owned by owns_model==true
     llama_context*  ctx         = nullptr;
+    llama_context_params context_params{};
+    bool used_stepwise = false;
+    std::vector<float> prompt_logits; // stable backing for registered host DMA
     // Second context for the double-buffered decode: each batch keeps a
     // STABLE sequence set on its own context, so llama's graph reuse
     // survives — alternating seq-id sets on ONE context forced a graph
@@ -42,6 +48,7 @@ struct InferenceEngine::Instance {
     size_t          dbuf_bytes  = 0;
 
     ~Instance() {
+        if (prompt_logits.data()) pow_gpu_unregister_host_range(prompt_logits.data());
         pow_gpu_device_free(dbuf[0]);
         pow_gpu_device_free(dbuf[1]);
         if (ctx_b) llama_free(ctx_b);
@@ -49,6 +56,10 @@ struct InferenceEngine::Instance {
         if (owns_model && model) llama_model_free(model);
     }
 };
+
+int InferenceEngine::worker_sampler_device(int w) const {
+    return (w >= 0 && w < (int)instances_.size()) ? instances_[w]->sampler_device : -1;
+}
 
 int InferenceEngine::worker_device(int w) const {
     return (w >= 0 && w < (int)instances_.size()) ? instances_[w]->device : -1;
@@ -78,10 +89,14 @@ bool InferenceEngine::load(const EngineConfig& cfg, std::string& error,
         return false;
     }
     // Guard rail, not a suggestion: see EngineConfig.
-    if (cfg.ctx_per_slot <= cfg.window_tokens + 64) {
+    if (cfg.ctx_per_slot <= cfg.window_tokens) {
         error = "ctx_per_slot (" + std::to_string(cfg.ctx_per_slot) + ") must exceed the "
-                + std::to_string(cfg.window_tokens) + "-token window plus prompt headroom; "
+                + std::to_string(cfg.window_tokens) + "-token window with room for a prompt; "
                 "otherwise generation truncates and no proof is ever produced";
+        return false;
+    }
+    if (cfg.kv_cache_type != "f16" && cfg.kv_cache_type != "q8_0") {
+        error = "unsupported KV cache type: " + cfg.kv_cache_type;
         return false;
     }
 
@@ -100,8 +115,14 @@ bool InferenceEngine::load(const EngineConfig& cfg, std::string& error,
     // Split mode loads the model ONCE across every selected GPU, so the loop
     // below runs a single time and `dev` is only the main/first card. The
     // data-parallel path is unchanged: one full model per device.
-    const std::vector<int> load_devices =
-        cfg.split_model ? std::vector<int>{ cfg.devices.front() } : cfg.devices;
+    const int group_size = cfg.split_model
+        ? (cfg.split_group_size > 0 ? cfg.split_group_size : int(cfg.devices.size())) : 1;
+    if (group_size < 1 || cfg.devices.size() % size_t(group_size) != 0) {
+        error = "selected devices must form complete split groups"; return false;
+    }
+    std::vector<int> load_devices;
+    for (size_t i=0;i<cfg.devices.size();i+=size_t(group_size)) load_devices.push_back(cfg.devices[i]);
+    size_t group_offset = 0;
 
     for (int dev : load_devices) {
         llama_model_params mp = llama_model_default_params();
@@ -109,26 +130,36 @@ bool InferenceEngine::load(const EngineConfig& cfg, std::string& error,
         mp.main_gpu     = dev;
         mp.split_mode   = LLAMA_SPLIT_MODE_NONE;     // data parallel, see engine.h
         mp.use_mmap     = true;
+        llama_model_tensor_buft_override tensor_overrides[2] = {};
+        if (cfg.gpu_embeddings) {
+            const std::string name = "CUDA" + std::to_string(dev);
+            auto device = ggml_backend_dev_by_name(name.c_str());
+            if (!device) { error = "cannot resolve embedding GPU " + name; return false; }
+            tensor_overrides[0] = {"^token_embd[.]weight$", ggml_backend_dev_buffer_type(device)};
+            mp.tensor_buft_overrides = tensor_overrides;
+        }
 
         // Restrict llama to the cards we were given, in order. Without this it
         // would spread across every visible GPU and quietly collide with the
         // other miner processes on a multi-card box.
         std::vector<ggml_backend_dev_t> split_devs;
         if (cfg.split_model) {
-            for (int d : cfg.devices) {
+            for (size_t di=group_offset;di<group_offset+size_t(group_size);++di) {
+                const int d = cfg.devices[di];
                 char name[32];
                 std::snprintf(name, sizeof(name), "CUDA%d", d);
                 if (ggml_backend_dev_t bd = ggml_backend_dev_by_name(name)) split_devs.push_back(bd);
             }
-            if (split_devs.size() != cfg.devices.size()) {
+            if (split_devs.size() != size_t(group_size)) {
                 error = "split-model: could not resolve every selected GPU as a llama backend device";
                 return false;
             }
             split_devs.push_back(nullptr);           // llama wants a null terminator
             mp.devices    = split_devs.data();
+            mp.main_gpu   = 0; // ordinal within the explicit device subset
             mp.split_mode = cfg.split_rows ? LLAMA_SPLIT_MODE_ROW : LLAMA_SPLIT_MODE_LAYER;
             if (progress)
-                progress("splitting one model across " + std::to_string(cfg.devices.size()) +
+                progress("splitting one model across " + std::to_string(group_size) +
                          " GPUs (" + (cfg.split_rows ? "row/tensor-parallel" : "layer") + ")");
         }
 
@@ -143,6 +174,7 @@ bool InferenceEngine::load(const EngineConfig& cfg, std::string& error,
         for (int w = 0; w < W; ++w) {
             auto inst = std::make_unique<Instance>();
             inst->device     = dev;
+            inst->sampler_device = cfg.split_model ? cfg.devices[group_offset+size_t(group_size)-1] : dev;
             inst->model      = model;
             inst->owns_model = (w == 0);   // one owner frees the shared weights
 
@@ -151,14 +183,15 @@ bool InferenceEngine::load(const EngineConfig& cfg, std::string& error,
             // The prompt pass submits every stream's prompt in ONE batch, so
             // n_batch must cover slots * prompt_len or llama_decode fails and
             // the miner produces nothing. Sized generously from the slot count.
-            cp.n_batch   = std::max(2048u, static_cast<uint32_t>(cfg.slots_per_device) * 64u);
+            cp.n_batch   = cfg.prefix_prefill ? std::max(512u, static_cast<uint32_t>(cfg.slots_per_device))
+                : std::max(2048u, static_cast<uint32_t>(cfg.slots_per_device) * 64u);
             // The prompt pass submits every stream's prompt at once, so it is
             // processed in ceil(total_prompt / n_ubatch) forward passes. At
             // 256 slots that is ~10.9k tokens = 22 passes at the old 512, and
             // it measured 612 ms per window batch on an H100 (~9% of wall
             // time). Larger ubatches do the same token-work in fewer, bigger
             // GEMMs. MEOW_UBATCH overrides for A/B.
-            cp.n_ubatch  = [](){
+            cp.n_ubatch  = cfg.ubatch > 0 ? static_cast<uint32_t>(cfg.ubatch) : [](){
                 const char* e = std::getenv("MEOW_UBATCH");
                 const int v = e ? std::atoi(e) : 2048;
                 return static_cast<uint32_t>(v > 0 ? v : 2048);
@@ -166,13 +199,22 @@ bool InferenceEngine::load(const EngineConfig& cfg, std::string& error,
             cp.n_seq_max = static_cast<uint32_t>(cfg.slots_per_device);
             cp.n_threads = cfg.threads > 0 ? cfg.threads : 8;
             cp.n_threads_batch = cp.n_threads;
+            if (cfg.kv_cache_type == "q8_0") {
+                cp.type_k = GGML_TYPE_Q8_0;
+                cp.type_v = GGML_TYPE_Q8_0;
+                cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            }
 
+            inst->context_params = cp;
             inst->ctx = llama_init_from_model(inst->model, cp);
             if (!inst->ctx) {
                 error = "failed to create context " + std::to_string(w) + " on GPU " +
                         std::to_string(dev) + " (try fewer slots/workers or a smaller ctx)";
                 return false;
             }
+            std::fprintf(stderr, "[engine] effective context: %u tokens/sequence, %u sequences, batch %u, ubatch %u\n",
+                         llama_n_ctx_seq(inst->ctx), llama_n_seq_max(inst->ctx),
+                         llama_n_batch(inst->ctx), llama_n_ubatch(inst->ctx));
             if (cfg.double_buffer) {
                 inst->ctx_b = llama_init_from_model(inst->model, cp);
                 if (!inst->ctx_b) {
@@ -183,6 +225,7 @@ bool InferenceEngine::load(const EngineConfig& cfg, std::string& error,
             }
             instances_.push_back(std::move(inst));
         }
+        group_offset += size_t(group_size);
         if (progress) {
             progress("GPU " + std::to_string(dev) + " ready — " + std::to_string(W) +
                      " workers x " + std::to_string(cfg.slots_per_device) + " slots x " +
@@ -376,16 +419,92 @@ int InferenceEngine::generate_windows_stepwise_tok(int device_slot,
     if (S < 1 || S > cfg_.slots_per_device) { error = "bad stream count"; return -1; }
     for (int s = 0; s < S; ++s)
         if (toks[s].empty()) { error = "empty prompt"; return -1; }
+    for (const auto& prompt : toks) {
+        if (prompt.size() + static_cast<size_t>(cfg_.window_tokens) >
+            static_cast<size_t>(cfg_.ctx_per_slot)) {
+            error = "prompt plus mining window exceeds per-sequence context capacity";
+            return -1;
+        }
+    }
 
     const auto tp0 = std::chrono::steady_clock::now();
+    if (cfg_.split_model && cfg_.refresh_split_context && in.used_stepwise) {
+        // Reset the inference graph/scheduler as well as KV contents. Historical
+        // split failures appeared only after a high-slot context was reused.
+        llama_free(in.ctx);
+        in.ctx = llama_init_from_model(in.model, in.context_params);
+        if (!in.ctx) { error = "failed to recreate split context"; return -1; }
+    }
+    in.used_stepwise = true;
     llama_memory_clear(llama_get_memory(in.ctx), true);
     const auto tp1 = std::chrono::steady_clock::now();
 
-    // Prompt pass: all streams in one batch, one logits row per stream (its
-    // last prompt token).
     int total_prompt = 0; for (auto& t : toks) total_prompt += (int)t.size();
-    llama_batch pb = llama_batch_init(total_prompt, 0, S);
     std::vector<int32_t> last_row(S, -1);
+    auto& prompt_logits = in.prompt_logits;
+    if (prompt_logits.capacity() < size_t(S) * n_vocab && prompt_logits.data())
+        pow_gpu_unregister_host_range(prompt_logits.data());
+    prompt_logits.clear();
+    if (cfg_.prefix_prefill) {
+        // Retain the last prompt token per stream so each sequence has an
+        // independent output row, even when all prompts are identical.
+        size_t common = toks.front().size() - 1;
+        for (int s = 1; s < S; ++s) {
+            common = std::min(common, toks[s].size() - 1);
+            size_t i = 0;
+            while (i < common && toks[s][i] == toks[0][i]) ++i;
+            common = i;
+        }
+        const int cap = static_cast<int>(llama_n_batch(in.ctx));
+        llama_batch pb = llama_batch_init(cap, 0, 1);
+        auto add = [&](llama_token token, int pos, int seq, bool output) {
+            const int r = pb.n_tokens++;
+            pb.token[r] = token; pb.pos[r] = pos; pb.n_seq_id[r] = 1;
+            pb.seq_id[r][0] = seq; pb.logits[r] = output;
+            return r;
+        };
+        for (size_t i = 0; i < common; ++i) {
+            add(toks[0][i], static_cast<int>(i), 0, false);
+            if (pb.n_tokens == cap || i + 1 == common) {
+                if (llama_decode(in.ctx, pb) != 0) {
+                    llama_batch_free(pb); error = "shared prefix decode failed"; return -1;
+                }
+                pb.n_tokens = 0;
+            }
+        }
+        if (common) {
+            llama_synchronize(in.ctx);
+            for (int s = 1; s < S; ++s)
+                llama_memory_seq_cp(llama_get_memory(in.ctx), 0, s, -1, -1);
+        }
+        prompt_logits.resize(size_t(S) * n_vocab);
+        std::vector<std::pair<int,int>> outputs;
+        auto flush = [&]() {
+            if (!pb.n_tokens) return true;
+            if (llama_decode(in.ctx, pb) != 0) return false;
+            for (auto [seq, row] : outputs) {
+                const float* logits = llama_get_logits_ith(in.ctx, row);
+                if (!logits) return false;
+                std::memcpy(prompt_logits.data() + size_t(seq) * n_vocab, logits, size_t(n_vocab) * sizeof(float));
+            }
+            outputs.clear(); pb.n_tokens = 0;
+            return true;
+        };
+        for (int s = 0; s < S; ++s) {
+            for (size_t i = common; i < toks[s].size(); ++i) {
+                const bool output = i + 1 == toks[s].size();
+                const int row = add(toks[s][i], static_cast<int>(i), s, output);
+                if (output) outputs.emplace_back(s,row);
+                if (pb.n_tokens == cap && !flush()) {
+                    llama_batch_free(pb); error = "prompt suffix decode failed"; return -1;
+                }
+            }
+        }
+        const bool ok = flush();
+        llama_batch_free(pb);
+        if (!ok) { error = "prompt suffix decode failed"; return -1; }
+    } else {
+    llama_batch pb = llama_batch_init(total_prompt, 0, S);
     for (int s = 0; s < S; ++s) {
         for (size_t i = 0; i < toks[s].size(); ++i) {
             const int r = pb.n_tokens++;
@@ -400,6 +519,7 @@ int InferenceEngine::generate_windows_stepwise_tok(int device_slot,
     const int prc = llama_decode(in.ctx, pb);
     llama_batch_free(pb);
     if (prc != 0) { error = "prompt decode failed"; return -1; }
+    }
     llama_synchronize(in.ctx);   // make the prompt pass visible to the timer
     const auto tp2 = std::chrono::steady_clock::now();
     {
@@ -461,6 +581,9 @@ int InferenceEngine::generate_windows_stepwise_tok(int device_slot,
         const char* e = std::getenv("POW_GPU_DEVICE_LOGITS");
         return !(e && *e == '0');
     }();
+    const char* compare_flag = std::getenv("MEOW_COMPARE_DEVICE_LOGITS");
+    const bool compare_device = compare_flag && std::strcmp(compare_flag,"1") == 0;
+    std::vector<float> device_comparison;
     bool dev_mode = false;   // becomes true once the device pointer verifies
     for (int step_i = 0; step_i < cfg_.window_tokens; ++step_i) {
         nb.n_tokens = 0;
@@ -473,10 +596,11 @@ int InferenceEngine::generate_windows_stepwise_tok(int device_slot,
                 dev_logits = static_cast<const float*>(p);
                 if (!dev_mode) {
                     dev_mode = true;
-                    llama_set_skip_logits_copy(in.ctx, true);
-                    static bool once = false;
-                    if (!once) { once = true;
-                        std::fprintf(stderr, "[engine] GPU-resident logits ACTIVE — llama D2H skipped from step 2 on\n"); }
+                    llama_set_skip_logits_copy(in.ctx, !compare_device);
+                    static std::atomic<bool> once{false};
+                    if (!once.exchange(true))
+                        std::fprintf(stderr, "[engine] GPU-resident logits ACTIVE%s\n",
+                                     compare_device ? " (mapped host comparison enabled)" : " — llama D2H skipped from step 2 on");
                 }
             } else if (dev_mode) {
                 // The pointer verified before but is gone now — the host copy
@@ -486,9 +610,31 @@ int InferenceEngine::generate_windows_stepwise_tok(int device_slot,
                 error = "device logits vanished mid-window"; return -1;
             }
         }
+        if (dev_logits && compare_device) {
+            // Validate every raw GPU row against llama's synchronized, mapped
+            // host extraction on the SAME forward pass, before sampling.
+            device_comparison.resize(size_t(S)*n_vocab);
+            if (!pow_gpu_copy_to_host(device_comparison.data(),dev_logits,
+                                     device_comparison.size()*sizeof(float))) {
+                llama_batch_free(nb); error="device/host comparison copy failed"; return -1;
+            }
+            for (int row=0;row<S;++row) {
+                const float* host=llama_get_logits_ith(in.ctx,last_row[row]);
+                if (!host || std::memcmp(host,device_comparison.data()+size_t(row)*n_vocab,
+                                         size_t(n_vocab)*sizeof(float)) != 0) {
+                    llama_batch_free(nb);
+                    error="raw device logits differ from mapped host row at step "+std::to_string(step_i)+" row "+std::to_string(row);
+                    return -1;
+                }
+            }
+            if (step_i+1==cfg_.window_tokens)
+                std::fprintf(stderr,"[engine] device/host bitwise comparison passed: %d rows x %d decode steps\n",S,step_i);
+        }
         if (!dev_logits) {
             for (int s = 0; s < S; ++s) {
-                all_logits[s] = llama_get_logits_ith(in.ctx, last_row[s]);
+                all_logits[s] = step_i == 0 && !prompt_logits.empty()
+                    ? prompt_logits.data() + size_t(s) * n_vocab
+                    : llama_get_logits_ith(in.ctx, last_row[s]);
                 if (!all_logits[s]) { llama_batch_free(nb); error = "no logits returned"; return -1; }
             }
         }
@@ -609,7 +755,7 @@ int InferenceEngine::generate_windows_stepwise_tok(int device_slot,
     // One line per completed window batch (~every 5-15 s): per-step phase cost
     // and the implied throughput. Direct measurement — immune to the job-churn
     // noise that plagues delta-counting the windows counter.
-    { const double per_step_ms = 1000.0 * (t_sample + t_decode) / cfg_.window_tokens;
+    if (std::getenv("MEOW_PROFILE")) { const double per_step_ms = 1000.0 * (t_sample + t_decode) / cfg_.window_tokens;
       std::fprintf(stderr, "[prof] batch S=%d: sample=%.1f decode-issue=%.1f ms/step -> %.2f windows/s LOOP-ONLY (see [prof-e2e])\n",
                    S, 1000.0*t_sample/cfg_.window_tokens, 1000.0*t_decode/cfg_.window_tokens,
                    per_step_ms > 0 ? 1000.0 * S / (256.0 * per_step_ms) : 0.0); }

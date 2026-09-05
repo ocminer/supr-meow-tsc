@@ -1,0 +1,14 @@
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -183,7 +183,10 @@
+         const char * mining_pad = getenv("MEOW_KV_PAD64");
+         const bool compact_q8 = mining_pad && mining_pad[0] == '1' && cparams.flash_attn &&
+             params.type_k == GGML_TYPE_Q8_0 && params.type_v == GGML_TYPE_Q8_0;
+-        cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, compact_q8 ? 64 : 256);
++        const char * f16_pad = getenv("MEOW_F16_KV_PAD64");
++        const bool compact_f16 = f16_pad && f16_pad[0] == '1' && cparams.flash_attn &&
++            params.type_k == GGML_TYPE_F16 && params.type_v == GGML_TYPE_F16;
++        cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, (compact_q8 || compact_f16) ? 64 : 256);
+ 
+         if (cparams.n_ctx_seq == 0) {
+             throw std::runtime_error("n_ctx_seq == 0");

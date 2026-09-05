@@ -229,6 +229,9 @@ fi
 
 MODEL_DIR="${MODEL_DIR:-/models}"
 mkdir -p "$MODEL_DIR"
+if [[ ${Q8_PROFILE:-1} == 1 ]]; then
+  . "/app/q8-profile.sh" || exit 1
+fi
 
 # ---- model resolution -------------------------------------------------
 if [[ -z "${MODEL_PATH:-}" ]]; then
@@ -290,6 +293,7 @@ args+=( -u "$USER_ARG" -p "${PASSWORD:-x}" --model "$MODEL_PATH" --no-color )
 # 15.3 GB model alone (2x12, 4x8, 8x6 GB). Aggregates VRAM, does not add
 # throughput, and the cards should be identical. Do NOT also run one container
 # per GPU — they would fight over the same cards.
+[[ ${Q8_PROFILE:-1} == 1 ]] && args+=( --q8 )
 [[ "${SPLIT_MODEL:-0}" == "1" ]] && args+=( --split-model )
 [[ "${SPLIT_ROWS:-0}"  == "1" ]] && args+=( --split-rows )
 args+=( --api-bind "${API_BIND:-off}" )

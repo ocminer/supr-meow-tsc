@@ -28,6 +28,18 @@ if(NOT EXISTS "${MEOW_LLAMA_DIR}/CMakeLists.txt")
     "Run: git submodule update --init --recursive")
 endif()
 
+# These extensions are part of the audited native profile. Fail configuration
+# rather than silently build a slower/different engine from pristine llama.
+file(READ "${MEOW_LLAMA_DIR}/src/llama-context.cpp" MEOW_LLAMA_CONTEXT_SOURCE)
+file(READ "${MEOW_LLAMA_DIR}/src/llama-kv-cache.cpp" MEOW_LLAMA_KV_SOURCE)
+file(READ "${MEOW_LLAMA_DIR}/src/llama-cparams.h" MEOW_LLAMA_CPARAMS_SOURCE)
+if(NOT MEOW_LLAMA_CONTEXT_SOURCE MATCHES "MEOW_KV_PAD64" OR
+   NOT MEOW_LLAMA_CONTEXT_SOURCE MATCHES "MEOW_F16_KV_PAD64" OR
+   NOT MEOW_LLAMA_KV_SOURCE MATCHES "MEOW_KV_SINGLE_UBATCH" OR
+   NOT MEOW_LLAMA_CPARAMS_SOURCE MATCHES "#ifndef LLAMA_MAX_SEQ")
+  message(FATAL_ERROR "Prepare the pinned llama dependency first: bash tools/prepare-llama.sh ${MEOW_LLAMA_DIR}")
+endif()
+
 option(MEOW_CUDA "Build with CUDA (required to mine)" ON)
 if(MEOW_CUDA)
   set(GGML_CUDA ON CACHE BOOL "" FORCE)
@@ -38,6 +50,12 @@ set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL           OFF CACHE BOOL "" FORCE)
 add_subdirectory(${MEOW_LLAMA_DIR} ${CMAKE_BINARY_DIR}/llama EXCLUDE_FROM_ALL)
+set(MEOW_MAX_SEQUENCES 512 CACHE STRING "Compile-time llama sequence bound (experimental 1024)")
+set_property(CACHE MEOW_MAX_SEQUENCES PROPERTY STRINGS 512 1024)
+if(NOT MEOW_MAX_SEQUENCES MATCHES "^(512|1024)$")
+  message(FATAL_ERROR "MEOW_MAX_SEQUENCES must be 512 or 1024")
+endif()
+target_compile_definitions(llama PUBLIC LLAMA_MAX_SEQ=${MEOW_MAX_SEQUENCES})
 
 # ---------------------------------------------------------------------------
 # Proof-of-inference sources.
@@ -135,12 +153,14 @@ add_custom_command(
   # each patch fixes; it fails the build if a target has disappeared.
   COMMAND ${CMAKE_COMMAND} -E env python3
           ${CMAKE_SOURCE_DIR}/tools/patch-staged-poi.py ${MEOW_POI_STAGE}
-  DEPENDS ${CMAKE_SOURCE_DIR}/tools/patch-staged-poi.py ${MEOW_FB_HEADERS} ${MEOW_POW_DIR}/pow_utils.cpp ${MEOW_POW_DIR}/pow_v3.cpp
+  COMMAND ${CMAKE_COMMAND} -E env python3
+          ${CMAKE_SOURCE_DIR}/tools/optimize-staged-poi.py ${MEOW_POI_STAGE}
+  DEPENDS ${CMAKE_SOURCE_DIR}/tools/optimize-staged-poi.py ${CMAKE_SOURCE_DIR}/tools/patch-staged-poi.py ${MEOW_FB_HEADERS} ${MEOW_POW_DIR}/pow_utils.cpp ${MEOW_POW_DIR}/pow_v3.cpp
   COMMENT "Staging proof-of-inference sources with regenerated schemas")
 
 add_library(meow_poi STATIC ${MEOW_POI_STAGED})
 target_include_directories(meow_poi PUBLIC
-  ${MEOW_POI_STAGE} ${ARGON2_INCLUDE_DIR} ${FLATBUFFERS_INCLUDE_DIR} ${ZMQ_INCLUDE_DIR})
+  ${MEOW_POI_STAGE} ${CMAKE_SOURCE_DIR}/src ${ARGON2_INCLUDE_DIR} ${FLATBUFFERS_INCLUDE_DIR} ${ZMQ_INCLUDE_DIR})
 target_link_libraries(meow_poi PUBLIC ${ARGON2_LIBRARY} ${ZMQ_LIBRARY} OpenSSL::Crypto)
 # Linking libargon2 is NOT enough: the v3 admission code is behind this macro,
 # and without it the sampler refuses to start on a v3 chain (its own guard —
@@ -150,6 +170,7 @@ target_compile_definitions(meow_poi PUBLIC POW_V3_HAVE_ARGON2)
 # GPU sampler pipeline. POW_GPU_SORT=0 at runtime forces the CPU path; the
 # CPU code remains intact as the fallback for both safety and non-CUDA builds.
 target_sources(meow_poi PRIVATE ${CMAKE_SOURCE_DIR}/src/pow_gpu.cu)
+target_sources(meow_poi PRIVATE ${CMAKE_SOURCE_DIR}/src/pow_histogram.cu)
 target_compile_definitions(meow_poi PUBLIC POW_GPU_SORT_ENABLED)
 set_source_files_properties(${CMAKE_SOURCE_DIR}/src/pow_gpu.cu PROPERTIES
   COMPILE_OPTIONS "--expt-relaxed-constexpr;-Xcompiler=-mavx2")
@@ -196,6 +217,7 @@ add_executable(supr-meow-tsc
   src/api.cpp
   src/canary.cpp
   src/tuning.cpp
+  src/model_profile.cpp
 )
 target_include_directories(supr-meow-tsc PRIVATE
   ${MEOW_LLAMA_DIR}/include

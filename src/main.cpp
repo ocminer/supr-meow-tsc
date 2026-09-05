@@ -16,6 +16,7 @@
 #include "api.h"
 #include "canary.h"
 #include "tuning.h"
+#include "model_profile.h"
 #include <algorithm>
 #include "../vendor/nlohmann/json.hpp"
 #include <random>
@@ -40,7 +41,7 @@ extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 
 namespace {
 
-const char* kVersion = "0.4.0";
+const char* kVersion = "0.6.0";
 
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop = true; }
@@ -124,6 +125,9 @@ struct Options {
     int         workers = 1;   // independent contexts per GPU (--workers)
     int         groups  = 8;   bool groups_set = false;  // --groups
     bool        double_buffer_set = false;
+    bool        q8 = false;
+    std::string kv_cache = "f16";
+    bool        ctx_set = false;
     bool        split_model = false;   // --split-model: one model across all -d cards
     bool        split_rows  = false;   // --split-rows: tensor-parallel instead of layer
     int         egress_base = 47021;  // base loopback port for proof egress (--egress-base)
@@ -163,13 +167,13 @@ void print_usage() {
 "                          the pool issues the VDF. --vdf-test prints costs.\n"
 "      --vdf-test          Self-test the VDF (prove, verify, and confirm a\n"
 "                          proof does NOT verify against another challenge).\n"
+"      --kv-cache <type>   Q8 profile cache: f16 (default) or q8_0.\n"
+"      --q8                Verified Q8 model + optimized native sampler.\n"
+"                          Auto-pairs matching cards below 12 GiB.\n"
 "      --slots <n>         Concurrent windows per GPU (default 8).\n"
-"      --split-model       Split ONE model across all -d GPUs instead of a\n"
-"                          full copy per card. For cards too small to hold\n"
-"                          the model alone (2x12GB, 4x8GB, 8x6GB). Aggregates\n"
-"                          VRAM; does NOT add throughput. Cards should match.\n"
-"      --split-rows        As --split-model but tensor-parallel (all-reduce\n"
-"                          per layer). Usually slower without NVLink; measure.\n"
+"      --split-model       With --q8, load one model per matching GPU pair.\n"
+"                          Automatic below 12 GiB; minimum 8 GiB per card.\n"
+"      --split-rows        Legacy experimental mode; disabled for mining.\n"
 "      --ctx <n>           KV tokens per slot (default 384). Must exceed\n"
 "                          prompt+window (~280); smaller fits more slots.\n"
 "      --protocol-test     Connect to the pool and print jobs/targets/model\n"
@@ -236,18 +240,13 @@ bool parse_args(int argc, char** argv, Options& o) {
         // group ids), so an env var of that name is silently replaced by "0"
         // and `--groups ${GROUPS}` becomes `--groups 0`.
         else if (a == "--groups")          { if (!need_value(i, argc, "--groups")) return false; o.groups = std::atoi(argv[++i]); o.groups_set = o.groups > 0; }
-        // --split-model is REFUSED by default: it produces proofs that pass every
-        // share-level check at 0% reject and then FAIL the chain's model replay,
-        // so a share is credited and any block it wins is ORPHANED. That is not
-        // hypothetical — it cost block 21074. See the refusal message below and
-        // SPLIT-MODEL-BUG-HANDOFF.md. Root cause is NOT yet found; every
-        // miner-side quantity measured (logits, top-k, per-step stats) is
-        // identical to a healthy single-GPU run, yet the pool's GPU replay
-        // reliably reds split proofs and greens single ones.
+        // Only the verified Q8 profile enables layer splitting.
+        else if (a == "--kv-cache") { if (!need_value(i, argc, "--kv-cache")) return false; o.kv_cache = argv[++i]; }
+        else if (a == "--q8")              { o.q8 = true; }
         else if (a == "--split-model")     { o.split_model = true; }
         else if (a == "--split-rows")      { o.split_model = true; o.split_rows = true; }
         else if (a == "--egress-base")     { if (!need_value(i, argc, "--egress-base")) return false; o.egress_base = std::atoi(argv[++i]); }
-        else if (a == "--ctx")             { if (!need_value(i, argc, "--ctx")) return false; o.ctx_per_slot = std::atoi(argv[++i]); }
+        else if (a == "--ctx")             { if (!need_value(i, argc, "--ctx")) return false; o.ctx_per_slot = std::atoi(argv[++i]); o.ctx_set = true; }
         else if (a == "--api-bind")        { if (!need_value(i, argc, "--api-bind")) return false; o.api_bind = argv[++i]; }
         else if (a == "--no-color")        o.no_color = true;
         else if (eq("-o", "--pool"))       { if (!need_value(i, argc, "-o")) return false; o.pool = argv[++i]; o.pools.push_back(o.pool); }
@@ -720,7 +719,9 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
         };
 
-        client.configure(urls, o.user, o.pass, std::string("supr-meow-tsc/") + kVersion, cb);
+        const std::string user_agent = std::string("supr-meow-tsc/") + kVersion +
+            (o.q8 ? (o.kv_cache == "f16" ? "" : "-experimental") : "-legacy");
+        client.configure(urls, o.user, o.pass, user_agent, cb);
         std::printf("connecting to %s as %s\n\n", urls[0].raw.c_str(), o.user.c_str());
         if (!client.start()) { std::fprintf(stderr, "error: cannot start pool client\n"); return 1; }
 
@@ -735,35 +736,63 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        // ---- refuse hardware that CANNOT produce a valid proof ------------
-        // The chain fixes compute precision at bf16 and the verifier checks it,
-        // so a GPU without bf16 can never make a valid share. Turing (sm_75)
-        // is the case that actually bites: the release packages contain sm_75
-        // code, so the miner would happily START on a 2080 Ti, look healthy,
-        // and have every share rejected — which reads as a miner bug rather
-        // than unusable hardware. Say so plainly instead, and name the card.
-        // --split-model is DISABLED. It produces model-invalid proofs: they pass
-        // every share-level check (0% reject) and then fail the chain's full
-        // model replay, so the share is credited and any block it wins is
-        // ORPHANED. Block 21074 was lost exactly this way. Refuse loudly rather
-        // than let a rig mine work that cannot become a block — a miner cannot
-        // detect this itself, which is what makes it dangerous.
-        if (o.split_model && !std::getenv("MEOW_ALLOW_BROKEN_SPLIT")) {
-            std::fprintf(stderr,
-                "\nerror: --split-model is disabled — it produces INVALID proofs.\n\n"
-                "  Shares from a split miner are accepted by the pool (0%% reject) but FAIL\n"
-                "  the chain's model replay, so any block they win is ORPHANED. This has\n"
-                "  already cost a real block. The cause is not yet found: the logits, top-k\n"
-                "  and per-step statistics are all bit-identical to a healthy single-GPU\n"
-                "  run, yet the chain's GPU replay rejects split proofs and accepts\n"
-                "  single-GPU ones.\n\n"
-                "  What to do instead:\n"
-                "    - Mine on cards that fit the model alone: 24 GB VRAM or more.\n"
-                "    - Run ONE miner process per GPU (that is the normal layout and is\n"
-                "      fully valid) rather than splitting one model across cards.\n\n"
-                "  Cards under 24 GB cannot currently mine TSC. Splitting them would only\n"
-                "  produce work that is thrown away.\n\n"
-                "  Details: https://github.com/ocminer/supr-meow-tsc — SPLIT-MODEL-BUG-HANDOFF\n\n");
+        // The F16-cache profile passed repeated offline and live full replay.
+        // The older Q8-cache split and legacy splitting remain restricted.
+        if (o.q8) {
+            std::string profile_error;
+            std::printf("Verifying Q8 model SHA-256...\n"); std::fflush(stdout);
+            if (!meow::verify_q8_model(o.model_path, profile_error)) {
+                std::fprintf(stderr, "error: %s\n", profile_error.c_str()); return 2;
+            }
+            if (o.kv_cache != "q8_0" && o.kv_cache != "f16") {
+                std::fprintf(stderr,"error: --kv-cache must be q8_0 or f16\n"); return 2;
+            }
+            const auto& cards = dm.devices();
+            const auto min_card = std::min_element(cards.begin(), cards.end(),
+                [](const auto& a,const auto& b){ return a.vram_total < b.vram_total; });
+            const size_t gib = size_t(1) << 30;
+            // Board totals are slightly below the marketed GiB capacity.
+            const size_t memory_gib = (min_card->vram_total + gib-1) / gib;
+            if (memory_gib < 12) o.split_model = true;
+            if (o.split_rows || o.workers != 1) {
+                std::fprintf(stderr,"error: --q8 requires layer splitting and one context per device/group\n"); return 2;
+            }
+            if (o.split_model) {
+                const char* testing = std::getenv("MEOW_Q8_SPLIT_TESTING");
+                if (o.kv_cache != "f16" && (!testing || std::strcmp(testing,"1") != 0)) {
+                    std::fprintf(stderr,"error: Q8-cache splitting failed live full replay; use the default F16 cache or MEOW_Q8_SPLIT_TESTING=1 for diagnostics\n");
+                    return 2;
+                }
+                if (cards.size()%2 || memory_gib < 8) {
+                    std::fprintf(stderr,"error: --q8 split requires complete pairs of matching GPUs with at least 8 GiB each\n"); return 2;
+                }
+                for (size_t i=0;i<cards.size();i+=2) {
+                    if (cards[i].name != cards[i+1].name || (cards[i].vram_total + gib-1)/gib != (cards[i+1].vram_total + gib-1)/gib) {
+                        std::fprintf(stderr,"error: select matching adjacent GPU pairs with -d\n"); return 2;
+                    }
+                }
+            }
+            const int default_slots = o.kv_cache == "f16"
+                ? (o.split_model ? 128 : memory_gib >= 32 ? 480 : memory_gib >= 24 ? 288 : memory_gib >= 16 ? 128 : 48)
+                : (o.split_model ? 128 : memory_gib >= 24 ? 512 : memory_gib >= 16 ? 256 : 96);
+            if (!o.slots_set) o.slots = default_slots;
+            if (!o.groups_set) o.groups = o.split_model ? 4 : 12;
+            if (!o.ctx_set) o.ctx_per_slot = 320;
+            if (o.slots < 1 || o.slots > 512 || o.ctx_per_slot < 320) {
+                std::fprintf(stderr,"error: --q8 requires 1..512 slots and at least 320 context tokens\n"); return 2;
+            }
+            o.slots_set = o.groups_set = true;
+            for (const char* flag : {"MEOW_BF16_HIST", "MEOW_CENTRAL_HIST", "MEOW_COMPACT_CDF", "MEOW_KV_SINGLE_UBATCH"})
+                ::setenv(flag,"1",1);
+            ::setenv("MEOW_DOUBLE_BUFFER","0",1);
+            ::setenv("MEOW_F16_KV_PAD64",o.kv_cache == "f16" ? "1" : "0",1);
+            ::setenv("MEOW_KV_PAD64",o.split_model || memory_gib < 32 ? "1" : "0",1);
+            ::setenv("MEOW_SPLIT_DEVICE_LOGITS",o.split_model ? "1" : "0",1);
+            std::printf("Q8 profile: %d slots, %d groups, %d context tokens, %s KV%s\n",o.slots,o.groups,o.ctx_per_slot,o.kv_cache.c_str(),
+                        o.split_model ? ", independent GPU pairs, fresh context per batch" : "");
+        }
+        if (o.split_model && !o.q8) {
+            std::fprintf(stderr,"error: legacy split inference is disabled after full-replay failures; use --q8 with the verified model\n");
             return 2;
         }
         {
@@ -867,6 +896,14 @@ int main(int argc, char** argv) {
         ec.double_buffer    = want_double;
         ec.split_model      = o.split_model;
         ec.split_rows       = o.split_rows;
+        if (o.q8) {
+            ec.kv_cache_type = o.kv_cache;
+            ec.ubatch = o.slots;
+            ec.prefix_prefill = true;
+            ec.gpu_embeddings = true;
+            ec.refresh_split_context = o.split_model;
+            ec.split_group_size = o.split_model ? 2 : 0;
+        }
         for (const auto& d : dm.devices()) ec.devices.push_back(d.index);
 
         meow::InferenceEngine engine;
@@ -914,7 +951,7 @@ int main(int argc, char** argv) {
         std::vector<std::unique_ptr<meow::SamplerPool>> pools_b;  // batch B (double-buffer)
         for (int w = 0; w < n_workers; ++w) {
             auto sp = std::make_unique<meow::SamplerPool>();
-            if (!sp->init(n_streams, n_groups, o.egress_base + w * 64, engine.worker_device(w), eerr)) {
+            if (!sp->init(n_streams, n_groups, o.egress_base + w * 64, engine.worker_sampler_device(w), eerr)) {
                 std::fprintf(stderr, "error: %s\n", eerr.c_str());
                 client.stop();
                 return 1;
@@ -925,7 +962,7 @@ int main(int argc, char** argv) {
                 // batch B is a fully independent set of windows.
                 auto sb = std::make_unique<meow::SamplerPool>();
                 if (!sb->init(n_streams, n_groups, o.egress_base + w * 64 + 32,
-                              engine.worker_device(w), eerr)) {
+                              engine.worker_sampler_device(w), eerr)) {
                     std::fprintf(stderr, "error: %s\n", eerr.c_str());
                     client.stop();
                     return 1;
@@ -978,13 +1015,14 @@ int main(int argc, char** argv) {
         std::mutex submit_mx;
         std::condition_variable submit_cv;
         std::deque<PendingShare> submit_q;
+        bool producers_done = false; // guarded by submit_mx
         std::thread submitter([&]{
             for (;;) {
                 PendingShare ps;
                 {
                     std::unique_lock<std::mutex> lk(submit_mx);
-                    submit_cv.wait(lk, [&]{ return g_stop || !submit_q.empty(); });
-                    if (submit_q.empty()) { if (g_stop) return; else continue; }
+                    submit_cv.wait(lk, [&]{ return producers_done || !submit_q.empty(); });
+                    if (submit_q.empty()) { if (producers_done) return; else continue; }
                     ps = std::move(submit_q.front());
                     submit_q.pop_front();
                 }
@@ -997,7 +1035,7 @@ int main(int argc, char** argv) {
         auto mine_device = [&](int worker) {
             meow::SamplerPool& pool = *pools[worker];
             meow::SamplerPool* poolB = want_double ? pools_b[worker].get() : nullptr;
-            pow_gpu_bind_device(engine.worker_device(worker));
+            pow_gpu_bind_device(engine.worker_sampler_device(worker));
             uint64_t my_windows = 0;
             bool double_ok = want_double;   // falls false if -2 (no device logits)
             while (!g_stop) {
@@ -1007,6 +1045,11 @@ int main(int argc, char** argv) {
                 if (!j.valid || !m.valid || j.share_target.empty()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     continue;
+                }
+                if (o.q8 && (m.name + "@" + m.commit != meow::q8_model_identifier || m.precision != "bf16")) {
+                    std::fprintf(stderr,"error: pool model does not match the verified Q8 weights; stopping\n");
+                    g_stop = true;
+                    break;
                 }
                 if (!pool.ready() || pool.job_id() != j.job_id) {
                     meow::PoiJobParams p;
@@ -1292,9 +1335,23 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
         }
         for (auto& w : workers) w.join();
+        { std::lock_guard<std::mutex> lk(submit_mx); producers_done = true; }
         submit_cv.notify_all();
         if (submitter.joinable()) submitter.join();
 
+        // Give the pool a bounded opportunity to acknowledge the final batch.
+        // Workers have finished and the submit queue is drained at this point.
+        for (int attempt=0;attempt<20;++attempt) {
+            const auto st=client.stats();
+            if (st.accepted+st.rejected+st.stale >= st.submitted) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        const auto final_stats=client.stats();
+        const auto resolved=final_stats.accepted+final_stats.rejected+final_stats.stale;
+        std::printf("Stopped: %llu submitted, %llu accepted, %llu rejected, %llu stale, %llu awaiting reply\n",
+            (unsigned long long)final_stats.submitted,(unsigned long long)final_stats.accepted,
+            (unsigned long long)final_stats.rejected,(unsigned long long)final_stats.stale,
+            (unsigned long long)(final_stats.submitted > resolved ? final_stats.submitted-resolved : 0));
         api.stop();
         client.stop();
         dm.restore_all();

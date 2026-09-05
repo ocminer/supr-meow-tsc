@@ -5,14 +5,12 @@
 // there is no external server process, no HTTP hop and no Python. One binary
 // loads the model and generates the token windows that proofs are built from.
 //
-// Multi-GPU is DATA parallel, not tensor parallel: each selected device gets
-// its own full copy of the model and its own contexts. A miner wants N cards
-// working independently — tensor-splitting a small model across cards would
-// add interconnect traffic and make one slow card throttle the rest.
+// Default multi-GPU operation loads an independent model on each card. The
+// experimental split path partitions one model across the selected cards.
 //
-// bf16 is enforced, not chosen. The proof declares its compute precision and
-// the network verifies it against the model checkpoint, so a quantised GGUF
-// would run faster and produce proofs that are rejected on-chain.
+// Proof logits are snapped to BF16. Weight/cache quantization is a separate
+// inference choice: its output must pass the registered model's full replay
+// verifier before the configuration can be supported in production.
 // =============================================================================
 #pragma once
 
@@ -50,6 +48,12 @@ struct EngineConfig {
     // what lets the batch scale past ~48 slots.
     int               ctx_per_slot     = 384;
     int               threads          = 0;  // 0 = auto
+    // Explicit inference controls; changes require full proof replay, since
+    // cache quantization changes the forward pass even with identical weights.
+    std::string       kv_cache_type    = "f16";
+    bool              gpu_embeddings   = false; // avoids CPU embedding gather/dequantization
+    bool              prefix_prefill   = false; // shared prefix + bounded prompt batches
+    int               ubatch           = 0;  // 0 retains environment/default
     // Double-buffered decode (generate_windows_double): doubles n_seq_max and
     // n_ctx so two full window batches coexist in the KV cache.
     bool              double_buffer    = false;
@@ -62,12 +66,17 @@ struct EngineConfig {
     // Default false, which keeps the data-parallel path (one full model per
     // card, N independent workers) that every measured profile was tuned on.
     bool              split_model      = false;
+    int               split_group_size = 0; // 0 uses all selected devices; 2 loads independent pairs
     // Only consulted when split_model is set. LAYER gives each GPU a slice of
     // the layers and passes activations along — little interconnect traffic,
     // but the cards run in sequence. ROW is true tensor parallelism: the cards
     // work simultaneously but all-reduce every layer, which without NVLink is
     // usually slower than LAYER. Measure before believing either.
     bool              split_rows       = false;
+    // Experimental workaround for stale state after split-context reuse.
+    // Recreate the context between window batches while keeping weights loaded.
+    // Must pass repeated-window full replay before enabling in production.
+    bool              refresh_split_context = false;
 };
 
 struct DeviceEngineStats {
@@ -178,6 +187,7 @@ public:
     // mining thread per worker; device_slot in the calls below is a WORKER id.
     int  worker_count() const { return static_cast<int>(instances_.size()); }
     int  worker_device(int w) const;
+    int  worker_sampler_device(int w) const;
 
 private:
     struct Instance;                      // one model+context set, per device

@@ -9,6 +9,18 @@
 #include <sstream>
 
 namespace meow {
+namespace {
+// CUDA ordinals can be reordered by CUDA_VISIBLE_DEVICES or by CUDA's default
+// fastest-first enumeration. Resolve the physical PCI device for NVML instead
+// of assuming its independent index namespace matches CUDA.
+nvmlReturn_t nvml_handle_for_cuda(int index, nvmlDevice_t* handle) {
+    char bus[32] = {};
+    if (cudaDeviceGetPCIBusId(bus, sizeof(bus), index) != cudaSuccess)
+        return NVML_ERROR_NOT_FOUND;
+    return nvmlDeviceGetHandleByPciBusId_v2(bus, handle);
+}
+}
+
 
 bool parse_device_spec(const std::string& spec, std::vector<int>& out, std::string& error) {
     out.clear();
@@ -101,7 +113,7 @@ bool DeviceManager::init(const std::string& spec, std::string& error) {
         }
         if (nvml_ready_) {
             nvmlDevice_t h{};
-            if (nvmlDeviceGetHandleByIndex_v2(static_cast<unsigned>(id), &h) == NVML_SUCCESS) {
+            if (nvml_handle_for_cuda(id, &h) == NVML_SUCCESS) {
                 d.nvml_ok = true;
                 char uuid[NVML_DEVICE_UUID_BUFFER_SIZE] = {0};
                 if (nvmlDeviceGetUUID(h, uuid, sizeof(uuid)) == NVML_SUCCESS) d.uuid = uuid;
@@ -118,7 +130,7 @@ DeviceTelemetry DeviceManager::telemetry(int index) const {
     if (!nvml_ready_) return t;
 
     nvmlDevice_t h{};
-    if (nvmlDeviceGetHandleByIndex_v2(static_cast<unsigned>(index), &h) != NVML_SUCCESS) return t;
+    if (nvml_handle_for_cuda(index, &h) != NVML_SUCCESS) return t;
 
     unsigned u = 0;
     if (nvmlDeviceGetTemperature(h, NVML_TEMPERATURE_GPU, &u) == NVML_SUCCESS) t.temp_c = static_cast<int>(u);
@@ -149,7 +161,7 @@ DeviceTelemetry DeviceManager::telemetry(int index) const {
 bool DeviceManager::apply_tuning(int index, const DeviceTuning& tun, std::string& error) {
     if (!nvml_ready_) { error = "NVML unavailable — cannot tune"; return false; }
     nvmlDevice_t h{};
-    if (nvmlDeviceGetHandleByIndex_v2(static_cast<unsigned>(index), &h) != NVML_SUCCESS) {
+    if (nvml_handle_for_cuda(index, &h) != NVML_SUCCESS) {
         error = "no NVML handle for device " + std::to_string(index);
         return false;
     }
@@ -194,7 +206,7 @@ void DeviceManager::restore_all() {
     if (!nvml_ready_) return;
     for (int idx : tuned_) {
         nvmlDevice_t h{};
-        if (nvmlDeviceGetHandleByIndex_v2(static_cast<unsigned>(idx), &h) != NVML_SUCCESS) continue;
+        if (nvml_handle_for_cuda(idx, &h) != NVML_SUCCESS) continue;
         // Hand the card back: fans to the driver's curve, clocks unlocked.
         // Offsets and power limit are left as set — an operator who asked for
         // them usually wants them to persist for the next run.

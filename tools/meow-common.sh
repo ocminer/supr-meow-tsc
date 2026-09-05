@@ -5,8 +5,13 @@
 # format, then execs this. Keeping one copy means a fix to the model fetch or
 # the argument mapping reaches every platform instead of three drifting forks.
 set -u
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")" || exit 1
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}$PWD/lib"
 
 MODEL_DIR="${MODEL_DIR:-$(pwd)/models}"
+if [[ ${Q8_PROFILE:-1} == 1 ]]; then
+  . "./q8-profile.sh" || exit 1
+fi
 if [[ -z ${MODEL_PATH:-} ]]; then
   if [[ -n ${MODEL_URL:-} ]]; then
     mkdir -p "$MODEL_DIR"
@@ -51,6 +56,7 @@ args+=( --api-bind "127.0.0.1:${API_PORT:-21550}" )
 [[ -n ${MEOW_GROUPS:-} ]] && args+=( --groups "$MEOW_GROUPS" )
 [[ -n ${CTX:-}         ]] && args+=( --ctx    "$CTX" )
 [[ -n ${DEVICES:-}     ]] && args+=( -d       "$DEVICES" )
+[[ ${Q8_PROFILE:-1} == 1 ]] && args+=( --q8 )
 [[ ${SPLIT_MODEL:-0} == 1 ]] && args+=( --split-model )
 [[ -n ${EXTRA_ARGS:-}  ]] && args+=( ${EXTRA_ARGS} )
 

@@ -22,6 +22,7 @@
 
 #include "pow_utils.h"
 #include "proof_generated.h"
+#include "../vendor/nlohmann/json.hpp"
 
 namespace meow {
 
@@ -106,7 +107,7 @@ struct PoiMiner::Impl {
     // new job. Labelling it with the CURRENT job made the pool submit it
     // against the wrong work unit ("req_id mismatch: rpc=15 flatbuffer=14").
     // The proof names its own unit (MiningResponse.req_id); label by that.
-    std::unordered_map<uint64_t, std::string> job_by_req;
+    std::unordered_map<uint64_t, PoiJobParams> job_by_req;
     std::mutex mtx;
 
     ~Impl() {
@@ -317,11 +318,11 @@ bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
         return false;
     }
 
-    impl_->job_by_req[p.request_id] = p.job_id;
+    impl_->job_by_req[p.request_id] = p;
     if (impl_->job_by_req.size() > 16) {           // drop stale entries; the
         for (auto it = impl_->job_by_req.begin(); // pool forgets old jobs too
              it != impl_->job_by_req.end() && impl_->job_by_req.size() > 8;)
-            it = (it->second != p.job_id) ? impl_->job_by_req.erase(it) : ++it;
+            it = (it->second.job_id != p.job_id) ? impl_->job_by_req.erase(it) : ++it;
     }
 
     impl_->job = p;
@@ -450,6 +451,14 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
         auto r = impl_->coord.sample_token_complete(seq_id, logits, n_vocab,
                                                     temperature, top_k, top_p,
                                                     window, "bf16");
+        // Float CDF accumulation can end just below the sampled uniform value.
+        // The reference lower_bound then returns n_vocab. Abort this window
+        // before recording or emitting it; clamping would change the protocol.
+        if (r.token_id < 0 || r.token_id >= n_vocab) {
+            impl_->coord.cleanup_sequence(seq_id);
+            impl_->last_ctx.erase(seq_id);
+            return -1;
+        }
         stage_ = "record_complete_step";
         impl_->coord.record_complete_step(seq_id, r, true);
         // ONLY at the end of a full window: check_solutions() reads
@@ -477,14 +486,14 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
         if (n > 0) {
             const auto* data = static_cast<const uint8_t*>(zmq_msg_data(&msg));
             auto share = std::make_unique<PoiShare>();
-            share->job_id       = impl_->job.job_id;
-            {
-                const auto* mr0 = flatbuffers::GetRoot<proof::MiningResponse>(data);
-                if (mr0) {
-                    auto it = impl_->job_by_req.find(mr0->req_id());
-                    if (it != impl_->job_by_req.end()) share->job_id = it->second;
-                }
+            const auto* response = flatbuffers::GetRoot<proof::MiningResponse>(data);
+            const auto origin = impl_->job_by_req.find(response->req_id());
+            if (origin == impl_->job_by_req.end()) {
+                // Never relabel delayed output as work for the current job.
+                zmq_msg_close(&msg);
+                return static_cast<int>(r.token_id);
             }
+            share->job_id = origin->second.job_id;
             // The pool dedups on (job, nonce) and rejects a repeat outright.
             // Blocks are submitted from the proof alone, so this value carries
             // no consensus meaning — it only has to be unique per job. Leaving
@@ -492,36 +501,6 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
             share->nonce        = ++nonce_seq_;
             share->proof_b64    = base64(data, static_cast<size_t>(n));
 
-            // MEOW_DUMP_PROOFS=<dir>: write raw proof bytes locally so a miner
-            // can diagnose its own output without needing the pool to capture
-            // and audit for it. Off unless the variable is set; capped so a
-            // forgotten setting cannot fill a rig's disk.
-            //
-            // Added while chasing a --split-model fault the pool could see and
-            // we could not: split proofs replay RED against the real model
-            // while single-GPU proofs pass, and the visible signature is in the
-            // logit tail (70th logit median ~5.2 split vs ~1.1 single). Having
-            // the proofs locally turns a cross-machine round trip into a diff.
-            {
-                static const char* dump_dir = std::getenv("MEOW_DUMP_PROOFS");
-                static std::atomic<int> dumped{0};
-                static const int dump_max = [](){
-                    const char* m = std::getenv("MEOW_DUMP_PROOFS_MAX");
-                    return m ? std::atoi(m) : 32;
-                }();
-                if (dump_dir && *dump_dir && dumped.load() < dump_max) {
-                    const int idx = dumped.fetch_add(1);
-                    if (idx < dump_max) {
-                        char path[512];
-                        std::snprintf(path, sizeof(path), "%s/proof-%s-%d.bin",
-                                      dump_dir, share->job_id.c_str(), idx);
-                        if (FILE* f = std::fopen(path, "wb")) {
-                            std::fwrite(data, 1, static_cast<size_t>(n), f);
-                            std::fclose(f);
-                        }
-                    }
-                }
-            }
             share->vdf_tick     = vdf_tick_;
             // The claim the pool judges is the HEADER HASH —
             // SHA256d(header76 || digest[:4]) — because that is what consensus
@@ -595,6 +574,44 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
                     }
                 }
             }
+            // MEOW_DUMP_PROOFS=<dir>: write raw proof bytes locally so a miner
+            // can diagnose its own output without needing the pool to capture
+            // and audit for it. Off unless the variable is set; capped so a
+            // forgotten setting cannot fill a rig's disk.
+            //
+            // Added while chasing a --split-model fault the pool could see and
+            // we could not: split proofs replay RED against the real model
+            // while single-GPU proofs pass, and the visible signature is in the
+            // logit tail (70th logit median ~5.2 split vs ~1.1 single). Having
+            // the proofs locally turns a cross-machine round trip into a diff.
+            {
+                static const char* dump_dir = std::getenv("MEOW_DUMP_PROOFS");
+                static std::atomic<int> dumped{0};
+                static const int dump_max = [](){
+                    const char* m = std::getenv("MEOW_DUMP_PROOFS_MAX");
+                    return m ? std::atoi(m) : 32;
+                }();
+                if (dump_dir && *dump_dir && dumped.load() < dump_max) {
+                    const int idx = dumped.fetch_add(1);
+                    if (idx < dump_max) {
+                        char path[512];
+                        std::snprintf(path, sizeof(path), "%s/proof-%d.bin", dump_dir, idx);
+                        if (FILE* f = std::fopen(path, "wb")) {
+                            std::fwrite(data, 1, static_cast<size_t>(n), f);
+                            std::fclose(f);
+                        }
+                        std::snprintf(path, sizeof(path), "%s/proof-%d.json", dump_dir, idx);
+                        const auto& job = origin->second;
+                        const auto record = nlohmann::json{{"proof_b64", share->proof_b64},
+                            {"headerPrefix", job.header_prefix}, {"shareTarget", job.share_target},
+                            {"reqId", job.request_id}, {"jobId", job.job_id}}.dump();
+                        if (FILE* f = std::fopen(path, "wb")) {
+                            std::fwrite(record.data(), 1, record.size(), f);
+                            std::fclose(f);
+                        }
+                    }
+                }
+            }
             {
                 std::lock_guard<std::mutex> lk(impl_->mtx);
                 impl_->pending_q.push_back(std::move(share));
@@ -643,6 +660,7 @@ struct SamplerPool::Impl {
     std::vector<uint64_t>     done;                    // per-group last gen finished
     bool                      stop = false;
     bool                      step_ok = true;
+    bool                      central_sorted = false;
 
     // Inputs valid for the current generation (owned by the mining thread).
     const std::vector<const float*>*            in_logits = nullptr;
@@ -729,10 +747,10 @@ struct SamplerPool::Impl {
             // GPU-resident mode (dev != null): the slice is read straight from
             // llama's device tensor — no narrowing, no H2D at all.
             bool ok = true;
-            bool gsort = false;
+            bool gsort = central_sorted;
             const int K = sort_stride;
 #ifdef POW_GPU_SORT_ENABLED
-            if (sort_ok && K > 0) {
+            if (!gsort && sort_ok && K > 0) {
                 // Rebind if the logits live on another card (--split-model). Asked
             // ONCE per worker, not per step: cudaPointerGetAttributes on every
             // step of every group would be pure overhead on the single-GPU
@@ -947,6 +965,24 @@ bool SamplerPool::sample_step(const std::vector<const float*>& logits,
                                    ++impl_->corrupt_seq)) {
             dev_logits = (const float*)impl_->corrupt_buf;
         }
+    }
+#endif
+    impl_->central_sorted = false;
+#ifdef POW_GPU_SORT_ENABLED
+    static const bool central_histogram = [] {
+        const char* flag = std::getenv("MEOW_CENTRAL_HIST");
+        const char* hist = std::getenv("MEOW_BF16_HIST");
+        return flag && flag[0] == '1' && hist && hist[0] == '1';
+    }();
+    if (central_histogram && dev_logits) {
+        const int owner = pow_gpu_device_of_ptr(dev_logits);
+        if (owner < 0 || !pow_gpu_bind_device(owner)) return false;
+        // One whole-batch CUDA pass avoids competing launches from all CPU
+        // workers. Their proof/sampling tails still execute in parallel.
+        if (!pow_gpu_sort_and_stats_device_k(dev_logits, impl_->n_streams, n_vocab,
+                impl_->sort_stride, 1.0f, impl_->sort_idx, impl_->sort_val,
+                impl_->sort_head, impl_->sort_stats, impl_->sort_probes)) return false;
+        impl_->central_sorted = true;
     }
 #endif
     {

@@ -1,0 +1,32 @@
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index d80e8a7..703f3be 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -9,6 +9,7 @@
+ #include <cassert>
+ #include <cmath>
+ #include <cstring>
++#include <cstdlib>
+ #include <limits>
+ #include <map>
+ #include <stdexcept>
+@@ -562,6 +563,19 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool
+ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+     llama_kv_cache::slot_info_vec_t res;
+ 
++    // A single microbatch has no later placement to simulate. find_slot is
++    // const; return its placement without applying and undoing KV metadata.
++    // Keep opt-in until repeated-window model replay validates the integration.
++    static const bool single_ubatch = [] {
++        const char * e = std::getenv("MEOW_KV_SINGLE_UBATCH");
++        return e && e[0] == '1';
++    }();
++    if (single_ubatch && ubatches.size() == 1) {
++        auto slot = find_slot(ubatches.front(), false);
++        if (!slot.empty()) res.push_back(std::move(slot));
++        return res;
++    }
++
+     struct state_t {
+         slot_info sinfo; // slot info for the ubatch
+ 

@@ -946,6 +946,9 @@ extern "C" int pow_gpu_device_of_ptr(const void* p) {
 // bf16 snap runs in registers inside pack/unpack. Additionally returns the
 // 20 telemetry probes per stream, since no host copy exists to read them.
 // ==========================================================================
+extern "C" bool pow_gpu_histogram_device_k(const float*, int, int, int, float,
+        uint32_t*, float*, float*, double*, float*);
+
 extern "C" bool pow_gpu_sort_and_stats_device_k(
         const float* d_logits, int S, int n, int topk, float inv_temp,
         uint32_t* h_idx /* [S*topk] */, float* h_val /* [S*topk] */,
@@ -953,6 +956,13 @@ extern "C" bool pow_gpu_sort_and_stats_device_k(
         float* h_probes /* [S*20] */) {
     if (!d_logits || S < 1 || n < 1) return false;
     if (topk < 1 || topk > n) topk = n;
+    static const bool histogram = [] {
+        const char* flag = std::getenv("MEOW_BF16_HIST");
+        return flag && flag[0] == '1';
+    }();
+    if (histogram && topk <= 64)
+        return pow_gpu_histogram_device_k(d_logits, S, n, topk, inv_temp,
+                                         h_idx, h_val, h_head, h_stats, h_probes);
     if (S > 64 || n > (1 << 18)) {
         // Not a transient error: this configuration can never sort. Say so —
         // silently returning false here fails every window forever.
@@ -1217,6 +1227,13 @@ extern "C" bool pow_gpu_register_host_range(const void* p, size_t bytes) {
     cudaGetLastError();
     return false;
 }
+extern "C" void pow_gpu_unregister_host_range(const void* p) {
+    std::lock_guard<std::mutex> lk(g_hostreg_mtx);
+    if (p && p == g_hostreg_base) {
+        cudaHostUnregister(const_cast<void*>(p));
+        g_hostreg_base = nullptr; g_hostreg_size = 0;
+    }
+}
 static bool pow_gpu_host_range_covered(const void* p, size_t bytes) {
     std::lock_guard<std::mutex> lk(g_hostreg_mtx);
     const auto* q = static_cast<const uint8_t*>(p);
@@ -1226,6 +1243,9 @@ static bool pow_gpu_host_range_covered(const void* p, size_t bytes) {
 // Truncated-copy variant under debug: identical sort/stats, but only the top
 // `topk` ranks of idx+val ride back to the host (the CPU tail reads no further
 // when GPU stats are valid). This is the version that hung in the miner.
+extern "C" bool pow_gpu_histogram_host_k(const float* const*, int, int, int, float,
+        uint32_t*, float*, float*, double*);
+
 extern "C" bool pow_gpu_sort_and_stats_batched_k(
         const float* const* h_logits, int S, int n, int topk, float inv_temp, int snap_bf16_in,
         uint32_t* h_idx /* [S*topk] */, float* h_val /* [S*topk] */,
@@ -1233,6 +1253,13 @@ extern "C" bool pow_gpu_sort_and_stats_batched_k(
     int snap_bf16 = snap_bf16_in;
     if (S < 1 || n < 1) return false;
     if (topk < 1 || topk > n) topk = n;
+    static const bool histogram = [] {
+        const char* flag = std::getenv("MEOW_BF16_HIST");
+        return flag && flag[0] == '1';
+    }();
+    if (histogram && snap_bf16 && topk <= 64)
+        return pow_gpu_histogram_host_k(h_logits, S, n, topk, inv_temp,
+                                       h_idx, h_val, h_head, h_stats);
     if (!g_batch.ensure(S, n)) return false;
     auto& b = g_batch;
     const int total = S * n;

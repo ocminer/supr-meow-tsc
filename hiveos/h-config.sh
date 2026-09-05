@@ -6,8 +6,8 @@
 #   Wallet/template     -> CUSTOM_TEMPLATE  <payout address>.<worker>
 #   Password            -> CUSTOM_PASS      (TSC pools ignore it)
 #   Extra config args   -> CUSTOM_USER_CONFIG, one KEY=VALUE per line:
-#       MODEL_URL=https://host/Qwen3-8B-<commit>-bf16.gguf
-#       MODEL_SHA256=<sha256>          strongly recommended
+#       DEVICES=0,1                   select a matching pair
+#       SPLIT_MODEL=1                 share one model across the pair
 #       MODEL_PATH=/path/to/model.gguf if you already have it on the rig
 #       MODEL_DIR=/hive-config/models  where to cache the download
 #       SLOTS=, MEOW_GROUPS=, CTX=     leave unset: the miner auto-tunes per GPU

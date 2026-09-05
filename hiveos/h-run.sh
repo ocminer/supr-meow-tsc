@@ -13,6 +13,9 @@ export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:$(pwd)/lib"
 
 # ---- model: 16.4 GB, fetched once and cached -------------------------------
 MODEL_DIR="${MODEL_DIR:-/hive-config/models}"
+if [[ ${Q8_PROFILE:-1} == 1 ]]; then
+  . "./q8-profile.sh" || exit 1
+fi
 if [[ -z $MODEL_PATH ]]; then
   if [[ -n $MODEL_URL ]]; then
     mkdir -p "$MODEL_DIR"
@@ -61,6 +64,7 @@ args+=( --api-bind "127.0.0.1:${API_PORT:-21550}" )
 # single worker — for rigs of cards too small to hold the 15.3 GB model alone
 # (2x12, 4x8, 8x6 GB). Cards should be identical. Note the miner uses CUDA
 # ordinals, which are NOT nvidia-smi's PCI order; check --list-devices.
+[[ ${Q8_PROFILE:-1} == 1 ]] && args+=( --q8 )
 [[ ${SPLIT_MODEL:-0} == 1 ]] && args+=( --split-model )
 [[ -n $EXTRA_ARGS  ]] && args+=( ${EXTRA_ARGS} )
 
