@@ -1169,6 +1169,10 @@ int main(int argc, char** argv) {
                 }
                 const auto tb1 = std::chrono::steady_clock::now();
                 if (n < 0) {
+                    // Discard this prompt range. Reusing it with the same job
+                    // repeats a deterministic sampler failure indefinitely.
+                    // Failed attempts must not count as completed windows.
+                    my_windows += uint64_t(n_streams) * (double_ok ? 2 : 1);
                     // A rented rig that fails every window is burning money.
                     // Complain loudly and give up rather than logging the same
                     // line for hours at 0.00 PoI/s — a non-zero exit also lets
