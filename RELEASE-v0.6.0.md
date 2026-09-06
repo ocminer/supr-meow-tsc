@@ -5,10 +5,11 @@ smaller memory. This release also improves device selection and shutdown.
 
 | Hardware | Mining rate |
 |---|---:|
-| RTX 5090 32 GB | 34.0 windows/s |
-| 2 × RTX 3070 8 GB, shared model | 7.2 windows/s combined |
+| RTX 5090 32 GB | 18.7 windows/s |
+| 2 × RTX 3070 8 GB, shared model | 5.0 windows/s combined |
 
-Rates vary with hardware, clocks and operating conditions.
+Rates are measured over six-minute live-pool runs, including startup and
+retries. They vary with hardware, clocks and operating conditions.
 
 ## Downloads
 
@@ -55,7 +56,7 @@ DEVICES=0,1
 SPLIT_MODEL=1
 ```
 
-Remove old `SLOTS`, `MEOW_GROUPS`, `CTX`, `EXTRA_ARGS`, `MODEL_URL` and
+Remove old `Q8_PROFILE`, `SLOTS`, `MEOW_GROUPS`, `CTX`, `EXTRA_ARGS`, `MODEL_URL` and
 `MODEL_PATH` overrides when upgrading, so the new defaults and required model
 are used. `MODEL_DIR` can select a persistent cache directory. For HiveOS, use
 the exact unsuffixed archive name shown above as the installation URL.

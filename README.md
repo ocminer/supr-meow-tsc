@@ -10,12 +10,13 @@ requirements.
 
 ## Performance
 
-Measured end-to-end during live-pool mining with the current miner.
+Measured over six-minute live-pool runs with the release package, including
+startup and retries.
 
 | GPU | Mining rate |
 |---|---:|
-| RTX 5090 32 GB | approximately 34.0 windows/s |
-| 2 × RTX 3070 8 GB, shared model | approximately 7.2 windows/s combined |
+| RTX 5090 32 GB | approximately 18.7 windows/s |
+| 2 × RTX 3070 8 GB, shared model | approximately 5.0 windows/s combined |
 
 Only recently tested hardware is listed. Other cards will be added after they
 are retested with this version. Rates vary with clocks and operating conditions.

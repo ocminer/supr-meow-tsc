@@ -24,3 +24,6 @@ select `DEVICES=0,1` within that visible list. Give separate processes distinct
 On upgrade, remove old performance and model overrides, then let the new
 version choose defaults. Stop the old process before launching the replacement.
 For normal shutdown, send SIGINT and wait for the process to exit.
+
+Rates can fluctuate between status updates because work completes in batches.
+Compare rates over several minutes after startup.
