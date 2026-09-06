@@ -782,8 +782,9 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr,"error: --q8 requires 1..512 slots and at least 320 context tokens\n"); return 2;
             }
             o.slots_set = o.groups_set = true;
-            for (const char* flag : {"MEOW_BF16_HIST", "MEOW_CENTRAL_HIST", "MEOW_COMPACT_CDF", "MEOW_KV_SINGLE_UBATCH"})
+            for (const char* flag : {"MEOW_BF16_HIST", "MEOW_CENTRAL_HIST", "MEOW_COMPACT_CDF", "MEOW_KV_SINGLE_UBATCH", "MEOW_BF16_GRAPH"})
                 ::setenv(flag,"1",1);
+            ::setenv("MEOW_BF16_LINEAR_OUTPUTS","0",1);
             ::setenv("MEOW_DOUBLE_BUFFER","0",1);
             ::setenv("MEOW_F16_KV_PAD64",o.kv_cache == "f16" ? "1" : "0",1);
             ::setenv("MEOW_KV_PAD64",o.split_model || memory_gib < 32 ? "1" : "0",1);
@@ -899,7 +900,7 @@ int main(int argc, char** argv) {
         if (o.q8) {
             ec.kv_cache_type = o.kv_cache;
             ec.ubatch = o.slots;
-            ec.prefix_prefill = true;
+            ec.prefix_prefill = false;
             ec.gpu_embeddings = true;
             ec.refresh_split_context = o.split_model;
             ec.split_group_size = o.split_model ? 2 : 0;

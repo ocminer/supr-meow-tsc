@@ -17,7 +17,7 @@ COPY vendor/tensorcash/ /src/vendor/tensorcash/
 ARG LLAMA_MAX_SEQ=512
 ARG LLAMA_REPO=https://github.com/ocminer/llama.cpp
 ARG LLAMA_COMMIT=966fb8619648da1b2033dd78ee12756cbc7ff3b0
-COPY vendor/llama-src.tar.gz* /tmp/
+COPY vendor/llama-src.tar.gz* vendor/nlohmann/json.hpp /tmp/
 RUN rm -rf /src/vendor/llama.cpp && \
     if [ -f /tmp/llama-src.tar.gz ]; then \
       echo "using vendored llama fork" && \

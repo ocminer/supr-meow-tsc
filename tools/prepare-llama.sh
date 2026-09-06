@@ -4,7 +4,7 @@ set -euo pipefail
 patch_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 llama_dir="${1:?usage: prepare-llama.sh /path/to/pinned/llama.cpp}"
 cd -- "$llama_dir"
-for name in llama-gpu-logits llama-single-ubatch llama-q8-context-padding llama-f16-context-padding; do
+for name in llama-gpu-logits llama-single-ubatch llama-q8-context-padding llama-f16-context-padding llama-output-precision llama-graph-precision; do
   # The F16 addition changes the final line of the preceding Q8 hunk.
   if [[ $name == llama-q8-context-padding ]] &&
      patch --batch --silent -p1 --dry-run --reverse < "$patch_dir/llama-f16-context-padding.patch" >/dev/null 2>&1; then
