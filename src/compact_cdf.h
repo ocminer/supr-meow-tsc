@@ -10,6 +10,7 @@ namespace meow {
 struct CompactCdf {
     std::vector<int> ids;
     std::vector<float> cdf;
+    float log_normalizer;
     CompactCdf(const std::vector<std::pair<float,int>>& ranked, int k) {
         std::vector<std::pair<int,float>> survivors;
         for (int r = 0; r < k-1 && ranked[r].first > ranked[k-1].first; ++r)
@@ -24,6 +25,10 @@ struct CompactCdf {
             cdf.push_back(std::exp(item.second-maximum));
             z += cdf.back();
         }
+        double normalizer_sum = 0;
+        for (const auto& item : survivors)
+            normalizer_sum += std::exp(double(item.second-maximum));
+        log_normalizer = maximum + static_cast<float>(std::log(normalizer_sum));
         const float inv = z > 0 ? float(1.0/z) : 0.0f;
         float cumulative = 0;
         for (float& v : cdf) { v *= inv; cumulative += v; v = cumulative; }

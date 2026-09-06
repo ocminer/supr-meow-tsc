@@ -39,6 +39,7 @@ s = s.replace(start, '''    // MEOW compact distribution experiment
         auto [token,probability] = distribution.map_rank(size_t(rank),u,n_vocab);
         result.token_id = token; result.u_value = u; result.digest = std::move(digest);
         result.token_prob = probability;
+        result.softmax_log_z = distribution.log_normalizer;
         if (compact_check) compact_result = result;
     }
     if (!compact || compact_check) {
@@ -46,7 +47,8 @@ s = s.replace(start, '''    // MEOW compact distribution experiment
 s = s.replace(end, '''    }
     if (compact && compact_check && (result.token_id != compact_result.token_id ||
         result.token_prob != compact_result.token_prob || result.u_value != compact_result.u_value ||
-        result.digest != compact_result.digest))
+        result.digest != compact_result.digest ||
+        result.softmax_log_z != compact_result.softmax_log_z))
         throw std::runtime_error("compact CDF differs from dense reference");
 
 '''+end,1)
