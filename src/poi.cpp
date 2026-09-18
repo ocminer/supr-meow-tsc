@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <unordered_map>
 #include <algorithm>
+#include <filesystem>
 
 #include "pow_utils.h"
 #include "proof_generated.h"
@@ -202,7 +203,15 @@ bool PoiMiner::init(int window_tokens, std::string& error, int n_streams,
     zmq_setsockopt(impl_->zmq_pull, ZMQ_RCVTIMEO, &timeo, sizeof(timeo));
 
     try {
+#ifdef _WIN32
+        const auto temporary = std::filesystem::temp_directory_path();
+        const std::string proof_dir = (temporary / "supr-meow-tsc-proofs").string();
+        ::setenv("PROOF_SAVE_DIR", proof_dir.c_str(), 0);
+        impl_->coord.initialize(get_env_var("MINER_LOG_DIR",
+            (temporary / "supr-meow-tsc-logs").string()), "");
+#else
         impl_->coord.initialize("/tmp/supr-meow-tsc-logs", "");
+#endif
     } catch (const std::exception& e) {
         error = std::string("sampler initialize failed: ") + e.what();
         return false;

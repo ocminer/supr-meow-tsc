@@ -224,7 +224,7 @@ inline uint32_t get_compact(const std::vector<uint8_t>& target, bool negative = 
 Logger::Logger(const std::string& log_dir) {
     std::string dir = log_dir.empty() ? get_env_var("MINER_LOG_DIR", "/data/miner_logs") : log_dir;
     fs::create_directories(dir);
-    log_file_path = fs::path(dir) / "pow_sampler.log";
+    log_file_path = (fs::path(dir) / "pow_sampler.log").string();
 }
 
 void Logger::log(const std::string& message, const std::string& level) {
