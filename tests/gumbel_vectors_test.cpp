@@ -29,6 +29,19 @@ int main(int argc, char** argv) {
         if (gumbel::token_uniform(seed,v["token_id"].get<uint32_t>()) != v["u"].get<double>()) return 1;
         ++checked;
     }
-    if (checked < 10) return 2;
-    std::cout << "Gumbel deterministic log and " << checked << " seed/uniform vectors passed\n";
+    for (const auto& v : d.at("dlog")) {
+        const auto input_bits = v["x_bits"].get<int64_t>();
+        double x;
+        std::memcpy(&x, &input_bits, sizeof(x));
+        const double y = gumbel::dlog(x);
+        int64_t bits;
+        std::memcpy(&bits, &y, sizeof(bits));
+        if (bits != v["dlog_bits"].get<int64_t>()) {
+            std::cerr << "Deterministic log differs from reference bits\n";
+            return 1;
+        }
+        ++checked;
+    }
+    if (checked != 479) return 2;
+    std::cout << "Gumbel deterministic log and " << checked << " seed/uniform/log vectors passed\n";
 }

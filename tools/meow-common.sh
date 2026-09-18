@@ -61,4 +61,6 @@ args+=( --api-bind "127.0.0.1:${API_PORT:-21550}" )
 [[ -n ${EXTRA_ARGS:-}  ]] && args+=( ${EXTRA_ARGS} )
 
 echo "[supr-meow-tsc] pool=$POOL_URL model=$(basename "$MODEL_PATH")"
+export MEOW_DOUBLE_BUFFER="${DOUBLE_BUFFER:-0}"
+export POW_PROMPT_STYLE="${PROMPT_STYLE:-1}"
 exec ./supr-meow-tsc "${args[@]}"

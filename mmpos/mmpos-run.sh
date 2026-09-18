@@ -7,7 +7,9 @@
 # model cache directory (MMPOS keeps persistent data under /hive-config on
 # some images and /mmpos on others — both are probed).
 cd "$(dirname "$0")" || exit 1
+set -a
 [[ -f miner.conf ]] && . ./miner.conf
+set +a
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:$(pwd)/lib"
 
 [[ -z $POOL_URL ]] && { echo "POOL_URL missing — set it in the MMPOS miner config"; exit 1; }
@@ -19,4 +21,5 @@ if [[ -z $MODEL_DIR ]]; then
   done
   MODEL_DIR="${MODEL_DIR:-$(pwd)/models}"
 fi
+export MODEL_DIR
 exec ./meow-common.sh
