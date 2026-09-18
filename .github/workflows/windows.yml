@@ -91,7 +91,10 @@ jobs:
               $Matches[1]
             }
           })
-          if ($LASTEXITCODE -or $objects.Count -lt 16) { throw 'Miner host object targets are missing' }
+          if ($LASTEXITCODE -or !($objects -match 'supr-meow-tsc') -or !($objects -match 'meow_poi')) {
+            throw 'Miner host object targets are missing'
+          }
+          Write-Host "Compiling $($objects.Count) miner host translation units"
           cmake --build build/windows --parallel 4 --target $objects
           if ($LASTEXITCODE) { throw 'Miner host compilation failed' }
       - name: Build CUDA miner and package
