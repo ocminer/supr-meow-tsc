@@ -13,7 +13,9 @@ int main(int argc, char** argv) {
     meow::StratumClient client;
     std::atomic<bool> accepted{false};
     meow::StratumCallbacks callbacks;
-    callbacks.on_job = [&](const meow::PoolJob& job) { client.submit(job.job_id, 42, "TEST", "ff", 1000); };
+    callbacks.on_job = [&](const meow::PoolJob& job) {
+        client.submit(job.job_id, 42, std::string(200000, 'A'), "ff", 1000);
+    };
     callbacks.on_submit_result = [&](bool ok, int, const std::string&, int) { accepted = ok; };
     client.configure({url}, "test.worker", "x", "supr-meow-tsc/0.7.0", callbacks);
     if (!client.start()) return 5;

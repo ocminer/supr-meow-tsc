@@ -27,7 +27,8 @@ with socket.socket() as listener, socket.socket() as reserve:
                         {'method': 'mining.notify', 'params': ['job', '00'*76, 'ff'*32, 1, 27000, 9999999999, True]}]:
                 stream.write(json.dumps(row).encode() + b'\n')
             share = json.loads(stream.readline())
-            assert share['method'] == 'mining.submit' and share['params'][:4] == ['test.worker', 'job', 42, 'TEST']
+            assert share['method'] == 'mining.submit' and share['params'][:3] == ['test.worker', 'job', 42]
+            assert share['params'][3] == 'A' * 200000
             stream.write(json.dumps({'id': share['id'], 'result': True, 'error': None}).encode() + b'\n')
             assert child.wait(timeout=10) == 0
     finally:
