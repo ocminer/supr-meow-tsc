@@ -136,6 +136,8 @@ add_custom_target(meow_fbgen DEPENDS ${MEOW_FB_HEADERS})
 # checked-in copies. Upstream's Dockerfile stages the same way.
 set(MEOW_POI_STAGE ${CMAKE_BINARY_DIR}/poi)
 file(MAKE_DIRECTORY ${MEOW_POI_STAGE})
+file(GLOB MEOW_POI_INPUTS CONFIGURE_DEPENDS
+  "${MEOW_POW_DIR}/*.cpp" "${MEOW_POW_DIR}/*.h")
 set(MEOW_POI_STAGED
   ${MEOW_POI_STAGE}/pow_utils.cpp ${MEOW_POI_STAGE}/pow_v3.cpp
   ${MEOW_POI_STAGE}/bcred_table_r1024.cpp
@@ -162,7 +164,7 @@ add_custom_command(
           ${CMAKE_SOURCE_DIR}/tools/patch-staged-poi.py ${MEOW_POI_STAGE}
   COMMAND ${CMAKE_COMMAND} -E env python3
           ${CMAKE_SOURCE_DIR}/tools/optimize-staged-poi.py ${MEOW_POI_STAGE}
-  DEPENDS ${CMAKE_SOURCE_DIR}/tools/optimize-staged-poi.py ${CMAKE_SOURCE_DIR}/tools/patch-staged-poi.py ${MEOW_FB_HEADERS} ${MEOW_POW_DIR}/pow_utils.cpp ${MEOW_POW_DIR}/pow_v3.cpp
+  DEPENDS ${CMAKE_SOURCE_DIR}/tools/optimize-staged-poi.py ${CMAKE_SOURCE_DIR}/tools/patch-staged-poi.py ${MEOW_FB_HEADERS} ${MEOW_POI_INPUTS}
   COMMENT "Staging proof-of-inference sources with regenerated schemas")
 
 add_library(meow_poi STATIC ${MEOW_POI_STAGED})

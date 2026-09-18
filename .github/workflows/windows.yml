@@ -95,7 +95,7 @@ jobs:
             throw 'Miner host object targets are missing'
           }
           Write-Host "Compiling $($objects.Count) miner host translation units"
-          cmake --build build/windows --parallel 4 --target $objects
+          cmake --build build/windows --parallel 4 --target $objects -- -k 0
           if ($LASTEXITCODE) { throw 'Miner host compilation failed' }
       - name: Build CUDA miner and package
         shell: pwsh

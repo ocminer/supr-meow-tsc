@@ -9,15 +9,22 @@
 #include <unordered_map>
 #include <vector>
 #include <cstdlib>
+#ifndef _MSC_VER
 #include <cxxabi.h>
+#endif
 
 // Demangle RTTI name
 static std::string demangle(const char* name) {
+#ifdef _MSC_VER
+    // MSVC's type_info::name() is already suitable for diagnostics.
+    return name;
+#else
     int status = 0;
     char* real = abi::__cxa_demangle(name, nullptr, nullptr, &status);
     std::string ret = (status == 0 && real) ? real : name;
     std::free(real);
     return ret;
+#endif
 }
 
 // Helper to dump a flat vector
