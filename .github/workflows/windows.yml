@@ -79,6 +79,18 @@ jobs:
             ~/AppData/Local/vcpkg/archives
             build/windows/vcpkg_installed
           key: meow-windows-deps-${{ hashFiles('vcpkg.json') }}-${{ github.sha }}
+      - name: Compile miner host sources
+        shell: pwsh
+        run: |
+          # Catch application-port errors before the much larger CUDA backend build.
+          $objects = @(& ninja -C build/windows -t targets all | ForEach-Object {
+            if ($_ -match '^(CMakeFiles[\\/](supr-meow-tsc|meow_poi)\.dir[\\/].*\.cpp\.obj):') {
+              $Matches[1]
+            }
+          })
+          if ($LASTEXITCODE -or $objects.Count -lt 16) { throw 'Miner host object targets are missing' }
+          cmake --build build/windows --parallel 4 --target $objects
+          if ($LASTEXITCODE) { throw 'Miner host compilation failed' }
       - name: Build CUDA miner and package
         shell: pwsh
         run: |
