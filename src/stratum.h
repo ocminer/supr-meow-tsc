@@ -6,6 +6,7 @@
 // fails over across the pools given with repeated -o.
 // =============================================================================
 #pragma once
+#include "net.h"
 
 #include <atomic>
 #include <cstdint>
@@ -111,7 +112,7 @@ private:
     std::string          user_, pass_, ua_;
     StratumCallbacks     cb_;
 
-    int                  fd_ = -1;
+    net::socket_type     fd_ = net::invalid;
     void*                tls_ = nullptr;      // opaque; TLS lands with the mining path
     std::thread          thread_;
     std::atomic<bool>    running_{false};

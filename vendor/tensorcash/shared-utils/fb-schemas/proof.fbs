@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: Apache-2.0
+// proof.fbs
+// FlatBuffers schema for PoW proof with C++ and Python compatibility
+namespace proof;
+
+// Wrapper for 1D float arrays (for 2D tensors)
+table FloatArray {
+  values:[float];      // float32 vector
+}
+
+// Wrapper for 1D uint arrays
+table UIntArray {
+  values:[uint32];     // uint32 vector
+}
+
+// Root table representing a single proof
+table Proof {
+  version:uint8;                 // schema version identifier
+  tick:uint64;                 // monotonic tick count
+  timestamp:uint64;            // UNIX timestamp
+
+  // Binary fields as raw bytes (more compact than hex strings)
+  target:[ubyte];              // target bytes
+  vdf:[ubyte];                 // VDF output bytes
+  hash:[ubyte];                // proof hash bytes
+  block_hash:[ubyte];                // prior block hash bytes
+  header_prefix:[ubyte];       // optional, if provided
+
+  is_solution:bool;
+  model_identifier : string;    // e.g. "gpt-4"
+  compute_precision: string;    // e.g. "fp16"
+  ipfs_cid         : string;    // e.g. "cdcdcd"
+  extra_flags      : string;    // e.g. ""
+  temperature      : float;     // sampling temperature
+  top_p            : float;     // nucleus‐sampling p
+  top_k            : uint32;    // top‐k sampling
+  repetition_penalty: float;    // repetition penalty
+  
+  // 1D arrays
+  chosen_tokens:[uint32];      // selected token IDs
+  chosen_probs:[float];        // probabilities
+  sampling_u:[float];          // random sampling values
+  softmax_normalizers:[float]; // softmax normalizers
+  prompt_tokens:[uint32];      // prompt token IDs
+  pad_mask:[bool];           // pad mask (0/1)
+
+  // 2D tensors implemented via wrapper tables
+  topk_logits:[FloatArray];    // vector of FloatArray
+  topk_indices:[UIntArray];    // vector of UIntArray
+  logsumexp_stats:[FloatArray]; // vector of FloatArray (2D tensor)
+}
+
+root_type Proof;
+file_identifier "PROF";  // optional 4-byte identifier

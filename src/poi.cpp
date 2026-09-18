@@ -1,3 +1,4 @@
+#include "platform.h"
 #include "poi.h"
 
 #include "stratum.h"
@@ -131,12 +132,21 @@ bool PoiMiner::init(int window_tokens, std::string& error, int n_streams,
     }
     // Both processes must agree on the proof version or the sampler aborts on
     // its first solution check; here there is only one process, so set it.
-    ::setenv("POW_PROOF_VERSION", "3", 1);
-    // Left at "off" DELIBERATELY. Turning it on makes the step-0 digest
-    // disagree with the verifier's recomputation, i.e. this validator does not
-    // fold an admission nonce into the hash. Nonce-less costs the
-    // [B_FLOOR, B_FREE) admission band, which is a throughput matter, not a
-    // validity one — and it is what this chain actually verifies against.
+    // Proof v4 (TIP proof-v4 hardfork): from height Z (27615) v3 proofs are no
+    // longer admitted, so this miner emits v4. v4 appends the effective step
+    // nonce E4 to every step and draws with the chain-bound Gumbel race (see
+    // pow_utils.cpp / meow_pow_v4). Free tier still computes A (Argon2id).
+    ::setenv("POW_PROOF_VERSION", "4", 1);
+    // v4 verification runs on the StepBind replay path; these select the
+    // tensor-main proof-v4 height schedule + strict mode for explicitly
+    // requested rulesets, and MUST be set in every process (verify at
+    // /proc/<pid>/environ). Unset silently selects the wrong schedule.
+    ::setenv("POW_CHAIN_NETWORK", "tensor-main", 1);
+    ::setenv("POW_V4_STRICT_MODE", "enforce-requested", 1);
+    // Left at "off" DELIBERATELY. The v3 admission GRIND is off (v4's R is a
+    // fresh random nonce, never grinded — free tier admits any A). This flag
+    // only gates the v3 grind; the v4 window-root path in prepare_window_-
+    // admission_ runs regardless and appends E4 on every step.
     ::setenv("POW_V3_ADMISSION_MODE", "off", 1);
     ::setenv("POW_EGRESS_MODE", "broker", 1);      // broker mode emits shares AND solutions
     ::setenv("POW_PROXY_ENABLE", "false", 1);      // ...and carries pow_blob_hash
@@ -289,7 +299,7 @@ bool PoiMiner::set_job(const PoiJobParams& p, std::string& error) {
         {"difficulty",        std::to_string(p.model_difficulty)},
         {"model_identifier",  p.model_identifier},
         {"compute_precision", "bf16"},
-        {"proof_version",     "3"},
+        {"proof_version",     "4"},
         {"request_id",        std::to_string(p.request_id)},
         // v3 refuses to sample without these: the sampler settings are part of
         // what the proof commits to, so they must be declared, not implied.

@@ -45,3 +45,6 @@ tools/compact-check.cpp
 tools/llama-bf16-linear-outputs.patch
 tools/llama-configurable-sequences.patch
 vllm-miner/RELEASE-v0.5.1.md
+
+vcpkg_installed/
+windows-build.log

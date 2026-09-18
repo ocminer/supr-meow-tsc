@@ -8,6 +8,7 @@
 // design: a rig API that needs a web framework is a liability.
 // =============================================================================
 #pragma once
+#include "net.h"
 
 #include <functional>
 #include <string>
@@ -32,7 +33,7 @@ public:
 private:
     void run();
 
-    int               fd_ = -1;
+    net::socket_type  fd_ = net::invalid;
     std::thread       thread_;
     std::atomic<bool> running_{false};
     Snapshot          snapshot_;

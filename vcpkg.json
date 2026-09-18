@@ -1,0 +1,6 @@
+{
+  "name": "supr-meow-tsc",
+  "version-string": "0.7.0",
+  "builtin-baseline": "e6f9e70a29a3e80a1fc510d8503304315447112f",
+  "dependencies": ["openssl", "argon2", "cppzmq", "gmp", "boost-multiprecision", "flatbuffers"]
+}

@@ -36,12 +36,12 @@ extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 #include <ctime>
 #include <string>
 #include <thread>
-#include <unistd.h>
+#include "platform.h"
 #include <vector>
 
 namespace {
 
-const char* kVersion = "0.6.0";
+const char* kVersion = "0.7.0";
 
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop = true; }

@@ -29,7 +29,7 @@ s = s.replace(start, '''    // MEOW compact distribution experiment
     static const bool compact_check = [] {
         const char* e = std::getenv("MEOW_COMPACT_CHECK"); return e && e[0] == '1';
     }();
-    const bool compact = compact_enabled && gpu_probes_valid_ && gpu_stats_valid_ &&
+    const bool compact = compact_enabled && proof_version_ < pow_v4::V4_PROOF_VERSION && gpu_probes_valid_ && gpu_stats_valid_ &&
         temperature == 1.0f && top_p == 1.0f && top_k > 0 && top_k < n_vocab &&
         pretemp_desc_.size() >= size_t(top_k);
     SamplingResult compact_result;

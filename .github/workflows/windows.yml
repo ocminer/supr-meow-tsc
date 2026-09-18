@@ -1,0 +1,93 @@
+name: Native Windows CUDA
+on:
+  push:
+    branches: ['ci/windows-*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-windows-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Cache CUDA toolkit
+        id: cuda-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cuda-13.3
+          key: meow-cuda-13.3-v1
+      - name: Install NVIDIA toolkit
+        shell: pwsh
+        run: |
+          $cuda = Join-Path $env:RUNNER_TEMP 'cuda-13.3'
+          if (!(Test-Path "$cuda/installed-components.json")) {
+            python tools/install-windows-cuda.py --output $cuda
+            if ($LASTEXITCODE) { throw 'CUDA installation failed' }
+          }
+          "CUDA_PATH=$cuda" | Out-File $env:GITHUB_ENV -Append
+          "$cuda/bin" | Out-File $env:GITHUB_PATH -Append
+          "$cuda/bin/x64" | Out-File $env:GITHUB_PATH -Append
+      - name: Cache dependency packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/AppData/Local/vcpkg/archives
+            build/windows/vcpkg_installed
+          key: meow-windows-deps-${{ hashFiles('vcpkg.json') }}
+      - name: Prepare pinned dependencies
+        shell: bash
+        run: bash tools/prepare-llama.sh vendor/llama.cpp
+      - name: Configure and test native proof and sockets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git -C $env:VCPKG_INSTALLATION_ROOT fetch --depth 1 origin e6f9e70a29a3e80a1fc510d8503304315447112f
+          if ($LASTEXITCODE) { throw 'vcpkg fetch failed' }
+          git -C $env:VCPKG_INSTALLATION_ROOT checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE) { throw 'vcpkg pin failed' }
+          & "$env:VCPKG_INSTALLATION_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE) { throw 'vcpkg bootstrap failed' }
+          cmake -S . -B build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows -DMEOW_BUILD_TESTS=ON `
+            '-DCMAKE_CUDA_ARCHITECTURES=80;86;89;90;120' -DGGML_NATIVE=OFF `
+            -DGGML_CUDA_FA_ALL_QUANTS=OFF -DGGML_CUDA_F16=ON
+          if ($LASTEXITCODE) { throw 'CMake configure failed' }
+          cmake --build build/windows --parallel 4 --target meow-v4-root-test meow-gumbel-test meow-vdf-test meow-network-test
+          if ($LASTEXITCODE) { throw 'Native host build failed' }
+          $env:PATH = "$PWD/build/windows/vcpkg_installed/x64-windows/bin;$env:PATH"
+          ctest --test-dir build/windows --output-on-failure
+          if ($LASTEXITCODE) { throw 'Native proof or socket validation failed' }
+      - name: Build CUDA miner and package
+        shell: pwsh
+        run: |
+          cmake --build build/windows --parallel 4 --target supr-meow-tsc
+          if ($LASTEXITCODE) { throw 'CUDA miner build failed' }
+          ./tools/package-windows.ps1
+          if ($LASTEXITCODE) { throw 'Native Windows packaging failed' }
+      - name: Upload native package
+        uses: actions/upload-artifact@v4
+        with:
+          name: supr-meow-tsc-0.7.0-windows-x86_64
+          path: dist/*
+          if-no-files-found: error
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-diagnostics
+          path: |
+            build/windows/Testing/Temporary/*
+            build/windows/CMakeFiles/CMakeConfigureLog.yaml
+            build/windows/vcpkg-manifest-install.log
+            build/windows/compile_commands.json
+          if-no-files-found: ignore

@@ -8,6 +8,10 @@ enable_language(CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(MSVC)
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/EHsc> $<$<COMPILE_LANGUAGE:CXX>:/bigobj>)
+endif()
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -97,7 +101,7 @@ endif()
 # compile against any other FlatBuffers. Regenerate them from the .fbs schemas
 # with the local flatc — which is exactly what upstream's Dockerfile does, and
 # it keeps the build working across FlatBuffers releases.
-find_library(ZMQ_LIBRARY NAMES zmq)
+find_library(ZMQ_LIBRARY NAMES zmq libzmq libzmq-mt-4_3_5 libzmq-mt-s-4_3_5)
 find_path(ZMQ_INCLUDE_DIR zmq.h)
 if(NOT ZMQ_LIBRARY OR NOT ZMQ_INCLUDE_DIR)
   message(FATAL_ERROR "libzmq not found — install libzmq3-dev. It arrives with "
@@ -136,7 +140,9 @@ file(MAKE_DIRECTORY ${MEOW_POI_STAGE})
 set(MEOW_POI_STAGED
   ${MEOW_POI_STAGE}/pow_utils.cpp ${MEOW_POI_STAGE}/pow_v3.cpp
   ${MEOW_POI_STAGE}/bcred_table_r1024.cpp
-  ${MEOW_POI_STAGE}/pow_zmq_writer.cpp)
+  ${MEOW_POI_STAGE}/pow_zmq_writer.cpp
+  # Proof v4: window-root derivation (E4) + the chain-bound Gumbel race draw.
+  ${MEOW_POI_STAGE}/meow_pow_v4.cpp ${MEOW_POI_STAGE}/gumbel_sampler.cpp)
 add_custom_command(
   OUTPUT ${MEOW_POI_STAGED}
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -146,6 +152,8 @@ add_custom_command(
           ${MEOW_POW_DIR}/any_map_dump.h
           ${MEOW_POW_DIR}/pow_zmq_writer.cpp ${MEOW_POW_DIR}/pow_zmq_writer.h
           ${MEOW_POW_DIR}/pow_zmq_writer_helpers.h
+          ${MEOW_POW_DIR}/meow_pow_v4.cpp ${MEOW_POW_DIR}/meow_pow_v4.h
+          ${MEOW_POW_DIR}/gumbel_sampler.cpp ${MEOW_POW_DIR}/gumbel_sampler.h
           ${MEOW_POI_STAGE}
   COMMAND ${CMAKE_COMMAND} -E copy_if_different ${MEOW_FB_HEADERS} ${MEOW_POI_STAGE}
   # Fixes for upstream defects are applied to the STAGED copy, never to
@@ -159,6 +167,12 @@ add_custom_command(
   COMMENT "Staging proof-of-inference sources with regenerated schemas")
 
 add_library(meow_poi STATIC ${MEOW_POI_STAGED})
+# The Gumbel race's deterministic log (gumbel_sampler.cpp) is bit-exact ONLY
+# with FP contraction OFF — it uses a shipped 129-entry log table and IEEE
+# basic ops in a fixed order, NO libm, NO FMA. dlog_selftest() (called before
+# every race) fails loudly if the TU was built with contraction/fast-math on.
+set_source_files_properties(${MEOW_POI_STAGE}/gumbel_sampler.cpp PROPERTIES
+  COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/fp:strict,-ffp-contract=off>")
 target_include_directories(meow_poi PUBLIC
   ${MEOW_POI_STAGE} ${CMAKE_SOURCE_DIR}/src ${ARGON2_INCLUDE_DIR} ${FLATBUFFERS_INCLUDE_DIR} ${ZMQ_INCLUDE_DIR})
 target_link_libraries(meow_poi PUBLIC ${ARGON2_LIBRARY} ${ZMQ_LIBRARY} OpenSSL::Crypto)
@@ -173,7 +187,7 @@ target_sources(meow_poi PRIVATE ${CMAKE_SOURCE_DIR}/src/pow_gpu.cu)
 target_sources(meow_poi PRIVATE ${CMAKE_SOURCE_DIR}/src/pow_histogram.cu)
 target_compile_definitions(meow_poi PUBLIC POW_GPU_SORT_ENABLED)
 set_source_files_properties(${CMAKE_SOURCE_DIR}/src/pow_gpu.cu PROPERTIES
-  COMPILE_OPTIONS "--expt-relaxed-constexpr;-Xcompiler=-mavx2")
+  COMPILE_OPTIONS "--expt-relaxed-constexpr;-Xcompiler=$<IF:$<CXX_COMPILER_ID:MSVC>,/arch:AVX2,-mavx2>")
 set_target_properties(meow_poi PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
@@ -205,7 +219,12 @@ if(GMPXX_LIBRARY)
 endif()
 # chiavdf's fixed-point paths are only correct under truncation rounding and
 # strict FP semantics; -ffast-math here would silently produce invalid proofs.
-target_compile_options(meow_vdf PRIVATE -fno-fast-math -frounding-math)
+if(MSVC)
+  target_compile_options(meow_vdf PRIVATE /fp:strict)
+  target_sources(meow_vdf PRIVATE ${MEOW_CHIAVDF_DIR}/src/uint128_t/uint128_t.cpp)
+else()
+  target_compile_options(meow_vdf PRIVATE -fno-fast-math -frounding-math)
+endif()
 set_target_properties(meow_vdf PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_executable(supr-meow-tsc
@@ -229,8 +248,65 @@ target_link_libraries(supr-meow-tsc PRIVATE meow_poi meow_vdf llama ggml CUDA::c
 # A miner is copied between rigs, so prefer a binary that does not chase host
 # libstdc++ versions. CUDA/NVML stay dynamic (they must match the driver).
 option(MEOW_STATIC_LIBSTDCXX "Link libstdc++/libgcc statically" ON)
-if(MEOW_STATIC_LIBSTDCXX)
+if(MEOW_STATIC_LIBSTDCXX AND NOT MSVC)
   target_link_options(supr-meow-tsc PRIVATE -static-libstdc++ -static-libgcc)
 endif()
 
+if(WIN32)
+  target_link_libraries(supr-meow-tsc PRIVATE ws2_32 delayimp)
+  target_link_options(supr-meow-tsc PRIVATE /DELAYLOAD:nvml.dll)
+endif()
+
+option(MEOW_BUILD_TESTS "Build CPU proof and network contract tests" OFF)
+if(MEOW_BUILD_TESTS)
+  enable_testing()
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_executable(meow-v4-root-test tests/v4_root_parity.cpp
+    ${MEOW_POW_DIR}/meow_pow_v4.cpp ${MEOW_POW_DIR}/pow_v3.cpp ${MEOW_POW_DIR}/bcred_table_r1024.cpp)
+  target_compile_definitions(meow-v4-root-test PRIVATE POW_V3_HAVE_ARGON2)
+  target_include_directories(meow-v4-root-test PRIVATE ${MEOW_POW_DIR} vendor/nlohmann ${ARGON2_INCLUDE_DIR})
+  target_link_libraries(meow-v4-root-test PRIVATE ${ARGON2_LIBRARY} OpenSSL::Crypto)
+  add_test(NAME v4-root-parity COMMAND meow-v4-root-test ${CMAKE_SOURCE_DIR}/tests/vectors/v4_vectors.json)
+  add_executable(meow-gumbel-test tests/gumbel_vectors_test.cpp ${MEOW_POW_DIR}/gumbel_sampler.cpp)
+  set_source_files_properties(${MEOW_POW_DIR}/gumbel_sampler.cpp PROPERTIES
+    COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/fp:strict,-ffp-contract=off>")
+  target_include_directories(meow-gumbel-test PRIVATE ${MEOW_POW_DIR} vendor/nlohmann)
+  target_link_libraries(meow-gumbel-test PRIVATE OpenSSL::Crypto)
+  add_test(NAME gumbel-parity COMMAND meow-gumbel-test ${CMAKE_SOURCE_DIR}/tests/vectors/gumbel_vectors.json)
+  add_executable(meow-vdf-test tests/vdf_test.cpp)
+  target_include_directories(meow-vdf-test PRIVATE src)
+  target_link_libraries(meow-vdf-test PRIVATE meow_vdf)
+  add_test(NAME vdf-proof-binding COMMAND meow-vdf-test ${CMAKE_SOURCE_DIR}/tests/vectors/vdf-reference.txt)
+  add_executable(meow-network-test tests/network_client.cpp src/api.cpp src/stratum.cpp)
+  target_include_directories(meow-network-test PRIVATE src)
+  target_link_libraries(meow-network-test PRIVATE Threads::Threads)
+  if(WIN32)
+    target_link_libraries(meow-network-test PRIVATE ws2_32)
+  endif()
+  add_test(NAME network-contract COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/network_test.py $<TARGET_FILE:meow-network-test>)
+endif()
 install(TARGETS supr-meow-tsc RUNTIME DESTINATION bin)
+
+# Offline measurement uses the production inference and proof sampler. It has
+# no pool client: captured fixtures cannot accidentally become live work.
+option(MEOW_BUILD_BENCH "Build the offline proof-generation benchmark" ON)
+# The measurement/bench tool sources are dev-only and are excluded from the
+# release Docker build context (.dockerignore), so guard the targets on their
+# sources actually being present: a dev checkout builds them, the portable
+# release build (which omits them) still configures cleanly instead of failing
+# with "No SOURCES given to target".
+if(MEOW_BUILD_BENCH AND EXISTS "${CMAKE_SOURCE_DIR}/tools/pow-bench.cpp")
+  add_executable(meow-compact-check tools/compact-check.cpp)
+  target_include_directories(meow-compact-check PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  add_executable(meow-histogram-check tools/histogram-check.cpp)
+  target_link_libraries(meow-histogram-check PRIVATE meow_poi CUDA::cudart)
+  add_executable(meow-replay-logits tools/replay-logits.cpp src/engine.cpp)
+  target_include_directories(meow-replay-logits PRIVATE src vendor
+    ${MEOW_LLAMA_DIR}/include ${MEOW_LLAMA_DIR}/ggml/include)
+  target_link_libraries(meow-replay-logits PRIVATE meow_poi llama ggml CUDA::cudart Threads::Threads)
+  add_executable(meow-pow-bench tools/pow-bench.cpp src/engine.cpp src/poi.cpp)
+  target_include_directories(meow-pow-bench PRIVATE src vendor
+    ${MEOW_LLAMA_DIR}/include ${MEOW_LLAMA_DIR}/ggml/include)
+  target_link_libraries(meow-pow-bench PRIVATE meow_poi meow_vdf llama ggml
+    CUDA::cudart Threads::Threads)
+endif()

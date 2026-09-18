@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: Apache-2.0
+include "proof.fbs";
+
+namespace proof;
+
+enum ValidationType : uint8 {
+  Quick = 0,
+  Quick_Smell = 1,
+  Full = 2,
+  Model = 3,
+  Challenge = 4,
+  // Audit/logits verification: sequence + logits replay only, no block
+  // sanity and no mining parameter envelope. Append-only addition —
+  // wire-compatible with older readers (they warn on the unknown value).
+  Logits = 5
+}
+
+enum ResponseValue : uint8 {
+  Quick_OK = 0,
+  Quick_Fail = 1,
+  Quick_OK_Smell_OK = 2,
+  Quick_OK_Smell_Fail = 3,
+  Quick_Fail_Smell_OK = 4,
+  Quick_Fail_Smell_Fail = 5,
+  Full_Green = 6,
+  Full_Amber = 7,
+  Full_Red = 8,
+  Model_OK = 9,
+  Model_Fail = 10,
+  Challenge_OK = 11,
+  Challenge_Fail = 12,
+  Model_Pending_Review = 13,
+  Logits_OK = 14,
+  Logits_Fail = 15
+}
+
+table BlockValidation {
+  version: uint32;
+  hash: [ubyte];             // 32 bytes
+  prev_block_hash: [ubyte];  // 32 bytes
+  merkle_root: [ubyte];      // 32 bytes
+  timestamp: uint32;
+  bits: uint32;
+  nonce: uint32;
+  pow_blob_hash: [ubyte];
+  adjusted_bits: uint32;
+  pow_blob: Proof;
+  // Registered model difficulty from the ModelRecord active at the block's
+  // height. Appended field: wire-compatible with old readers/writers.
+  //
+  // Option 2 (TIP-0003) — this field doubles as the verifier's
+  // v3-ACTIVE signal, so there is NO separate v3_active field:
+  //   difficulty == 0  => v3 admission inactive/unavailable at this height;
+  //                       a version>=3 proof is replayed under v2 rules
+  //                       (admission nonce NOT folded into the u preimage),
+  //                       byte-identical to consensus.
+  //   difficulty  > 0  => v3 is ACTIVE; the verifier applies the v3
+  //                       nonce/tier/admission semantics and derives the
+  //                       admission target from this value.
+  // bcore MUST send difficulty > 0 only when Consensus::IsV3Active(height)
+  // is true, and remains authoritative for the admission check itself.
+  difficulty: int64;
+}
+
+table ModelValidation {
+  model_name: string;
+  model_commit: string;
+  difficulty: int64;
+  cid: string;
+  extra: string;
+  txid: [ubyte];             // 32 bytes
+  block_hash: [ubyte];        // 32 bytes
+  block_height: int32;
+}
+
+union ValidationUnion {
+  BlockValidation,
+  ModelValidation
+}
+
+table ValidationRequest {
+  hash_id: [ubyte];        // 32 bytes
+  validation_type: ValidationType;
+  request: ValidationUnion;
+}
+
+table ValidationResponse {
+  hash_identifier: [ubyte];   
+  enum_response: ResponseValue;
+}
+
+root_type ValidationRequest;

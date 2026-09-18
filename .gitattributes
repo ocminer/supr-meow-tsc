@@ -1,3 +1,6 @@
 
 # Unified patch context markers include a space on blank lines.
 *.patch -whitespace
+
+# Preserve upstream source whitespace in the vendored proof dependency.
+vendor/tensorcash/** -whitespace

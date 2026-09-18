@@ -1,12 +1,5 @@
 #include "stratum.h"
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <chrono>
 #include <cstring>
@@ -70,7 +63,7 @@ void StratumClient::configure(std::vector<PoolUrl> pools, std::string user, std:
 }
 
 bool StratumClient::start() {
-    if (pools_.empty()) return false;
+    if (pools_.empty() || !net::init()) return false;
     running_ = true;
     thread_ = std::thread([this] { run(); });
     return true;
@@ -84,7 +77,7 @@ void StratumClient::stop() {
 
 void StratumClient::close_socket() {
     std::lock_guard<std::mutex> lk(mtx_);
-    if (fd_ >= 0) { ::shutdown(fd_, SHUT_RDWR); ::close(fd_); fd_ = -1; }
+    if (fd_ != net::invalid) { ::shutdown(fd_, net::shutdown_both); net::close(fd_); fd_ = net::invalid; }
     connected_ = false;
 }
 
@@ -110,19 +103,19 @@ bool StratumClient::connect_once(const PoolUrl& p, std::string& error) {
     const int rc = ::getaddrinfo(p.host.c_str(), port.c_str(), &hints, &res);
     if (rc != 0 || !res) { error = std::string("cannot resolve ") + p.host + ": " + gai_strerror(rc); return false; }
 
-    int fd = -1;
+    net::socket_type fd = net::invalid;
     for (addrinfo* a = res; a; a = a->ai_next) {
         fd = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-        if (fd < 0) continue;
-        if (::connect(fd, a->ai_addr, a->ai_addrlen) == 0) break;
-        ::close(fd); fd = -1;
+        if (fd == net::invalid) continue;
+        if (::connect(fd, a->ai_addr, static_cast<int>(a->ai_addrlen)) == 0) break;
+        net::close(fd); fd = net::invalid;
     }
     ::freeaddrinfo(res);
-    if (fd < 0) { error = "connection refused by " + p.host + ":" + port; return false; }
+    if (fd == net::invalid) { error = "connection refused by " + p.host + ":" + port; return false; }
 
     int one = 1;
-    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    net::option(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    net::option(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
 
     std::lock_guard<std::mutex> lk(mtx_);
     fd_ = fd;
@@ -134,11 +127,11 @@ bool StratumClient::connect_once(const PoolUrl& p, std::string& error) {
 
 bool StratumClient::send_line(const std::string& s) {
     std::lock_guard<std::mutex> lk(mtx_);
-    if (fd_ < 0) { outq_.push_back(s); return false; }
+    if (fd_ == net::invalid) { outq_.push_back(s); return false; }
     const std::string line = s + "\n";
     size_t off = 0;
     while (off < line.size()) {
-        const ssize_t n = ::send(fd_, line.data() + off, line.size() - off, MSG_NOSIGNAL);
+        const auto n = net::send(fd_, line.data() + off, line.size() - off);
         if (n <= 0) return false;
         off += static_cast<size_t>(n);
     }
@@ -339,17 +332,17 @@ void StratumClient::run() {
         }
 
         while (running_) {
-            pollfd pfd{};
+            net::poll_fd pfd{};
             { std::lock_guard<std::mutex> lk(mtx_); pfd.fd = fd_; }
-            if (pfd.fd < 0) break;
+            if (pfd.fd == net::invalid) break;
             pfd.events = POLLIN;
-            const int pr = ::poll(&pfd, 1, 1000);
+            const int pr = net::poll(&pfd, 1, 1000);
             if (pr < 0) break;
             if (pr == 0) continue;
             if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
 
             char buf[65536];
-            const ssize_t n = ::recv(pfd.fd, buf, sizeof(buf), 0);
+            const auto n = ::recv(pfd.fd, buf, sizeof(buf), 0);
             if (n <= 0) break;
 
             std::string chunk(buf, static_cast<size_t>(n));

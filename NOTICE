@@ -23,9 +23,10 @@ TensorCash shared-utils / pow-utils — Apache License 2.0
     https://git.tensorcash.org/tensorcash/tensorcash
     vendor/tensorcash/shared-utils/pow-utils
 
-    The proof-of-inference sampler and proof serialisation. Used unmodified;
-    local build adjustments live in tools/patch-staged-poi.py and are applied
-    to a staged copy, not to the vendored tree.
+    The proof-of-inference sampler and proof serialisation, including the
+    proof-v4 integration and portable integer arithmetic. Additional build
+    adjustments are applied to a staged copy by tools/patch-staged-poi.py
+    and tools/optimize-staged-poi.py. Full license: shared-utils/pow-utils/LICENSE.
 
 --------------------------------------------------------------------------------
 chiavdf — Apache License 2.0
