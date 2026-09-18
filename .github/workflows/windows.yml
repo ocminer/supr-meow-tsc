@@ -43,7 +43,10 @@ jobs:
           path: |
             ~/AppData/Local/vcpkg/archives
             build/windows/vcpkg_installed
-          key: meow-windows-deps-${{ hashFiles('vcpkg.json') }}
+          key: meow-windows-deps-${{ hashFiles('vcpkg.json') }}-${{ github.sha }}
+          restore-keys: |
+            meow-windows-deps-${{ hashFiles('vcpkg.json') }}-
+            meow-windows-deps-${{ hashFiles('vcpkg.json') }}
       - name: Prepare pinned dependencies
         shell: bash
         run: bash tools/prepare-llama.sh vendor/llama.cpp
@@ -75,7 +78,7 @@ jobs:
           path: |
             ~/AppData/Local/vcpkg/archives
             build/windows/vcpkg_installed
-          key: meow-windows-deps-${{ hashFiles('vcpkg.json') }}
+          key: meow-windows-deps-${{ hashFiles('vcpkg.json') }}-${{ github.sha }}
       - name: Build CUDA miner and package
         shell: pwsh
         run: |

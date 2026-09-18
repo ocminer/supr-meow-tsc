@@ -68,11 +68,9 @@ target_compile_definitions(llama PUBLIC LLAMA_MAX_SEQ=${MEOW_MAX_SEQUENCES})
 # not in the llama.cpp fork — the fork's CMakeLists references pow_utils.cpp but
 # does not contain it, because upstream's Dockerfile copies it in at image build
 # time. Anyone cloning the fork alone therefore cannot build it. We reference
-# both repos as pinned submodules and compile the sampler directly, so a plain
-# `git clone --recursive && cmake` reproduces the binary.
-#
-# The FlatBuffers headers (proof_generated.h etc.) are pre-generated in the repo,
-# so no flatc is needed at build time.
+# the pinned llama submodule and the bundled TensorCash sources directly.
+# FlatBuffers headers are regenerated with the installed flatc so they match
+# the runtime headers used by the build.
 # ---------------------------------------------------------------------------
 set(MEOW_POW_DIR "${CMAKE_SOURCE_DIR}/vendor/tensorcash/shared-utils/pow-utils"
     CACHE PATH "TensorCash pow-utils checkout")
@@ -157,7 +155,7 @@ add_custom_command(
           ${MEOW_POI_STAGE}
   COMMAND ${CMAKE_COMMAND} -E copy_if_different ${MEOW_FB_HEADERS} ${MEOW_POI_STAGE}
   # Fixes for upstream defects are applied to the STAGED copy, never to
-  # vendor/, so the submodule stays a clean checkout. See the script for what
+  # vendor/, so the bundled source stays unchanged. See the script for what
   # each patch fixes; it fails the build if a target has disappeared.
   COMMAND ${CMAKE_COMMAND} -E env python3
           ${CMAKE_SOURCE_DIR}/tools/patch-staged-poi.py ${MEOW_POI_STAGE}

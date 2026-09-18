@@ -61,7 +61,11 @@ std::string timestamp_now() {
     char buf[16];
     const std::time_t t = std::time(nullptr);
     std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
     localtime_r(&t, &tm);
+#endif
     std::strftime(buf, sizeof(buf), "%H:%M:%S", &tm);
     return buf;
 }
