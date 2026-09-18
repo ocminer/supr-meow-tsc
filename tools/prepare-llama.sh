@@ -25,12 +25,12 @@ done
 python3 - <<'PY'
 from pathlib import Path
 p = Path('src/llama-cparams.h')
-s = p.read_text()
+s = p.read_text(encoding="utf-8")
 if '#ifndef LLAMA_MAX_SEQ' not in s:
     import re
     s, count = re.subn(r'^#define LLAMA_MAX_SEQ (256|512)$',
         '#ifndef LLAMA_MAX_SEQ\n#define LLAMA_MAX_SEQ 512\n#endif', s, flags=re.M)
     if count != 1:
         raise SystemExit('unknown LLAMA_MAX_SEQ declaration')
-    p.write_text(s)
+    p.write_text(s, encoding="utf-8")
 PY

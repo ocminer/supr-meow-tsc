@@ -774,7 +774,7 @@ PATCHES = [
 def main(stage_dir: str) -> int:
     for filename, old, new in PATCHES:
         path = f"{stage_dir}/{filename}"
-        with open(path) as fh:
+        with open(path, encoding="utf-8") as fh:
             text = fh.read()
         if new in text:
             continue                      # already patched by an earlier build
@@ -782,7 +782,7 @@ def main(stage_dir: str) -> int:
             print(f"error: patch target not found in {filename} — upstream "
                   f"changed; re-check the fix before removing it", file=sys.stderr)
             return 1
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8") as fh:
             fh.write(text.replace(old, new, 1))
         print(f"patched {filename}: proof timestamp is seconds, not nanoseconds")
     return 0

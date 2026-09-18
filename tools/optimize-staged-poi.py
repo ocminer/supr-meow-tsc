@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 p = Path(sys.argv[1]) / 'pow_utils.cpp'
-s = p.read_text()
+s = p.read_text(encoding="utf-8")
 marker = '// MEOW compact distribution experiment'
 if marker in s:
     sys.exit(0)
@@ -52,4 +52,4 @@ s = s.replace(end, '''    }
         throw std::runtime_error("compact CDF differs from dense reference");
 
 '''+end,1)
-p.write_text(s)
+p.write_text(s, encoding="utf-8")
