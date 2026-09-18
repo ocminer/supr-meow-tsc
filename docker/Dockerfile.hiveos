@@ -69,6 +69,11 @@ COPY mmpos/mmpos-run.sh                          /out/supr-meow-tsc/
 COPY smos/smos-run.sh                            /out/supr-meow-tsc/
 COPY tools/q8-profile.sh                         /out/supr-meow-tsc/
 COPY tools/meow-common.sh                        /out/supr-meow-tsc/
+COPY RELEASE-v0.7.0.md                          /out/supr-meow-tsc/README.md
+COPY LICENSE NOTICE                            /out/supr-meow-tsc/
+COPY --from=build /src/vendor/llama.cpp/LICENSE  /out/supr-meow-tsc/licenses/llama-LICENSE
+COPY vendor/tensorcash/shared-utils/chiavdf/LICENSE /out/supr-meow-tsc/licenses/chiavdf-LICENSE
+COPY vendor/tensorcash/shared-utils/pow-utils/LICENSE /out/supr-meow-tsc/licenses/tensorcash-LICENSE
 
 COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12*    /out/supr-meow-tsc/lib/
 COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.12*    /out/supr-meow-tsc/lib/

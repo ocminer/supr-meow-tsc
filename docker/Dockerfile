@@ -56,6 +56,11 @@ COPY --from=build /src/build/supr-meow-tsc      /app/
 COPY --from=build /src/build/bin/*.so*          /app/lib/
 COPY tools/q8-profile.sh                      /app/q8-profile.sh
 COPY docker/entrypoint.sh                       /app/entrypoint.sh
+COPY RELEASE-v0.7.0.md                         /app/README.md
+COPY LICENSE NOTICE                           /app/
+COPY --from=build /src/vendor/llama.cpp/LICENSE /app/licenses/llama-LICENSE
+COPY vendor/tensorcash/shared-utils/chiavdf/LICENSE /app/licenses/chiavdf-LICENSE
+COPY vendor/tensorcash/shared-utils/pow-utils/LICENSE /app/licenses/tensorcash-LICENSE
 RUN chmod +x /app/entrypoint.sh
 ENV LD_LIBRARY_PATH=/app/lib
 

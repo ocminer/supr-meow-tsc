@@ -14,7 +14,7 @@ Copy-Item windows/* $stage
 Copy-Item LICENSE,NOTICE $stage
 $licenses = Join-Path $stage 'licenses'
 New-Item -ItemType Directory -Force $licenses | Out-Null
-foreach ($dep in @('gmp','openssl','argon2','zeromq','flatbuffers','boost-multiprecision')) {
+foreach ($dep in @('gmp','openssl','argon2','zeromq','cppzmq','flatbuffers','boost-multiprecision')) {
     $copyright = "build/windows/vcpkg_installed/x64-windows/share/$dep/copyright"
     if (Test-Path $copyright) { Copy-Item $copyright "$licenses/$dep.txt" }
 }
