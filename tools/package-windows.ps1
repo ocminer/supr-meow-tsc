@@ -21,7 +21,12 @@ foreach ($dep in @('gmp','openssl','argon2','zeromq','cppzmq','flatbuffers','boo
 Copy-Item vendor/llama.cpp/LICENSE "$licenses/llama.txt"
 Copy-Item vendor/tensorcash/shared-utils/chiavdf/LICENSE "$licenses/chiavdf.txt"
 Copy-Item vendor/tensorcash/shared-utils/pow-utils/LICENSE "$licenses/tensorcash.txt"
-Get-ChildItem $env:CUDA_PATH -Filter '*EULA*' -Recurse | Select-Object -First 1 | Copy-Item -Destination "$licenses/NVIDIA-CUDA-EULA.txt"
+foreach ($component in @('cuda_cudart','libcublas','cccl')) {
+    $notice = Join-Path $env:CUDA_PATH "licenses/nvidia/$component.txt"
+    if (!(Test-Path $notice)) { throw "Missing NVIDIA redistribution notice: $component" }
+    Copy-Item $notice "$licenses/NVIDIA-$component.txt"
+}
+Copy-Item "$env:CUDA_PATH/installed-components.json" "$licenses/NVIDIA-components.json"
 $info = @{
     version = '0.7.0'; source_commit = (& git rev-parse HEAD).Trim()
     ci_run = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"

@@ -24,7 +24,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/cuda-13.3
-          key: meow-cuda-13.3-v1
+          key: meow-cuda-13.3-v2-licenses
       - name: Install NVIDIA toolkit
         shell: pwsh
         run: |

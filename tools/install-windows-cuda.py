@@ -32,6 +32,7 @@ def install(output: Path):
         if digest != item["sha256"]:
             raise RuntimeError(f"SHA256 mismatch: {name}")
         # NVIDIA archives contain exactly one component-root directory.
+        license_file = output / "licenses" / "nvidia" / (name + ".txt")
         with zipfile.ZipFile(archive) as z:
             for entry in z.infolist():
                 parts = Path(entry.filename).parts
@@ -44,6 +45,12 @@ def install(output: Path):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(entry) as source, target.open("wb") as dest:
                     shutil.copyfileobj(source, dest)
+                # Every archive calls its root notice LICENSE; keep them separately.
+                if relative == Path("LICENSE"):
+                    license_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(target, license_file)
+        if not license_file.is_file():
+            raise RuntimeError(f"Missing NVIDIA redistribution notice: {name}")
         records.append({"component": name, "version": component["version"], **item})
     (output / "installed-components.json").write_text(json.dumps(records, indent=2))
     for required in ["bin/nvcc.exe", "bin/cuobjdump.exe", "bin/nvdisasm.exe", "include/cuda.h", "lib/x64/cuda.lib", "lib/x64/cudart_static.lib"]:
