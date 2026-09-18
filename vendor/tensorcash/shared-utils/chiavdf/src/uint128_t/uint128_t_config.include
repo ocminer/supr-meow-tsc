@@ -1,7 +1,9 @@
 #ifndef _UINT128_T_CONFIG_
   #define _UINT128_T_CONFIG_
   #if defined(_MSC_VER)
-    #if defined(_DLL)
+    // The CRT's _DLL flag does not mean this type is built as a DLL.
+    // The miner links this implementation into its static VDF library.
+    #if defined(UINT128_T_DLL)
       #define _UINT128_T_EXPORT __declspec(dllexport)
       #define _UINT128_T_IMPORT __declspec(dllimport)
     #else
@@ -16,4 +18,3 @@
     #define _UINT128_T_IMPORT __attribute__((visibility("default")))
   #endif
 #endif
-
