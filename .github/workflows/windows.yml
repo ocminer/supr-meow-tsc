@@ -64,6 +64,7 @@ jobs:
             "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows -DMEOW_BUILD_TESTS=ON `
             '-DCMAKE_CUDA_ARCHITECTURES=80;86;89;90;120' -DGGML_NATIVE=OFF `
+            '-DCMAKE_CUDA_FLAGS=--diag-suppress=177 --diag-suppress=550' `
             -DGGML_CUDA_FA_ALL_QUANTS=OFF -DGGML_CUDA_F16=ON
           if ($LASTEXITCODE) { throw 'CMake configure failed' }
       - name: Save complete dependency cache
@@ -97,7 +98,19 @@ jobs:
           Write-Host "Compiling $($objects.Count) miner host translation units"
           cmake --build build/windows --parallel 4 --target $objects -- -k 0
           if ($LASTEXITCODE) { throw 'Miner host compilation failed' }
+      - name: Compile proof CUDA kernels
+        shell: pwsh
+        run: |
+          $objects = @(& ninja -C build/windows -t targets all | ForEach-Object {
+            if ($_ -match '^(CMakeFiles[\\/](meow_poi)\.dir[\\/].*\.cu\.obj):') {
+              $Matches[1]
+            }
+          })
+          if ($LASTEXITCODE -or $objects.Count -lt 2) { throw 'Proof CUDA object targets are missing' }
+          cmake --build build/windows --parallel 2 --target $objects -- -k 0
+          if ($LASTEXITCODE) { throw 'Native proof CUDA compilation failed' }
       - name: Build CUDA miner and package
+        id: cuda-build
         shell: pwsh
         run: |
           cmake --build build/windows --parallel 4 --target supr-meow-tsc
