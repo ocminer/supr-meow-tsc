@@ -305,6 +305,29 @@ if(MEOW_PRECHECK)
   target_link_libraries(meow_tc122 PRIVATE OpenSSL::Crypto)
 endif()
 
+# Pre-submit check (src/precheck.cpp). Compiled with the same pinned flags and
+# namespace renames as meow_tc122 because it instantiates upstream header-only
+# rules; the renames stay PRIVATE so the miner's own sources never see them.
+# Without MEOW_PRECHECK the same file builds as a stub that reports itself
+# unavailable and the miner submits every proof (v0.7.0 behaviour).
+set(MEOW_PRECHECK_DEFAULT_MODE "on" CACHE STRING "Default --precheck mode (on|shadow|off)")
+set_property(CACHE MEOW_PRECHECK_DEFAULT_MODE PROPERTY STRINGS on shadow off)
+if(NOT MEOW_PRECHECK_DEFAULT_MODE MATCHES "^(on|shadow|off)$")
+  message(FATAL_ERROR "MEOW_PRECHECK_DEFAULT_MODE must be on, shadow or off")
+endif()
+add_library(meow_precheck STATIC src/precheck.cpp)
+add_dependencies(meow_precheck meow_fbgen)
+target_include_directories(meow_precheck PRIVATE ${MEOW_FB_GEN} ${FLATBUFFERS_INCLUDE_DIR})
+set_target_properties(meow_precheck PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(MEOW_PRECHECK)
+  set_target_properties(meow_precheck PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+  target_compile_options(meow_precheck PRIVATE ${MEOW_TC122_FP_FLAGS})
+  target_compile_definitions(meow_precheck PRIVATE MEOW_PRECHECK_ENABLED ${MEOW_TC122_RENAME})
+  target_include_directories(meow_precheck PRIVATE
+    ${MEOW_TC122_DIR} ${MEOW_TC122_DIR}/bcore_compat ${MEOW_BOOST_INCLUDE_DIR})
+  target_link_libraries(meow_precheck PRIVATE meow_tc122)
+endif()
+
 add_executable(supr-meow-tsc
   src/main.cpp
   src/device.cpp
@@ -322,6 +345,8 @@ target_include_directories(supr-meow-tsc PRIVATE
 )
 target_include_directories(supr-meow-tsc PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
 target_link_libraries(supr-meow-tsc PRIVATE meow_poi meow_vdf llama ggml CUDA::cudart CUDA::nvml Threads::Threads)
+target_link_libraries(supr-meow-tsc PRIVATE meow_precheck)
+target_compile_definitions(supr-meow-tsc PRIVATE MEOW_PRECHECK_DEFAULT_MODE="${MEOW_PRECHECK_DEFAULT_MODE}")
 
 # A miner is copied between rigs, so prefer a binary that does not chase host
 # libstdc++ versions. CUDA/NVML stay dynamic (they must match the driver).
@@ -366,6 +391,26 @@ if(MEOW_BUILD_TESTS)
     target_link_libraries(meow-network-test PRIVATE ws2_32)
   endif()
   add_test(NAME network-contract COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/network_test.py $<TARGET_FILE:meow-network-test>)
+  if(MEOW_PRECHECK)
+    # CPU-only: upstream's golden vectors and mainnet windows through the
+    # pre-check, plus synthetic windows for each gate and the FlatBuffer path.
+    add_executable(meow-precheck-test tests/precheck_test.cpp)
+    add_dependencies(meow-precheck-test meow_fbgen)
+    set_target_properties(meow-precheck-test PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+    target_compile_options(meow-precheck-test PRIVATE ${MEOW_TC122_FP_FLAGS})
+    target_compile_definitions(meow-precheck-test PRIVATE ${MEOW_TC122_RENAME})
+    target_include_directories(meow-precheck-test PRIVATE src vendor ${MEOW_FB_GEN} ${FLATBUFFERS_INCLUDE_DIR}
+      ${MEOW_TC122_DIR} ${MEOW_TC122_DIR}/bcore_compat ${MEOW_BOOST_INCLUDE_DIR})
+    target_link_libraries(meow-precheck-test PRIVATE meow_precheck meow_tc122)
+    set(MEOW_AP_VECTORS ${CMAKE_BINARY_DIR}/antiparrot_mainnet.bin)
+    add_test(NAME precheck-render-vectors COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/render_antiparrot_vectors.py
+      ${MEOW_TC122_DIR}/tests/vectors/antiparrot_mainnet ${MEOW_AP_VECTORS})
+    set_tests_properties(precheck-render-vectors PROPERTIES FIXTURES_SETUP ap_vectors)
+    add_test(NAME precheck-vectors COMMAND meow-precheck-test ${MEOW_TC122_DIR}/tests/vectors ${MEOW_AP_VECTORS})
+    set_tests_properties(precheck-vectors PROPERTIES FIXTURES_REQUIRED ap_vectors)
+    add_test(NAME precheck-vendored-hashes COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check-vendored-precheck.sh)
+  endif()
 endif()
 install(TARGETS supr-meow-tsc RUNTIME DESTINATION bin)
 

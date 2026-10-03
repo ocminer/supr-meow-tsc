@@ -519,6 +519,7 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
             // it at 0 makes every share after the first a "duplicate".
             share->nonce        = ++nonce_seq_;
             share->proof_b64    = base64(data, static_cast<size_t>(n));
+            share->proof_raw    = std::make_shared<const std::vector<uint8_t>>(data, data + n);
 
             share->vdf_tick     = vdf_tick_;
             // The claim the pool judges is the HEADER HASH —

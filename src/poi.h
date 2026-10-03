@@ -48,6 +48,9 @@ struct PoiShare {
     std::string job_id;
     uint64_t    nonce = 0;
     std::string proof_b64;     // serialized MiningResponse
+    // The same serialized MiningResponse, raw, for the pre-submit check
+    // (src/precheck.h). Read-only: what is submitted is proof_b64.
+    std::shared_ptr<const std::vector<uint8_t>> proof_raw;
     std::string achieved_hex;  // 64 hex, display-endian
     uint64_t    vdf_tick = 0;
     bool        is_block = false;   // also cleared the chain target

@@ -17,6 +17,7 @@
 #include "canary.h"
 #include "tuning.h"
 #include "model_profile.h"
+#include "precheck.h"
 #include <algorithm>
 #include "../vendor/nlohmann/json.hpp"
 #include <random>
@@ -42,6 +43,21 @@ extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 namespace {
 
 const char* kVersion = "0.7.0";
+
+#ifndef MEOW_PRECHECK_DEFAULT_MODE
+#define MEOW_PRECHECK_DEFAULT_MODE "on"
+#endif
+
+// Pre-submit check counters (src/precheck.h). `rejected` counts proofs a gate
+// rejected (dropped in mode on, predicted RED in mode shadow); `dropped` only
+// proofs actually withheld. Dropped proofs never reach the pool client, so
+// they are never counted as submitted, accepted, rejected or stale.
+struct PrecheckCounters {
+    std::atomic<uint64_t> checked{0}, passed{0}, unavailable{0}, rejected{0};
+    std::atomic<uint64_t> dropped{0}, blocks_withheld{0}, us_total{0};
+    std::atomic<uint64_t> by_gate[meow::precheck::kGateCount];
+};
+PrecheckCounters g_pc;
 
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop = true; }
@@ -138,6 +154,8 @@ struct Options {
     int         ctx_per_slot = 384;   // --ctx: KV per slot. MUST exceed prompt+window.
     std::string api_bind = "127.0.0.1:21550";  // --api-bind ("off" disables)
     std::vector<std::string> pools;   // repeated -o = failover order
+    std::string precheck_mode;        // --precheck on|shadow|off ("" = env/default)
+    std::string precheck_gates;       // --precheck-gates <list> ("" = env/all)
     meow::DeviceTuning tuning;   // --cclock/--mclock/--pl/--fan/--lock-core
 };
 
@@ -190,6 +208,19 @@ void print_usage() {
 "                          egress (default 47021). Running one miner per GPU\n"
 "                          on a host needs a disjoint range each, e.g. 47021\n"
 "                          and 48021; a busy port is skipped automatically.\n"
+"      --precheck <mode>   Pre-submit consensus check (default %s):\n"
+"                          on     - check every proof with the TensorCash\n"
+"                                   v1.2.2 window rules and do not submit a\n"
+"                                   proof the verifier would reject;\n"
+"                          shadow - check and log, but submit everything;\n"
+"                          off    - submit every proof unchecked (v0.7.0).\n"
+"                          Env: MEOW_PRECHECK. Unavailable in Windows builds.\n"
+"      --precheck-gates <list>  Gates to apply (default all): comma list of\n"
+"                          strict, near-pin, candidate-band, prompt-scaffold,\n"
+"                          flat-region, credit-tier, anti-parrot; 'all',\n"
+"                          'none', '-gate' removes one (e.g. all,-credit-tier).\n"
+"                          Env: MEOW_PRECHECK_GATES. Check threads:\n"
+"                          MEOW_PRECHECK_THREADS (default 1-4 by CPU count).\n"
 "      --no-color          Plain output for logs and flight sheets.\n"
 "  -h, --help              This text.\n"
 "  -V, --version           Version.\n"
@@ -212,7 +243,7 @@ void print_usage() {
 "  supr-meow-tsc -o stratum+tcp://pool-a:3310 -o stratum+tcp://pool-b:3310 -u tc1q…\n"
 "  supr-meow-tsc -o stratum+tcp://tsc.suprnova.cc:3310 -u tc1qexample --protocol-test\n"
 "  supr-meow-tsc --list-devices\n"
-"\n", kVersion);
+"\n", kVersion, MEOW_PRECHECK_DEFAULT_MODE);
 }
 
 bool need_value(int i, int argc, const char* flag) {
@@ -253,6 +284,10 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--ctx")             { if (!need_value(i, argc, "--ctx")) return false; o.ctx_per_slot = std::atoi(argv[++i]); o.ctx_set = true; }
         else if (a == "--api-bind")        { if (!need_value(i, argc, "--api-bind")) return false; o.api_bind = argv[++i]; }
         else if (a == "--no-color")        o.no_color = true;
+        else if (a == "--precheck")        { if (!need_value(i, argc, "--precheck")) return false; o.precheck_mode = argv[++i]; }
+        else if (a.rfind("--precheck=", 0) == 0) o.precheck_mode = a.substr(11);
+        else if (a == "--precheck-gates")  { if (!need_value(i, argc, "--precheck-gates")) return false; o.precheck_gates = argv[++i]; }
+        else if (a.rfind("--precheck-gates=", 0) == 0) o.precheck_gates = a.substr(17);
         else if (eq("-o", "--pool"))       { if (!need_value(i, argc, "-o")) return false; o.pool = argv[++i]; o.pools.push_back(o.pool); }
         else if (eq("-u", "--user"))       { if (!need_value(i, argc, "-u")) return false; o.user = argv[++i]; }
         else if (eq("-p", "--pass"))       { if (!need_value(i, argc, "-p")) return false; o.pass = argv[++i]; }
@@ -334,10 +369,41 @@ int main(int argc, char** argv) {
     if (!parse_args(argc, argv, o)) return 2;
     g_color = !o.no_color && ::isatty(1);
 
+    // Pre-submit check: --precheck beats MEOW_PRECHECK beats the build default.
+    meow::precheck::Mode pc_mode = meow::precheck::Mode::On;
+    {
+        std::string m = o.precheck_mode;
+        if (m.empty()) if (const char* e = std::getenv("MEOW_PRECHECK")) m = e;
+        if (m.empty()) m = MEOW_PRECHECK_DEFAULT_MODE;
+        if (!meow::precheck::parse_mode(m, pc_mode)) {
+            std::fprintf(stderr, "error: --precheck must be on, shadow or off (got '%s')\n", m.c_str());
+            return 2;
+        }
+    }
+    uint32_t pc_gates = meow::precheck::implemented_gates();
+    {
+        std::string g = o.precheck_gates;
+        if (g.empty()) if (const char* e = std::getenv("MEOW_PRECHECK_GATES")) g = e;
+        std::string gerr;
+        if (!g.empty() && !meow::precheck::parse_gates(g, pc_gates, gerr)) {
+            std::fprintf(stderr, "error: --precheck-gates: %s\n", gerr.c_str());
+            return 2;
+        }
+    }
+    const bool pc_unavailable = pc_mode != meow::precheck::Mode::Off && !meow::precheck::available();
+    if (pc_unavailable) pc_mode = meow::precheck::Mode::Off;
+
     std::printf("%s%s+------------------------------------------------------------+%s\n", C_C(), C_B(), C_0());
     std::printf("%s%s|  supr-meow-tsc %-8s        TensorCash (TSC) GPU miner  |%s\n", C_C(), C_B(), kVersion, C_0());
     std::printf("%s%s|  algorithm: proof-of-inference (LLM transcript + VDF)      |%s\n", C_C(), C_B(), C_0());
     std::printf("%s%s+------------------------------------------------------------+%s\n", C_C(), C_B(), C_0());
+    if (pc_unavailable)
+        std::printf("precheck: unavailable in this build (compiled out); every proof is submitted unchecked\n");
+    else if (pc_mode == meow::precheck::Mode::Off)
+        std::printf("precheck: off — every proof is submitted unchecked\n");
+    else
+        std::printf("precheck: %s, gates %s, rules %s\n", meow::precheck::mode_name(pc_mode),
+                    meow::precheck::gates_string(pc_gates).c_str(), meow::precheck::rules_version());
 
     meow::DeviceManager dm;
     std::string err;
@@ -1021,7 +1087,20 @@ int main(int argc, char** argv) {
         std::condition_variable submit_cv;
         std::deque<PendingShare> submit_q;
         bool producers_done = false; // guarded by submit_mx
-        std::thread submitter([&]{
+        // With the pre-check on, K submitter threads each check a proof
+        // (~0.1-0.3 s of CPU) before submitting it; with it off, one thread
+        // submits exactly as v0.7.0 did.
+        const int pc_threads = [&]() {
+            if (pc_mode == meow::precheck::Mode::Off) return 1;
+            if (const char* e = std::getenv("MEOW_PRECHECK_THREADS")) {
+                const int v = std::atoi(e);
+                if (v >= 1 && v <= 64) return v;
+            }
+            const int hw = static_cast<int>(std::thread::hardware_concurrency());
+            return std::min(4, std::max(1, hw / 8));
+        }();
+        auto submit_loop = [&]{
+            if (pc_mode != meow::precheck::Mode::Off) meow::precheck::ensure_float_environment();
             for (;;) {
                 PendingShare ps;
                 {
@@ -1031,11 +1110,58 @@ int main(int argc, char** argv) {
                     ps = std::move(submit_q.front());
                     submit_q.pop_front();
                 }
-                client.submit(ps.sh->job_id, ps.sh->nonce, ps.sh->proof_b64,
-                              ps.sh->achieved_hex, ps.sh->vdf_tick, ps.device);
-                ++shares;
+                bool submit = true;
+                if (pc_mode != meow::precheck::Mode::Off) {
+                    meow::precheck::Verdict v;
+                    if (ps.sh->proof_raw)
+                        v = meow::precheck::evaluate(ps.sh->proof_raw->data(), ps.sh->proof_raw->size(), pc_gates);
+                    else
+                        v.reason = "raw proof bytes missing";
+                    g_pc.checked++;
+                    g_pc.us_total += static_cast<uint64_t>(v.ms * 1000.0);
+                    if (v.outcome == meow::precheck::Outcome::Reject) {
+                        const bool drop = pc_mode == meow::precheck::Mode::On;
+                        g_pc.rejected++;
+                        g_pc.by_gate[static_cast<int>(v.gate)]++;
+                        if (drop) { g_pc.dropped++; submit = false; }
+                        std::printf("[%s] %s[precheck] %s%s [GPU %d] gate=%s hash=%s %.0fms: %s\n",
+                                    timestamp_now().c_str(), drop ? C_Y() : C_C(),
+                                    drop ? "dropped share" : "predicted RED (submitted, shadow)", C_0(),
+                                    ps.device, meow::precheck::gate_name(v.gate),
+                                    v.hash_hex.c_str(), v.ms, v.reason.c_str());
+                        if (v.is_solution) {
+                            if (drop) g_pc.blocks_withheld++;
+                            std::printf("[%s] %s[precheck] BLOCK candidate %s%s [GPU %d] gate=%s hash=%s: %s\n",
+                                        timestamp_now().c_str(), C_R(),
+                                        drop ? "WITHHELD (consensus-invalid)" : "predicted invalid (submitted, shadow)",
+                                        C_0(), ps.device, meow::precheck::gate_name(v.gate),
+                                        v.hash_hex.c_str(), v.reason.c_str());
+                            std::fprintf(stderr, "[precheck] BLOCK candidate %s gate=%s hash=%s: %s\n",
+                                         drop ? "WITHHELD" : "predicted invalid",
+                                         meow::precheck::gate_name(v.gate), v.hash_hex.c_str(), v.reason.c_str());
+                        }
+                        std::fflush(stdout);
+                    } else if (v.outcome == meow::precheck::Outcome::Unavailable) {
+                        const uint64_t k = ++g_pc.unavailable;
+                        if (k <= 5 || k % 100 == 0) {
+                            std::printf("[%s] [precheck] could not check proof (submitted) [GPU %d] hash=%s: %s\n",
+                                        timestamp_now().c_str(), ps.device,
+                                        v.hash_hex.empty() ? "-" : v.hash_hex.c_str(), v.reason.c_str());
+                            std::fflush(stdout);
+                        }
+                    } else {
+                        g_pc.passed++;
+                    }
+                }
+                if (submit) {
+                    client.submit(ps.sh->job_id, ps.sh->nonce, ps.sh->proof_b64,
+                                  ps.sh->achieved_hex, ps.sh->vdf_tick, ps.device);
+                    ++shares;
+                }
             }
-        });
+        };
+        std::vector<std::thread> submitters;
+        for (int k = 0; k < pc_threads; ++k) submitters.emplace_back(submit_loop);
 
         auto mine_device = [&](int worker) {
             meow::SamplerPool& pool = *pools[worker];
@@ -1276,6 +1402,25 @@ int main(int argc, char** argv) {
             }
             j["total_poi_s"] = total_rate;
             j["gpus"] = std::move(gpus);
+            {
+                nlohmann::json pc;
+                pc["mode"]      = pc_unavailable ? "unavailable" : meow::precheck::mode_name(pc_mode);
+                pc["rules"]     = meow::precheck::rules_version();
+                pc["gates"]     = meow::precheck::gates_string(pc_gates);
+                pc["checked"]   = g_pc.checked.load();
+                pc["passed"]    = g_pc.passed.load();
+                pc["unavailable"] = g_pc.unavailable.load();
+                pc["rejected"]  = g_pc.rejected.load();
+                pc["dropped"]   = g_pc.dropped.load();
+                pc["blocks_withheld"] = g_pc.blocks_withheld.load();
+                nlohmann::json bg = nlohmann::json::object();
+                for (int gi = 0; gi < meow::precheck::kGateCount; ++gi)
+                    bg[meow::precheck::gate_name(static_cast<meow::precheck::Gate>(gi))] = g_pc.by_gate[gi].load();
+                pc["by_gate"]   = std::move(bg);
+                const uint64_t nck = g_pc.checked.load();
+                pc["avg_ms"]    = nck ? double(g_pc.us_total.load()) / 1000.0 / double(nck) : 0.0;
+                j["precheck"] = std::move(pc);
+            }
             return j.dump();
         };
         meow::StatsHttpServer api;
@@ -1340,13 +1485,31 @@ int main(int argc, char** argv) {
                         C_G(), (unsigned long long)st.accepted, C_0(),
                         st.rejected ? C_R() : "", (unsigned long long)st.rejected, st.rejected ? C_0() : "",
                         (unsigned long long)st.stale);
+            if (pc_mode != meow::precheck::Mode::Off) {
+                std::string gates;
+                for (int gi = 0; gi < meow::precheck::kGateCount; ++gi) {
+                    const uint64_t c = g_pc.by_gate[gi].load();
+                    if (!c) continue;
+                    if (!gates.empty()) gates += ", ";
+                    gates += std::string(meow::precheck::gate_name(static_cast<meow::precheck::Gate>(gi))) +
+                             " " + std::to_string(c);
+                }
+                const uint64_t nck = g_pc.checked.load();
+                std::printf(" precheck %s: %llu checked, %llu %s%s%s%s, %llu unchecked, avg %.0f ms\n",
+                            meow::precheck::mode_name(pc_mode), (unsigned long long)nck,
+                            (unsigned long long)g_pc.rejected.load(),
+                            pc_mode == meow::precheck::Mode::On ? "dropped" : "predicted RED",
+                            gates.empty() ? "" : " (", gates.c_str(), gates.empty() ? "" : ")",
+                            (unsigned long long)g_pc.unavailable.load(),
+                            nck ? double(g_pc.us_total.load()) / 1000.0 / double(nck) : 0.0);
+            }
             std::printf("%s================================================================================%s\n", C_C(), C_0());
             std::fflush(stdout);
         }
         for (auto& w : workers) w.join();
         { std::lock_guard<std::mutex> lk(submit_mx); producers_done = true; }
         submit_cv.notify_all();
-        if (submitter.joinable()) submitter.join();
+        for (auto& t : submitters) if (t.joinable()) t.join();
 
         // Give the pool a bounded opportunity to acknowledge the final batch.
         // Workers have finished and the submit queue is drained at this point.
