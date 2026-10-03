@@ -374,9 +374,9 @@ bool decode(const uint8_t* data, size_t n, Window& out, std::string& why) noexce
     try {
         out = Window{};
         if (!data || n == 0) { why = "empty proof"; return false; }
-        flatbuffers::Verifier::Options opts;
-        opts.max_tables = 4u << 20;
-        flatbuffers::Verifier ver(data, n, opts);
+        // (buf, len, max_depth, max_tables): available in flatbuffers 2.x (Ubuntu 22.04,
+        // HiveOS build) and still accepted by 23.x+, unlike Verifier::Options.
+        flatbuffers::Verifier ver(data, n, 64, 4u << 20);
         if (!ver.VerifyBuffer<proof::MiningResponse>(nullptr)) { why = "MiningResponse does not verify"; return false; }
         const auto* mr = flatbuffers::GetRoot<proof::MiningResponse>(data);
         const auto* pf = mr ? mr->pow_blob() : nullptr;
