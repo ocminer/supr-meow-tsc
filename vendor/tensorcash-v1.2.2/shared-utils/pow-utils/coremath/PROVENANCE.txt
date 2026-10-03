@@ -1,0 +1,29 @@
+source: https://gitlab.inria.fr/core-math/core-math (master 9239a6b0643ab6ad71b985f0f00173708322eb56, 2026-09-11T10:17:37+02:00)
+src/binary64/exp/exp.c  sha256 024b63b3433b455be57a6523f3acf3c82e7db1edf2cee414dc03d01be4359c63
+src/binary64/log/log.c  sha256 5f923601d1d0aab2e42136f5432794ecfcf4c23568f273ad8d32921bd1832bcf
+src/binary64/log/dint.h sha256 0da80a15d311bb1e550035f98edc2266ef31828cd423aec3a2e4507d2dad5e0e
+fetched 2026-09-11, unmodified, MIT licence (see file headers)
+local modification 2026-09-13 (exp.c only): the two bare `asm("":"=x"(r):"0"(x))`
+statements (near the GCC branches of the sign/underflow helpers) are spelled
+`__asm__` — `asm` is not a keyword under -std=c11 (depends/hosts/mingw32.mk
+compiles C that way for the Windows build) while `__asm__` is accepted by every
+GCC/Clang mode, exactly as the file's own lines 56-60 already do. No
+arithmetic or codegen change (the asm string is empty; it is a register
+reinterpretation). The byte-identical copy in shared-utils/pow-utils/coremath/
+exp.c must carry the same two-character change.
+local modification 2026-09-13 (exp.c only): the `roundeven_finite` selector
+additionally requires `!defined(__MINGW32__)`. With gcc >= 10 the file maps
+roundeven_finite to __builtin_roundeven; on x86-64 without SSE4.1 gcc lowers
+that builtin to a call to libm `roundeven`, which the mingw-w64 CRT does not
+provide, so the Windows (mingw32 depends) link of bitcoin-qt failed with two
+undefined references to `roundeven` from exp.c.obj. MinGW builds now take the
+file's own portable branch (`__builtin_round` + ties-to-even correction, the
+branch upstream already uses for MSVC and pre-10 gcc); `round` is in the
+mingw-w64 CRT. Every other platform is preprocessor-identical to before. The
+portable branch returns +0 where roundeven returns -0 (x = -0.5 exactly); at
+both call sites t feeds only (i64)t and products with x subtracted, where the
+sign of zero is inert, and a whole-function differential run of cr_exp
+(default branch vs forced portable branch) over ties, the -0.5/s
+neighbourhood and 2x10^7 random arguments was bit-identical. The
+byte-identical copy in shared-utils/pow-utils/coremath/exp.c must carry the
+same change.

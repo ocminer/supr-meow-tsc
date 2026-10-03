@@ -29,6 +29,27 @@ TensorCash shared-utils / pow-utils — Apache License 2.0
     and tools/optimize-staged-poi.py. Full license: shared-utils/pow-utils/LICENSE.
 
 --------------------------------------------------------------------------------
+TensorCash v1.2.2 consensus predicates — Apache License 2.0
+    https://git.tensorcash.org/tensorcash/tensorcash  (tag v1.2.2, commit
+    48d1344106044338e6e500de7e95869de036bc55)
+    vendor/tensorcash-v1.2.2
+
+    UNMODIFIED copies of the canonical credit kernel and the window rules
+    (near-pin count, candidate band, anti-parrot gate, prompt scaffold, flat
+    region) used by the miner's pre-submit check, plus upstream's golden test
+    vectors. Compiled with upstream's pinned floating-point flags under
+    renamed namespaces (compiler definitions only; no file is edited). The
+    upstream LICENSE, NOTICE and LICENSING.md are included verbatim in that
+    directory; UPSTREAM.txt lists every file with its sha256.
+
+    Included third-party code inside that directory, under its own terms:
+      * CORE-MATH exp/log (coremath/exp.c, log.c, dint.h) — MIT,
+        Copyright (c) 2022-2025 Alexei Sibidanov. See coremath/PROVENANCE.txt.
+      * arith_uint256 subset (bcore_compat/arith_uint256.h) — MIT,
+        Copyright (c) 2009-2010 Satoshi Nakamoto,
+        Copyright (c) 2009-2022 The Bitcoin Core developers.
+
+--------------------------------------------------------------------------------
 chiavdf — Apache License 2.0
     vendor/tensorcash/shared-utils/chiavdf
     Full licence text: vendor/tensorcash/shared-utils/chiavdf/LICENSE

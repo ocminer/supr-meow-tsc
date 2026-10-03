@@ -1,0 +1,71 @@
+Upstream provenance for vendor/tensorcash-v1.2.2/
+===================================================
+
+repository : https://git.tensorcash.org/tensorcash/tensorcash
+tag        : v1.2.2
+commit     : 48d1344106044338e6e500de7e95869de036bc55
+
+Every file listed below is a byte-identical copy of the file at the same
+relative path in that commit. Nothing in this directory is edited locally:
+the miner compiles these sources unchanged (renamed namespaces are applied
+with compiler -D definitions in CMakeLists.txt, never by editing a file).
+tools/check-vendored-precheck.sh recomputes the hashes below and fails on any
+difference.
+
+Licenses
+--------
+* Apache License 2.0 (LICENSE, NOTICE and LICENSING.md, verbatim from the
+  upstream repository root): every file under shared-utils/pow-utils/ except
+  the two groups below. LICENSING.md maps shared-utils/pow-utils/ to
+  first-party Apache-2.0.
+* MIT, CORE-MATH (Copyright (c) 2022-2025 Alexei Sibidanov):
+  shared-utils/pow-utils/coremath/{exp.c,log.c,dint.h}. Licence text in the
+  file headers; provenance and the two documented upstream edits to exp.c in
+  coremath/PROVENANCE.txt.
+* MIT, Bitcoin Core (Copyright (c) 2009-2010 Satoshi Nakamoto, 2009-2022 The
+  Bitcoin Core developers): the arith_uint256 subset in
+  shared-utils/pow-utils/bcore_compat/arith_uint256.h (licence in its header).
+
+sha256 (path relative to this directory)
+-----------------------------------------
+556abff1b5b6d82e07e8778ab6063864e50a7dd58812295e43128c86ba61bed0  LICENSE
+e0711266de6184fb3f328c395eb2345e33ec09144567a8e66306a9122a5df438  LICENSING.md
+d4ccdebf36e003eb5c76e88d302cbc69aea924ae73d48b60287c3ccc05aa22dc  NOTICE
+ce4a863050dc85bf3b7b0f6e21f431e054aba4d1a84ff7f64c697312ac274e11  shared-utils/pow-utils/antiparrot_gate.h
+08ff3dd83c03f1138b3f7e983454ba648cc43c2e4e5f42f90e717d1ba93ea49e  shared-utils/pow-utils/bcore_compat/arith_uint256.h
+1f6bc1558362d71c3678c2ccf69902675cc03e39fd2828aca07179042fa42590  shared-utils/pow-utils/bcore_compat/consensus/params.h
+ecda297701365a6755c22c87783458c18699002928f8a861cd5fd2142df108e2  shared-utils/pow-utils/bcore_compat/verification/candidate_band.h
+38e3a7f5740b56dec1ff029728fa82c25308764b9aa6779869c25d023300be04  shared-utils/pow-utils/bcore_compat/verification/credit_v4.h
+4dd4c2bdf2bec9b8adb3ffc67a6d79a90dde44d7a1206c71fd687ea7ad9f7080  shared-utils/pow-utils/bcore_compat/verification/gumbel_sampler.h
+5addd7ae8a668eff31093d52d6c17f895ad8325f82d8d544a3565ca4c6b32d19  shared-utils/pow-utils/bcore_compat/verification/pow_v3.h
+9f8cfa511f18515b4cb2df052d9ec4852dc7b474b9280c049e3eb23dc3c63469  shared-utils/pow-utils/bcore_compat/verification/pow_v4.h
+62077cf7c8779c20658b167af012519f3600c36a88eb0ea313c37b2a31cb6aab  shared-utils/pow-utils/bcred_table_r1024.cpp
+1a129eb11a4de646b170594ff11ad0fe4d69bd8516857a87c249c1cf3990a98b  shared-utils/pow-utils/bcred_table_r1024.h
+f731fdec8ac6182758d8208c0a4c5c3aba749a5c8db18b386df825e4a64325af  shared-utils/pow-utils/candidate_band.h
+b0e200c3a3ef4c4704471dd9ed7601bab136c22bb59482cfd0f09bf84561e1f9  shared-utils/pow-utils/coremath/PROVENANCE.txt
+0da80a15d311bb1e550035f98edc2266ef31828cd423aec3a2e4507d2dad5e0e  shared-utils/pow-utils/coremath/dint.h
+cc9639deb78dd38678e417ef8bfa63e2f28ecb2518ded145e3d082e234539f50  shared-utils/pow-utils/coremath/exp.c
+5f923601d1d0aab2e42136f5432794ecfcf4c23568f273ad8d32921bd1832bcf  shared-utils/pow-utils/coremath/log.c
+208080e9fc4a00e51bdcab391c34d6ea2301789eb50f3f03aa5296d86dee8df8  shared-utils/pow-utils/credit_v4.cpp
+1cb48dacc1630f9a99e50d04455b7d74dfbef2e68c035014a2bc261e9bd044c2  shared-utils/pow-utils/credit_v4.h
+706aa81a598b4babc1423ba6fe61e414faf97c1c508b8b39f42b73a132a5c448  shared-utils/pow-utils/flat_region.cpp
+680291666f94ad9b625c7658be929ccc1f4267b7faf0b96e13088e8ac1fb6663  shared-utils/pow-utils/flat_region.h
+4a6bd240dc2fbd2f7f99d28f90f2aaceb785d870337133e464ec3aad1eb4235f  shared-utils/pow-utils/gumbel_sampler.cpp
+3a99fa66480ecf5eeb00ffa3d74fdb65879eb25f114f0006913d531d1aaff409  shared-utils/pow-utils/gumbel_sampler.h
+17f5a718ef9d90fc6f4a4c8663ace9e1ed12f4b2c8454b2ce0ddfa6d902dd3c5  shared-utils/pow-utils/pow_v3.cpp
+a3476b9271a1783cfad2518403872bb9b3d266e1720576c56cb3fe9aaf135632  shared-utils/pow-utils/pow_v3.h
+261747df9d5f16974f3ebfab19798773c68d7449840a547e17a071d1e2bb3d39  shared-utils/pow-utils/pow_v4.cpp
+7448e4a55b44a6e89e2f926f37e559b586d1f27f09d27e2346f6b13eeed085b2  shared-utils/pow-utils/pow_v4.h
+5d019d252ae8a204271c75809d2e64d3ad7e8f40fd1b4eea52a45a2599720a57  shared-utils/pow-utils/prompt_scaffold.h
+85076b6fe2af2595dbe7d36c3da741b875ece9ed3940f6f9fa6242776f463990  shared-utils/pow-utils/sunset_abi.cpp
+b25fc9fc7aff081b2f164ccc03d9b73d84fae31db8428a89c50944139a6e578c  shared-utils/pow-utils/term_table_r1024.cpp
+90424021fffdc83ced806228beb246b307e55a7d81c3dc62a86e9bde0c7387ef  shared-utils/pow-utils/term_table_r1024.h
+d3efb46e78b786e9568f1fa48358365d6f0dcdceb6ac690d5e9bd63f937e1c04  shared-utils/pow-utils/tests/vectors/antiparrot_mainnet/expected_bcore.json
+00022444bf48b69297b5d57d5e71287a042ae6e0eec3eb86b7e8f3161b0c4e02  shared-utils/pow-utils/tests/vectors/antiparrot_mainnet/h023851.npz
+1d9cec19a30441947cbdea181ee02d5c3f70a08820eaa0471d8d81536915fdde  shared-utils/pow-utils/tests/vectors/antiparrot_mainnet/h023961.npz
+cf97171fd32f4991eaf739802485435190c54caff0fa3175dbd6e740b6c5fb04  shared-utils/pow-utils/tests/vectors/antiparrot_mainnet/h023969.npz
+409054210c04925873d0129cd852661985adc3f9769a1ee3c75da52ef27860b8  shared-utils/pow-utils/tests/vectors/antiparrot_mainnet/h024150.npz
+3897f74eddb069334cb73a424e497093c984d1b09b90450c14372136901bd90a  shared-utils/pow-utils/tests/vectors/antiparrot_mainnet/h024155.npz
+ea0b7f63d45d4889b553fece6ff2ea8766a7c9af12caefe4e6e78c73c291bec8  shared-utils/pow-utils/tests/vectors/candidate_band_vectors.json
+c213e5b18c5fa70ab29f66b2b2e2c558401ff83142a3c4f5a906365b94524914  shared-utils/pow-utils/tests/vectors/flat_region_vectors.json
+afcabb5c581fd85139698ec1e5ab1813fc1fff85a6841822b54ab4518f9b0bea  shared-utils/pow-utils/tests/vectors/prompt_scaffold_vectors.json

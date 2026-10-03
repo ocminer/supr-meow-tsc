@@ -1,0 +1,17 @@
+TensorCash
+Copyright 2026 The TensorCash developers
+
+This product includes software developed by the TensorCash project and its
+contributors, licensed under the Apache License, Version 2.0.
+
+The proof-of-inference verification methods, statistical verification
+procedures, and associated cryptographic constructions published in this
+repository (notably under services/verification-api/ and shared-utils/) are
+released publicly as of the dates in the version-control history (and, at
+release, by signed tags and archived source snapshots). This public release is
+intended, among other things, to support a prior-art defense — it supports, but
+does not by itself guarantee, such a defense.
+
+This repository also incorporates third-party components (git submodules and
+vendored code) that are licensed separately by their respective authors and
+remain governed by their own licenses. See LICENSING.md.

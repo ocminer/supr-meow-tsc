@@ -6,7 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git patch ca-certificates \
         libssl-dev libzmq3-dev libargon2-dev libgmp-dev \
-        flatbuffers-compiler libflatbuffers-dev python3 \
+        flatbuffers-compiler libflatbuffers-dev libboost-dev python3 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git clone --depth 1 --branch v4.10.0 https://github.com/zeromq/cppzmq /tmp/cppzmq \
@@ -17,6 +17,7 @@ WORKDIR /src
 COPY tools/             /src/tools/
 COPY vendor/nlohmann/   /src/vendor/nlohmann/
 COPY vendor/tensorcash/ /src/vendor/tensorcash/
+COPY vendor/tensorcash-v1.2.2/ /src/vendor/tensorcash-v1.2.2/
 
 ARG LLAMA_MAX_SEQ=512
 ARG LLAMA_REPO=https://github.com/ocminer/llama.cpp
