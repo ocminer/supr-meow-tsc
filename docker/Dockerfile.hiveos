@@ -78,9 +78,9 @@ COPY vendor/tensorcash/shared-utils/pow-utils/LICENSE /out/supr-meow-tsc/license
 COPY vendor/tensorcash-v1.2.2/LICENSE /out/supr-meow-tsc/licenses/tensorcash-v1.2.2-LICENSE
 COPY vendor/tensorcash-v1.2.2/NOTICE /out/supr-meow-tsc/licenses/tensorcash-v1.2.2-NOTICE
 
-COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12*    /out/supr-meow-tsc/lib/
-COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.12*    /out/supr-meow-tsc/lib/
-COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcublasLt.so.12*  /out/supr-meow-tsc/lib/
+COPY --from=build /usr/local/cuda-12.8/targets/x86_64-linux/lib/libcudart.so.12*    /out/supr-meow-tsc/lib/
+COPY --from=build /usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublas.so.12*    /out/supr-meow-tsc/lib/
+COPY --from=build /usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublasLt.so.12*  /out/supr-meow-tsc/lib/
 COPY --from=build /deps/                                                      /out/supr-meow-tsc/lib/
 
 RUN cd /out/supr-meow-tsc/lib \
