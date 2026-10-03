@@ -1,6 +1,6 @@
 services:
   miner:
-    image: ocminersupr/supr-meow-tsc:0.6.0
+    image: ocminersupr/supr-meow-tsc:0.7.1
     restart: unless-stopped
     deploy:
       resources:

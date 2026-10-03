@@ -58,6 +58,9 @@ args+=( --api-bind "127.0.0.1:${API_PORT:-21550}" )
 [[ -n ${DEVICES:-}     ]] && args+=( -d       "$DEVICES" )
 [[ ${Q8_PROFILE:-1} == 1 ]] && args+=( --q8 )
 [[ ${SPLIT_MODEL:-0} == 1 ]] && args+=( --split-model )
+# Pre-submit check (on|shadow|off); unset = the miner default (on).
+[[ -n ${MEOW_PRECHECK:-} ]] && args+=( --precheck "$MEOW_PRECHECK" )
+[[ -n ${MEOW_PRECHECK_GATES:-} ]] && args+=( --precheck-gates "$MEOW_PRECHECK_GATES" )
 [[ -n ${EXTRA_ARGS:-}  ]] && args+=( ${EXTRA_ARGS} )
 
 echo "[supr-meow-tsc] pool=$POOL_URL model=$(basename "$MODEL_PATH")"

@@ -42,7 +42,7 @@ extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 
 namespace {
 
-const char* kVersion = "0.7.0";
+const char* kVersion = "0.7.1";
 
 #ifndef MEOW_PRECHECK_DEFAULT_MODE
 #define MEOW_PRECHECK_DEFAULT_MODE "on"
