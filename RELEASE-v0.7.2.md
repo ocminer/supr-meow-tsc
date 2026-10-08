@@ -27,13 +27,20 @@ faster.
 
 ## Speed
 
-Measured as the time the miner takes to generate one batch of windows with
-the default Q8 profile (`MEOW_PROFILE=1`), v0.7.1 against v0.7.2 on the same
-card, alternating runs:
+Measured as the time the miner takes to generate one batch of windows while
+mining on the pool with the default Q8 profile (`MEOW_PROFILE=1`). The release
+packages of v0.7.1 and v0.7.2 ran on the same card, alternating, 2 × 180 s
+each:
 
 | Card | Slots | v0.7.1 | v0.7.2 | Gain |
 |---|---|---|---|---|
-| CMP 170HX (74 SMs) | 480 | 76.5 s | 65.4 s | +17 % |
+| RTX 5090 (450 W cap) | 480 | 34.7 s | 27.7 s | +25.5 % |
+| CMP 170HX (74 SMs) | 480 | 78.7 s | 67.6 s | +16.6 % |
+| 2× RTX 3070, `--split-model` | 128 | 32.4 s | 28.7 s | +12.8 % |
+| RTX 5070 Ti | 128 | 17.9 s | 15.9 s | +12.1 % |
+
+On every card the logit fingerprint of v0.7.2 is identical to v0.7.1. All
+shares in these runs were accepted (0 rejected).
 
 ## Upgrading
 
