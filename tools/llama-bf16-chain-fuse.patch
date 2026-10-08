@@ -1,0 +1,367 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 4da079f..70ecd21 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -18,6 +18,7 @@
+ #include "ggml-cuda/convert.cuh"
+ #include "ggml-cuda/count-equal.cuh"
+ #include "ggml-cuda/cpy.cuh"
++#include "ggml-cuda/meow-fuse.cuh"
+ #include "ggml-cuda/cross-entropy-loss.cuh"
+ #include "ggml-cuda/cumsum.cuh"
+ #include "ggml-cuda/diagmask.cuh"
+@@ -3264,12 +3265,41 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
+     return true;
+ }
+ 
+-// MEOW: ggml_cast(ggml_cast(x, BF16), F32) as emitted by meow_bf16_graph().
+-// ggml_cast sets src[1] to the node itself, so the inner BF16 node's use count is
+-// 2 (self + the outer cast); require exactly that, so nothing else reads the BF16.
+-static bool meow_bf16_roundtrip_fusable(const struct ggml_cgraph * cgraph, int i) {
+-    static const bool enabled = [] { const char * e = getenv("MEOW_BF16_FUSE"); return !(e && e[0] == '0'); }();
+-    if (!enabled || i + 1 >= cgraph->n_nodes) {
++// MEOW: fusion of the MEOW_BF16_GRAPH rounding boundaries (bf16 snaps that the
++// TSC verifier reproduces). MEOW_BF16_FUSE: 0 = off, 1 = cast pairs only,
++// 2 (default) = also the norm / SwiGLU / residual chains around them.
++static int meow_bf16_fuse_level() {
++    static const int level = [] {
++        const char * e = getenv("MEOW_BF16_FUSE");
++        return e && e[0] == '0' ? 0 : e && e[0] == '1' ? 1 : 2;
++    }();
++    return level;
++}
++
++// Identical pointers are safe for the elementwise/row kernels; partial overlap is not.
++static bool meow_same_or_disjoint(const ggml_tensor * x, const ggml_tensor * y) {
++    const char * x0 = (const char *) x->data; const char * x1 = x0 + ggml_nbytes(x);
++    const char * y0 = (const char *) y->data; const char * y1 = y0 + ggml_nbytes(y);
++    return x0 == y0 || x1 <= y0 || y1 <= x0;
++}
++
++static bool meow_disjoint(const ggml_tensor * x, const ggml_tensor * y) {
++    const char * x0 = (const char *) x->data; const char * x1 = x0 + ggml_nbytes(x);
++    const char * y0 = (const char *) y->data; const char * y1 = y0 + ggml_nbytes(y);
++    return x1 <= y0 || y1 <= x0;
++}
++
++// A node whose result the fused kernel never materializes.
++static bool meow_internal(const struct ggml_cgraph * cgraph, int i, int uses) {
++    const ggml_tensor * t = cgraph->nodes[i];
++    return !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && t->view_src == nullptr && (t->flags & GGML_TENSOR_FLAG_COMPUTE) &&
++           ggml_node_get_use_count(cgraph, i) == uses;
++}
++
++// ggml_cast(ggml_cast(x, BF16), F32) at nodes i, i+1. ggml_cast sets src[1] to the
++// node itself, so the inner BF16 node's use count is 2 (self + the outer cast).
++static bool meow_rt(const struct ggml_cgraph * cgraph, int i) {
++    if (i + 1 >= cgraph->n_nodes) {
+         return false;
+     }
+     const ggml_tensor * a = cgraph->nodes[i];
+@@ -3280,20 +3310,108 @@ static bool meow_bf16_roundtrip_fusable(const struct ggml_cgraph * cgraph, int i
+     if (a->src[0] == nullptr || a->src[0]->type != GGML_TYPE_F32 || a->type != GGML_TYPE_BF16 || b->type != GGML_TYPE_F32) {
+         return false;
+     }
+-    if ((b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (a->flags & GGML_TENSOR_FLAG_OUTPUT) || a->view_src) {
++    if ((b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !meow_internal(cgraph, i, 2)) {
+         return false;
+     }
+-    if (ggml_node_get_use_count(cgraph, i) != 2) {
+-        return false;
++    return ggml_is_contiguous(a->src[0]) && ggml_is_contiguous(b) && ggml_nelements(a->src[0]) == ggml_nelements(b);
++}
++
++static bool meow_bf16_roundtrip_fusable(const struct ggml_cgraph * cgraph, int i) {
++    return meow_bf16_fuse_level() >= 1 && meow_rt(cgraph, i) && meow_same_or_disjoint(cgraph->nodes[i]->src[0], cgraph->nodes[i + 1]);
++}
++
++// RMS_NORM, rt, MUL(w), rt  ->  returns w, or nullptr.
++static const ggml_tensor * meow_norm_chain(const struct ggml_cgraph * cgraph, int i) {
++    if (meow_bf16_fuse_level() < 2 || i + 5 >= cgraph->n_nodes) {
++        return nullptr;
+     }
+-    if (!ggml_is_contiguous(a->src[0]) || !ggml_is_contiguous(b) || ggml_nelements(a->src[0]) != ggml_nelements(b)) {
+-        return false;
++    ggml_tensor ** n = cgraph->nodes;
++    const ggml_tensor * rms = n[i];
++    const ggml_tensor * mul = n[i + 3];
++    if (rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rms->type != GGML_TYPE_F32) {
++        return nullptr;
++    }
++    if (!meow_rt(cgraph, i + 1) || n[i + 1]->src[0] != rms || !meow_rt(cgraph, i + 4) || n[i + 4]->src[0] != mul) {
++        return nullptr;
++    }
++    const ggml_tensor * w = mul->src[0] == n[i + 2] ? mul->src[1] : mul->src[1] == n[i + 2] ? mul->src[0] : nullptr;
++    if (w == nullptr || w->type != GGML_TYPE_F32 || w->nb[0] != sizeof(float) || rms->src[0]->nb[0] != sizeof(float)) {
++        return nullptr;
++    }
++    if (!meow_internal(cgraph, i, 1) || !meow_internal(cgraph, i + 2, 2) || !meow_internal(cgraph, i + 3, 1)) {
++        return nullptr;
+     }
+-    // The allocator may hand the freed input buffer to the outer cast. Identical
+-    // pointers are safe for an elementwise kernel; a partial overlap is not.
+-    const char * x0 = (const char *) a->src[0]->data; const char * x1 = x0 + ggml_nbytes(a->src[0]);
+-    const char * d0 = (const char *) b->data;         const char * d1 = d0 + ggml_nbytes(b);
+-    return x0 == d0 || x1 <= d0 || d1 <= x0;
++    const ggml_tensor * out = n[i + 5];
++    if (!ggml_are_same_shape(rms, mul) || !ggml_are_same_shape(rms, out) || !ggml_is_contiguous(out)) {
++        return nullptr;
++    }
++    // each row is fully read (reduction) before it is written, so an identical buffer is safe
++    return meow_same_or_disjoint(rms->src[0], out) && meow_disjoint(w, out) ? w : nullptr;
++}
++
++// rt(m), ADD(., other), rt  ->  returns other, or nullptr.
++static const ggml_tensor * meow_add_chain(const struct ggml_cgraph * cgraph, int i) {
++    if (meow_bf16_fuse_level() < 2 || i + 4 >= cgraph->n_nodes) {
++        return nullptr;
++    }
++    ggml_tensor ** n = cgraph->nodes;
++    const ggml_tensor * add = n[i + 2];
++    if (add->op != GGML_OP_ADD || !meow_rt(cgraph, i) || !meow_rt(cgraph, i + 3) || n[i + 3]->src[0] != add) {
++        return nullptr;
++    }
++    const ggml_tensor * other = add->src[0] == n[i + 1] ? add->src[1] : add->src[1] == n[i + 1] ? add->src[0] : nullptr;
++    if (other == nullptr || other->type != GGML_TYPE_F32 || !ggml_is_contiguous(other) || !ggml_are_same_shape(other, add)) {
++        return nullptr;
++    }
++    if (!meow_internal(cgraph, i + 1, 2) || !meow_internal(cgraph, i + 2, 1)) {
++        return nullptr;
++    }
++    const ggml_tensor * m = n[i]->src[0];
++    const ggml_tensor * out = n[i + 4];
++    return meow_same_or_disjoint(m, out) && meow_same_or_disjoint(other, out) ? other : nullptr;
++}
++
++// rt(g), SILU, rt, MUL_MAT(up), rt(u), MUL, rt  ->  returns the MUL_MAT(up) node, or nullptr.
++static ggml_tensor * meow_swiglu_chain(const struct ggml_cgraph * cgraph, int i) {
++    if (meow_bf16_fuse_level() < 2 || i + 10 >= cgraph->n_nodes) {
++        return nullptr;
++    }
++    ggml_tensor ** n = cgraph->nodes;
++    const ggml_tensor * silu = n[i + 2];
++    ggml_tensor *       up   = n[i + 5];
++    const ggml_tensor * mul  = n[i + 8];
++    if (silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->src[0] != n[i + 1]) {
++        return nullptr;
++    }
++    if (up->op != GGML_OP_MUL_MAT || up->type != GGML_TYPE_F32 || (up->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || mul->op != GGML_OP_MUL) {
++        return nullptr;
++    }
++    if (!meow_rt(cgraph, i) || !meow_rt(cgraph, i + 3) || n[i + 3]->src[0] != silu ||
++        !meow_rt(cgraph, i + 6) || n[i + 6]->src[0] != up || !meow_rt(cgraph, i + 9) || n[i + 9]->src[0] != mul) {
++        return nullptr;
++    }
++    if (!((mul->src[0] == n[i + 4] && mul->src[1] == n[i + 7]) || (mul->src[0] == n[i + 7] && mul->src[1] == n[i + 4]))) {
++        return nullptr;
++    }
++    // MUL_MAT(up) is run ahead of the SILU branch: it must not read any node it skips.
++    for (int k = 0; k < GGML_MAX_SRC && up->src[k]; ++k) {
++        for (int j = i; j <= i + 4; ++j) {
++            if (up->src[k] == n[j]) {
++                return nullptr;
++            }
++        }
++    }
++    if (!meow_internal(cgraph, i + 1, 2) || !meow_internal(cgraph, i + 2, 1) || !meow_internal(cgraph, i + 4, 2) ||
++        !meow_internal(cgraph, i + 7, 2) || !meow_internal(cgraph, i + 8, 1)) {
++        return nullptr;
++    }
++    const ggml_tensor * g   = n[i]->src[0];
++    const ggml_tensor * out = n[i + 10];
++    if (!ggml_are_same_shape(g, up) || !ggml_is_contiguous(up) || !ggml_are_same_shape(mul, out)) {
++        return nullptr;
++    }
++    // the allocator may have reused g's buffer (dead after node i in graph order) for up
++    return meow_disjoint(up, g) && meow_same_or_disjoint(g, out) && meow_same_or_disjoint(up, out) ? up : nullptr;
+ }
+ 
+ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -3979,6 +4097,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                         continue;
+                     }
+ 
++                    if (const ggml_tensor * w = meow_norm_chain(cgraph, i)) {
++                        ggml_cuda_meow_rms_norm_mul_bf16(*cuda_ctx, node, w, cgraph->nodes[i+5]);
++                        i += 5;
++                        continue;
++                    }
++
++                    if (ggml_tensor * up = meow_swiglu_chain(cgraph, i)) {
++                        GGML_ASSERT(ggml_cuda_compute_forward(*cuda_ctx, up));
++                        ggml_cuda_meow_swiglu_bf16(*cuda_ctx, node->src[0], up, cgraph->nodes[i+10]);
++                        i += 10;
++                        continue;
++                    }
++
++                    if (const ggml_tensor * other = meow_add_chain(cgraph, i)) {
++                        ggml_cuda_meow_add_bf16(*cuda_ctx, node->src[0], other, cgraph->nodes[i+4]);
++                        i += 4;
++                        continue;
++                    }
++
+                     if (meow_bf16_roundtrip_fusable(cgraph, i)) {
+                         ggml_cuda_bf16_roundtrip(*cuda_ctx, node->src[0], cgraph->nodes[i+1]);
+                         i++;
+diff --git a/ggml/src/ggml-cuda/meow-fuse.cu b/ggml/src/ggml-cuda/meow-fuse.cu
+new file mode 100644
+index 0000000..b81c96c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/meow-fuse.cu
+@@ -0,0 +1,76 @@
++// MEOW: producer/consumer fusion of the MEOW_BF16_GRAPH rounding chains.
++// Every bf16 rounding of the unfused graph is kept, in the same order, with the
++// same conversion and arithmetic helpers, so results are bit-identical.
++#include "meow-fuse.cuh"
++#include "unary.cuh"
++
++static __device__ __forceinline__ float meow_bf16(const float x) {
++    return __bfloat162float(__float2bfloat16(x));
++}
++
++// SwiGLU chain: out = r(r(silu(r(g))) * r(u)) — the ADDs/MULs of the graph are
++// SILU(ffn_gate), MUL(silu, ffn_up), with every intermediate rounded.
++static __device__ __forceinline__ float meow_swiglu_one(const float g, const float u) {
++    const float s = meow_bf16(ggml_cuda_op_silu_single(meow_bf16(g)));
++    return meow_bf16(s * meow_bf16(u));
++}
++
++// Residual chain: out = r(r(m) + r_other) where r_other is already rounded by
++// the graph (ffn_inp / previous l_out); the ADD operand order does not matter.
++static __device__ __forceinline__ float meow_add_one(const float m, const float o) {
++    return meow_bf16(meow_bf16(m) + o);
++}
++
++template <int kind>
++static __global__ void meow_chain_f32x4(const float4 * __restrict__ a, const float4 * __restrict__ b, float4 * __restrict__ dst, const int64_t n4) {
++    for (int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x; i < n4; i += (int64_t)blockDim.x*gridDim.x) {
++        const float4 x = a[i];
++        const float4 y = b[i];
++        float4 r;
++        if constexpr (kind == 0) {
++            r.x = meow_swiglu_one(x.x, y.x); r.y = meow_swiglu_one(x.y, y.y);
++            r.z = meow_swiglu_one(x.z, y.z); r.w = meow_swiglu_one(x.w, y.w);
++        } else {
++            r.x = meow_add_one(x.x, y.x); r.y = meow_add_one(x.y, y.y);
++            r.z = meow_add_one(x.z, y.z); r.w = meow_add_one(x.w, y.w);
++        }
++        dst[i] = r;
++    }
++}
++
++template <int kind>
++static __global__ void meow_chain_f32(const float * __restrict__ a, const float * __restrict__ b, float * __restrict__ dst, const int64_t ne) {
++    for (int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x; i < ne; i += (int64_t)blockDim.x*gridDim.x) {
++        dst[i] = kind == 0 ? meow_swiglu_one(a[i], b[i]) : meow_add_one(a[i], b[i]);
++    }
++}
++
++template <int kind>
++static void meow_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * a, const ggml_tensor * b, ggml_tensor * dst) {
++    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(dst));
++    const int64_t ne = ggml_nelements(dst);
++    GGML_ASSERT(ggml_nelements(a) == ne && ggml_nelements(b) == ne);
++    if (ne == 0) {
++        return;
++    }
++    cudaStream_t stream = ctx.stream();
++    const int block = 256;
++    if (ne % 4 == 0 && (uintptr_t) a->data % 16 == 0 && (uintptr_t) b->data % 16 == 0 && (uintptr_t) dst->data % 16 == 0) {
++        const int64_t n4 = ne / 4;
++        const int blocks = (int) std::min<int64_t>((n4 + block - 1) / block, 65535);
++        meow_chain_f32x4<kind><<<blocks, block, 0, stream>>>((const float4 *) a->data, (const float4 *) b->data, (float4 *) dst->data, n4);
++    } else {
++        const int blocks = (int) std::min<int64_t>((ne + block - 1) / block, 65535);
++        meow_chain_f32<kind><<<blocks, block, 0, stream>>>((const float *) a->data, (const float *) b->data, (float *) dst->data, ne);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void ggml_cuda_meow_swiglu_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up, ggml_tensor * dst) {
++    meow_chain<0>(ctx, gate, up, dst);
++}
++
++void ggml_cuda_meow_add_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * m, const ggml_tensor * other, ggml_tensor * dst) {
++    meow_chain<1>(ctx, m, other, dst);
++}
+diff --git a/ggml/src/ggml-cuda/meow-fuse.cuh b/ggml/src/ggml-cuda/meow-fuse.cuh
+new file mode 100644
+index 0000000..14a4010
+--- /dev/null
++++ b/ggml/src/ggml-cuda/meow-fuse.cuh
+@@ -0,0 +1,8 @@
++#pragma once
++#include "common.cuh"
++
++// MEOW: fused MEOW_BF16_GRAPH chains (see meow-fuse.cu). All tensors contiguous F32 of equal size.
++// dst = r(r(silu(r(gate))) * r(up))
++void ggml_cuda_meow_swiglu_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up, ggml_tensor * dst);
++// dst = r(r(m) + other)
++void ggml_cuda_meow_add_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * m, const ggml_tensor * other, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index ef98f67..2ddb617 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -71,7 +71,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
+     }
+ }
+ 
+-template <int block_size, bool do_multiply = false, bool do_add = false>
++template <int block_size, bool do_multiply = false, bool do_add = false, bool meow_round = false>
+ static __global__ void rms_norm_f32(const float * x,
+                                     float *       dst,
+                                     const int     ncols,
+@@ -141,6 +141,11 @@ static __global__ void rms_norm_f32(const float * x,
+             const int mul_col = fastmodulo(col, mul_ncols_packed);
+             const int add_col = fastmodulo(col, add_ncols_packed);
+             dst[col]          = scale * x[col] * mul[mul_col] + add[add_col];
++        } else if constexpr (do_multiply && meow_round) {
++            // MEOW: RMS_NORM -> bf16 round -> MUL(w) -> bf16 round, in graph order.
++            const int mul_col = fastmodulo(col, mul_ncols_packed);
++            const float n     = __bfloat162float(__float2bfloat16(scale * x[col]));
++            dst[col]          = __bfloat162float(__float2bfloat16(n * mul[mul_col]));
+         } else if constexpr (do_multiply) {
+             const int mul_col = fastmodulo(col, mul_ncols_packed);
+             dst[col]          = scale * x[col] * mul[mul_col];
+@@ -670,3 +675,30 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ 
+     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+ }
++
++// MEOW: out = bf16(bf16(rms_norm(x)) * w) for the MEOW_BF16_GRAPH chain
++// RMS_NORM, CPY(bf16), CPY(f32), MUL(w), CPY(bf16), CPY(f32). Same reduction and
++// block-size rule as rms_norm_f32_cuda, so the result is bit-identical.
++void ggml_cuda_meow_rms_norm_mul_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * w, ggml_tensor * out) {
++    const ggml_tensor * x = rms->src[0];
++    float eps = 0.0f;
++    memcpy(&eps, rms->op_params, sizeof(float));
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && out->type == GGML_TYPE_F32 && eps >= 0.0f);
++    GGML_ASSERT(x->nb[0] == sizeof(float) && w->nb[0] == sizeof(float) && ggml_is_contiguous(out));
++    const int ncols = x->ne[0], nrows = x->ne[1], nchannels = x->ne[2], nsamples = x->ne[3];
++    const int64_t s01 = x->nb[1]/sizeof(float), s02 = x->nb[2]/sizeof(float), s03 = x->nb[3]/sizeof(float);
++    const int64_t w01 = w->nb[1]/sizeof(float), w02 = w->nb[2]/sizeof(float), w03 = w->nb[3]/sizeof(float);
++    const uint3 wc = init_fastdiv_values(w->ne[0]), wr = init_fastdiv_values(w->ne[1]);
++    const uint3 wh = init_fastdiv_values(w->ne[2]), ws = init_fastdiv_values(w->ne[3]);
++    const dim3 blocks_num(nrows, nchannels, nsamples);
++    cudaStream_t stream = ctx.stream();
++    const float * xd = (const float *) x->data; const float * wd = (const float *) w->data; float * od = (float *) out->data;
++    if (ncols < 1024) {
++        rms_norm_f32<256, true, false, true><<<blocks_num, dim3(256, 1, 1), 32 * sizeof(float), stream>>>(
++            xd, od, ncols, s01, s02, s03, eps, wd, w01, w02, w03, wc, wr, wh, ws);
++    } else {
++        rms_norm_f32<1024, true, false, true><<<blocks_num, dim3(1024, 1, 1), 32 * sizeof(float), stream>>>(
++            xd, od, ncols, s01, s02, s03, eps, wd, w01, w02, w03, wc, wr, wh, ws);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index a74f637..2d4d196 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -16,3 +16,5 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++void ggml_cuda_meow_rms_norm_mul_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * w, ggml_tensor * out);
