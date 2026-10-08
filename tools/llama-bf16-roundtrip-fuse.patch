@@ -1,0 +1,119 @@
+diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
+index ee84303..1eb89ff 100644
+--- a/ggml/src/ggml-cuda/cpy.cu
++++ b/ggml/src/ggml-cuda/cpy.cu
+@@ -193,6 +193,47 @@ cudaStream_t stream) {
+         (cx, cdst, ne);
+ }
+ 
++// MEOW: fused f32 -> bf16 -> f32 round trip (ggml_cast(ggml_cast(x, BF16), F32)).
++// Same conversions as the two cpy_scalar_contiguous kernels it replaces, so the
++// result is bit-identical; one launch and 8 instead of 12 bytes of traffic/element.
++static __global__ void meow_bf16_roundtrip_f32x4(const float4 * __restrict__ x, float4 * __restrict__ dst, const int64_t n4) {
++    for (int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x; i < n4; i += (int64_t)blockDim.x*gridDim.x) {
++        float4 v = x[i];
++        v.x = ggml_cuda_cast<float>(ggml_cuda_cast<nv_bfloat16>(v.x));
++        v.y = ggml_cuda_cast<float>(ggml_cuda_cast<nv_bfloat16>(v.y));
++        v.z = ggml_cuda_cast<float>(ggml_cuda_cast<nv_bfloat16>(v.z));
++        v.w = ggml_cuda_cast<float>(ggml_cuda_cast<nv_bfloat16>(v.w));
++        dst[i] = v;
++    }
++}
++
++static __global__ void meow_bf16_roundtrip_f32(const float * __restrict__ x, float * __restrict__ dst, const int64_t ne) {
++    for (int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x; i < ne; i += (int64_t)blockDim.x*gridDim.x) {
++        dst[i] = ggml_cuda_cast<float>(ggml_cuda_cast<nv_bfloat16>(x[i]));
++    }
++}
++
++void ggml_cuda_bf16_roundtrip(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
++    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst) && ggml_nelements(src) == ggml_nelements(dst));
++    const int64_t ne = ggml_nelements(src);
++    if (ne == 0) {
++        return;
++    }
++    cudaStream_t stream = ctx.stream();
++    const int block = 256;
++    const int max_blocks = 65535;
++    if (ne % 4 == 0 && (uintptr_t) src->data % 16 == 0 && (uintptr_t) dst->data % 16 == 0) {
++        const int64_t n4 = ne / 4;
++        const int blocks = (int) std::min<int64_t>((n4 + block - 1) / block, max_blocks);
++        meow_bf16_roundtrip_f32x4<<<blocks, block, 0, stream>>>((const float4 *) src->data, (float4 *) dst->data, n4);
++    } else {
++        const int blocks = (int) std::min<int64_t>((ne + block - 1) / block, max_blocks);
++        meow_bf16_roundtrip_f32<<<blocks, block, 0, stream>>>((const float *) src->data, (float *) dst->data, ne);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ template<typename src_t, typename dst_t, bool transposed = false>
+ static void ggml_cpy_scalar_cuda(
+     const char * cx, char * cdst, const int64_t ne,
+diff --git a/ggml/src/ggml-cuda/cpy.cuh b/ggml/src/ggml-cuda/cpy.cuh
+index a7a87d8..a49e9b9 100644
+--- a/ggml/src/ggml-cuda/cpy.cuh
++++ b/ggml/src/ggml-cuda/cpy.cuh
+@@ -5,3 +5,6 @@
+ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1);
+ 
+ void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// MEOW: fused f32 -> bf16 -> f32 rounding; src and dst are contiguous F32 of equal size.
++void ggml_cuda_bf16_roundtrip(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 562d403..4da079f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3264,6 +3264,38 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
+     return true;
+ }
+ 
++// MEOW: ggml_cast(ggml_cast(x, BF16), F32) as emitted by meow_bf16_graph().
++// ggml_cast sets src[1] to the node itself, so the inner BF16 node's use count is
++// 2 (self + the outer cast); require exactly that, so nothing else reads the BF16.
++static bool meow_bf16_roundtrip_fusable(const struct ggml_cgraph * cgraph, int i) {
++    static const bool enabled = [] { const char * e = getenv("MEOW_BF16_FUSE"); return !(e && e[0] == '0'); }();
++    if (!enabled || i + 1 >= cgraph->n_nodes) {
++        return false;
++    }
++    const ggml_tensor * a = cgraph->nodes[i];
++    const ggml_tensor * b = cgraph->nodes[i + 1];
++    if (a->op != GGML_OP_CPY || b->op != GGML_OP_CPY || a->src[1] != a || b->src[1] != b || b->src[0] != a) {
++        return false;
++    }
++    if (a->src[0] == nullptr || a->src[0]->type != GGML_TYPE_F32 || a->type != GGML_TYPE_BF16 || b->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if ((b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (a->flags & GGML_TENSOR_FLAG_OUTPUT) || a->view_src) {
++        return false;
++    }
++    if (ggml_node_get_use_count(cgraph, i) != 2) {
++        return false;
++    }
++    if (!ggml_is_contiguous(a->src[0]) || !ggml_is_contiguous(b) || ggml_nelements(a->src[0]) != ggml_nelements(b)) {
++        return false;
++    }
++    // The allocator may hand the freed input buffer to the outer cast. Identical
++    // pointers are safe for an elementwise kernel; a partial overlap is not.
++    const char * x0 = (const char *) a->src[0]->data; const char * x1 = x0 + ggml_nbytes(a->src[0]);
++    const char * d0 = (const char *) b->data;         const char * d1 = d0 + ggml_nbytes(b);
++    return x0 == d0 || x1 <= d0 || d1 <= x0;
++}
++
+ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+                                int                                       node_idx,
+                                std::initializer_list<enum ggml_op>       ops,
+@@ -3947,6 +3979,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                         continue;
+                     }
+ 
++                    if (meow_bf16_roundtrip_fusable(cgraph, i)) {
++                        ggml_cuda_bf16_roundtrip(*cuda_ctx, node->src[0], cgraph->nodes[i+1]);
++                        i++;
++                        continue;
++                    }
++
+                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD}, {})) {
+                         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+                         i += 2;
