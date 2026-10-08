@@ -3,8 +3,11 @@
 // decoding; prints one FNV-1a hash per step over every sequence's full-vocab
 // logits, plus the greedy tokens. Two runs are bit-identical iff all lines match.
 // usage: meow-bf16-fuse-exact <model.gguf> [slots=480] [steps=48]
+// MEOW_EXACT_SPLIT=1 splits the model by layer across all visible GPUs (8 GB cards).
+// The last line reports the GPU time of the decode steps (prefill and host hashing excluded).
 #include "llama.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -25,7 +28,8 @@ int main(int argc, char** argv) {
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 999;
-    mp.split_mode   = LLAMA_SPLIT_MODE_NONE;
+    const char * split = std::getenv("MEOW_EXACT_SPLIT");
+    mp.split_mode   = split && split[0] == '1' ? LLAMA_SPLIT_MODE_LAYER : LLAMA_SPLIT_MODE_NONE;
     llama_model* model = llama_model_load_from_file(argv[1], mp);
     if (!model) { std::fprintf(stderr, "model load failed\n"); return 1; }
     const llama_vocab* vocab = llama_model_get_vocab(model);
@@ -66,6 +70,7 @@ int main(int argc, char** argv) {
     }
     if (llama_decode(ctx, batch) != 0) { std::fprintf(stderr, "prefill decode failed\n"); return 1; }
 
+    double secs = 0.0;   // GPU decode time only (hashing on the host excluded)
     std::vector<int> pos(S);
     for (int s = 0; s < S; ++s) pos[s] = (int)prompts[s].size();
     for (int step = 0; step <= steps; ++step) {
@@ -87,8 +92,12 @@ int main(int argc, char** argv) {
             batch.token[s] = next[s]; batch.pos[s] = pos[s]++;
             batch.n_seq_id[s] = 1; batch.seq_id[s][0] = s; batch.logits[s] = 1;
         }
+        const auto t0 = std::chrono::steady_clock::now();
         if (llama_decode(ctx, batch) != 0) { std::fprintf(stderr, "decode failed at step %d\n", step); return 1; }
+        llama_synchronize(ctx);
+        secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
+    std::printf("time %d steps x %d seqs: %.3f s (%.1f tok/s)\n", steps, S, secs, steps * S / secs);
     llama_batch_free(batch);
     llama_free(ctx);
     llama_model_free(model);
