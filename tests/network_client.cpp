@@ -17,7 +17,7 @@ int main(int argc, char** argv) {
         client.submit(job.job_id, 42, std::string(200000, 'A'), "ff", 1000);
     };
     callbacks.on_submit_result = [&](bool ok, int, const std::string&, int) { accepted = ok; };
-    client.configure({url}, "test.worker", "x", "supr-meow-tsc/0.7.1", callbacks);
+    client.configure({url}, "test.worker", "x", "supr-meow-tsc/0.7.2", callbacks);
     if (!client.start()) return 5;
     for (int i=0; i<100 && !accepted; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     client.stop();

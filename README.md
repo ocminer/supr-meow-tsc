@@ -8,10 +8,10 @@ See [v0.7.1 release notes](RELEASE-v0.7.1.md) for downloads and
 upgrade instructions, and [hardware compatibility](docs/COMPATIBILITY.md) for
 requirements.
 
-Version **0.7.1** emits proof v4 (unchanged from 0.7.0) and checks every proof
+Version **0.7.2** emits proof v4 (unchanged from 0.7.0) and checks every proof
 with the TensorCash v1.2.2 window rules before submitting it, so proofs the
 verifier would reject are not sent (`--precheck`, see the release notes).
-Use the standard Q8/F16 profile so the pool receives `supr-meow-tsc/0.7.1`.
+Use the standard Q8/F16 profile so the pool receives `supr-meow-tsc/0.7.2`.
 
 ## Quick start
 
@@ -41,7 +41,7 @@ See [operation notes](docs/OPERATIONS.md) for sharing a rig with other workloads
 
 ## Native Windows
 
-Download and extract `supr-meow-tsc-0.7.1-windows-x86_64.zip`, edit `start.cmd`
+Download and extract `supr-meow-tsc-0.7.2-windows-x86_64.zip`, edit `start.cmd`
 with your wallet, and run it. This is a native executable built in GitHub CI;
 WSL and Docker are not required. See [Windows instructions](windows/README.txt).
 The first launch downloads the same verified Q8 model used by Linux.
@@ -68,15 +68,15 @@ cmake --build build --target supr-meow-tsc -j
 Build the container or the portable mining-OS package:
 
 ```sh
-docker build -f docker/Dockerfile -t supr-meow-tsc:0.7.1 .
-bash tools/build-hiveos-package.sh 0.7.1
+docker build -f docker/Dockerfile -t supr-meow-tsc:0.7.2 .
+bash tools/build-hiveos-package.sh 0.7.2
 ```
 
 The portable package is built against Ubuntu 22.04 for compatibility with
 mining distributions. Do not substitute a binary built against a newer glibc.
 
 The [TSC Stratum specification](docs/STRATUM-TSC.md) documents pool integration.
-The older vLLM backend remains in `vllm-miner/` for compatibility; the v0.7.1
+The older vLLM backend remains in `vllm-miner/` for compatibility; the v0.7.2
 packages and image above are the current release path.
 
 The [Windows CI workflow](.github/workflows/windows.yml) builds with MSVC and CUDA,

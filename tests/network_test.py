@@ -19,7 +19,7 @@ with socket.socket() as listener, socket.socket() as reserve:
             conn.settimeout(10)
             sub = json.loads(stream.readline())
             auth = json.loads(stream.readline())
-            assert sub['method'] == 'mining.subscribe' and sub['params'][0] == 'supr-meow-tsc/0.7.1'
+            assert sub['method'] == 'mining.subscribe' and sub['params'][0] == 'supr-meow-tsc/0.7.2'
             assert auth['method'] == 'mining.authorize' and auth['params'] == ['test.worker', 'x']
             with urllib.request.urlopen(f'http://127.0.0.1:{http_port}/summary', timeout=3) as response:
                 assert json.load(response) == {'test': True}

@@ -120,7 +120,7 @@ jobs:
       - name: Upload native package
         uses: actions/upload-artifact@v4
         with:
-          name: supr-meow-tsc-0.7.1-windows-x86_64
+          name: supr-meow-tsc-0.7.2-windows-x86_64
           path: dist/*
           if-no-files-found: error
       - name: Upload diagnostics

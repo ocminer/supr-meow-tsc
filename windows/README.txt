@@ -1,4 +1,4 @@
-supr-meow-tsc 0.7.1 - native Windows x64 / NVIDIA CUDA
+supr-meow-tsc 0.7.2 - native Windows x64 / NVIDIA CUDA
 
 This package runs natively on Windows; WSL and Docker are not required.
 Use Windows 10/11 x64 and an NVIDIA Ampere or newer GPU with a driver
@@ -17,7 +17,7 @@ Two matching cards sharing one model:
   .\start.ps1 -Wallet YOUR_TSC_WALLET -Devices '0,1' -SplitModel
 
 Stop your old miner first. Use the standard Q8 profile and F16 KV cache;
-it identifies itself to the pool as supr-meow-tsc/0.7.1 and emits proof v4.
+it identifies itself to the pool as supr-meow-tsc/0.7.2 and emits proof v4.
 The launcher uses tsc.suprnova.cc:3310 unless you pass -Pool.
 CPU proof and native socket tests run in GitHub CI. The hosted Windows
 runner has no NVIDIA GPU; Windows GPU mining is not hardware-tested there.

@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
-$stage = Join-Path $env:RUNNER_TEMP 'supr-meow-tsc-0.7.1-windows-x86_64'
+$stage = Join-Path $env:RUNNER_TEMP 'supr-meow-tsc-0.7.2-windows-x86_64'
 New-Item -ItemType Directory -Force $stage | Out-Null
 $exe = Get-ChildItem build/windows -Filter supr-meow-tsc.exe -Recurse | Select-Object -First 1
 if (!$exe) { throw 'Native miner executable missing' }
@@ -28,7 +28,7 @@ foreach ($component in @('cuda_cudart','libcublas','cccl')) {
 }
 Copy-Item "$env:CUDA_PATH/installed-components.json" "$licenses/NVIDIA-components.json"
 $info = @{
-    version = '0.7.1'; source_commit = (& git rev-parse HEAD).Trim()
+    version = '0.7.2'; source_commit = (& git rev-parse HEAD).Trim()
     ci_run = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
     platform = 'native-windows-x86_64'; cuda = '13.3'; architectures = @(80,86,89,90,120)
     cpu_proof_and_socket_tests = 'passed'; windows_gpu_hardware_test = $false
@@ -45,6 +45,6 @@ Get-ChildItem $stage -File -Recurse | Sort-Object FullName | ForEach-Object {
     "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $relative
 } | Set-Content "$stage/SHA256SUMS.txt"
 New-Item -ItemType Directory -Force dist | Out-Null
-$zip = Join-Path $root 'dist/supr-meow-tsc-0.7.1-windows-x86_64.zip'
+$zip = Join-Path $root 'dist/supr-meow-tsc-0.7.2-windows-x86_64.zip'
 Compress-Archive -Path "$stage/*" -DestinationPath $zip -Force
 "{0}  {1}" -f (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant(), (Split-Path $zip -Leaf) | Set-Content "$zip.sha256"
