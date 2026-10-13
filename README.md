@@ -8,10 +8,13 @@ See [v0.7.1 release notes](RELEASE-v0.7.1.md) for downloads and
 upgrade instructions, and [hardware compatibility](docs/COMPATIBILITY.md) for
 requirements.
 
-Version **0.7.2** emits proof v4 (unchanged from 0.7.0) and checks every proof
-with the TensorCash v1.2.2 window rules before submitting it, so proofs the
-verifier would reject are not sent (`--precheck`, see the release notes).
-Use the standard Q8/F16 profile so the pool receives `supr-meow-tsc/0.7.2`.
+Version **0.7.3** emits proof v4 (unchanged from 0.7.0) and checks every proof
+with the TensorCash **v1.2.3** window rules before submitting it, so proofs the
+verifier would reject are not sent (`--precheck`, see the release notes). This
+is the release for **TensorCash v1.2.3 (ruleset 5, mainnet height 31,400)**: it
+withholds near-pinned free windows that the network now requires an admission
+proof for, judged by each job's own height. Update before height 31,400.
+Use the standard Q8/F16 profile so the pool receives `supr-meow-tsc/0.7.3`.
 
 ## Quick start
 
@@ -41,7 +44,7 @@ See [operation notes](docs/OPERATIONS.md) for sharing a rig with other workloads
 
 ## Native Windows
 
-Download and extract `supr-meow-tsc-0.7.2-windows-x86_64.zip`, edit `start.cmd`
+Download and extract `supr-meow-tsc-0.7.3-windows-x86_64.zip`, edit `start.cmd`
 with your wallet, and run it. This is a native executable built in GitHub CI;
 WSL and Docker are not required. See [Windows instructions](windows/README.txt).
 The first launch downloads the same verified Q8 model used by Linux.
@@ -68,15 +71,15 @@ cmake --build build --target supr-meow-tsc -j
 Build the container or the portable mining-OS package:
 
 ```sh
-docker build -f docker/Dockerfile -t supr-meow-tsc:0.7.2 .
-bash tools/build-hiveos-package.sh 0.7.2
+docker build -f docker/Dockerfile -t supr-meow-tsc:0.7.3 .
+bash tools/build-hiveos-package.sh 0.7.3
 ```
 
 The portable package is built against Ubuntu 22.04 for compatibility with
 mining distributions. Do not substitute a binary built against a newer glibc.
 
 The [TSC Stratum specification](docs/STRATUM-TSC.md) documents pool integration.
-The older vLLM backend remains in `vllm-miner/` for compatibility; the v0.7.2
+The older vLLM backend remains in `vllm-miner/` for compatibility; the v0.7.3
 packages and image above are the current release path.
 
 The [Windows CI workflow](.github/workflows/windows.yml) builds with MSVC and CUDA,

@@ -513,6 +513,7 @@ int PoiMiner::on_logits(int seq_id, const float* logits, int n_vocab,
                 return static_cast<int>(r.token_id);
             }
             share->job_id = origin->second.job_id;
+            share->height = origin->second.height;   // candidate height → precheck ruleset-5 gate
             // The pool dedups on (job, nonce) and rejects a repeat outright.
             // Blocks are submitted from the proof alone, so this value carries
             // no consensus meaning — it only has to be unique per job. Leaving

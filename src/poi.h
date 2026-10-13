@@ -29,6 +29,7 @@ struct PoiJobParams {
     uint64_t    model_difficulty = 1000000;
     uint64_t    normalizer       = 1000000;
     uint64_t    request_id       = 0;
+    uint64_t    height           = 0;   // candidate height (mining.notify param 4)
     std::string job_id;
     // Ticks for the SELF-PROVE path (--vdf-tick). 0 keeps the built-in
     // default. Ignored when the pool issues the VDF: its tick wins.
@@ -46,6 +47,7 @@ struct PoiJobParams {
 // A finished window that met a threshold and should be submitted.
 struct PoiShare {
     std::string job_id;
+    uint64_t    height = 0;     // candidate height of the job that produced it
     uint64_t    nonce = 0;
     std::string proof_b64;     // serialized MiningResponse
     // The same serialized MiningResponse, raw, for the pre-submit check

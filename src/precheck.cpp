@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 
@@ -156,13 +157,70 @@ struct Ctx {
     uint64_t sunset_out[11] = {};
     uint64_t sunset_failed = 0;
     std::vector<uint8_t> pad_norm;   // pow_v3.normalize_pad_mask
+    // The v4 structure/credit bundle, built ONCE from the single kernel pass
+    // (build_metrics) so the near-pin gate, the credit-tier gate and the
+    // ruleset-5 price telemetry all read the same metrics — no second CDF
+    // pass and no divergence. `metrics_ok` mirrors WindowStructure::valid.
+    pow_v4::StructureMetrics sm;
+    pow_v4::CreditMetrics cm;
+    uint64_t cred_units_sum = 0;
+    bool metrics_ok = false;
     explicit Ctx(const Window& win) : w(win) {}
 };
+
+// Assemble pow_v4::StructureMetrics and CreditMetrics from the kernel pass.
+// StructureMetrics takes exactly the fields pow_v4::V4StructureRejects /
+// V4Ruleset5Tier read; CreditMetrics is the per-step credit units the tier
+// and price rules read. Both carry WindowStructure::valid as `valid`.
+void build_metrics(Ctx& c) {
+    const auto& ws = c.ws;
+    c.sm.near_pin_count = ws.near_pin_count;
+    c.sm.bcap_units     = ws.bcap_units;
+    c.sm.collision_u    = ws.collision_u;
+    c.sm.collision_id   = ws.collision_id;
+    c.sm.valid          = ws.valid;
+    c.cm.step_units = ws.credit_units;
+    c.cred_units_sum = 0;
+    for (uint64_t u : ws.credit_units) c.cred_units_sum += u;
+    c.cm.total_units = c.cred_units_sum;
+    c.cm.valid = ws.valid;
+    c.metrics_ok = ws.valid;
+}
+
+// Ruleset-5 (candidate-height) activation, mirroring the upstream miner's own
+// gate (shared-utils/pow-utils/pow_utils.cpp ~l.1861 and chain_rules.py
+// ruleset5_active): on tensor-main ruleset 5 is active for a candidate at
+// height >= max(DetectorPolicyHeight 31400, V3SunsetHeight 27615). Both admit
+// the same integer env overrides the upstream code reads, so a rehearsal or a
+// non-main network can move or disable the boundary WITHOUT touching source:
+//   MINING_DETECTOR_POLICY_HEIGHT  (default 31400)
+//   MINING_V3_SUNSET_HEIGHT        (default 27615)
+// A height of 0 (unknown) is never ruleset 5. The constant is tensor-main's;
+// this miner only connects to tensor-main pools, so there is no per-network
+// branch here — set the env override for anything else.
+uint64_t env_height(const char* name, uint64_t dflt) {
+    if (const char* raw = std::getenv(name)) {
+        while (*raw == ' ') ++raw;
+        if (*raw) {
+            char* end = nullptr;
+            const long long v = std::strtoll(raw, &end, 10);
+            if (end && *end == '\0' && v >= 0) return static_cast<uint64_t>(v);
+        }
+    }
+    return dflt;
+}
+bool ruleset5_active(uint64_t height) {
+    if (height == 0) return false;
+    const uint64_t detector = env_height("MINING_DETECTOR_POLICY_HEIGHT", 31400);
+    const uint64_t sunset   = env_height("MINING_V3_SUNSET_HEIGHT", 27615);
+    return height >= detector && height >= sunset;
+}
 
 // Result of one gate: pass, reject (with the verifier's reason), or abstain.
 struct GateResult {
     Outcome outcome = Outcome::Pass;
     std::string reason;
+    bool ruleset5_tier_withheld = false;   // set only by the ruleset-5 free-window withhold
     static GateResult pass() { return {}; }
     static GateResult reject(std::string r) { return {Outcome::Reject, std::move(r)}; }
     static GateResult unavailable(std::string r) { return {Outcome::Unavailable, std::move(r)}; }
@@ -189,15 +247,9 @@ GateResult gate_strict(Ctx& c) {
 // ---- near-pin: proof v4 structure rule (pow_v4::V4StructureRejects) -------
 GateResult gate_near_pin(Ctx& c) {
     const auto& ws = c.ws;
-    if (!ws.valid) return GateResult::unavailable("structure aggregate incomplete");
-    pow_v4::StructureMetrics m;
-    m.near_pin_count = ws.near_pin_count;
-    m.bcap_units = ws.bcap_units;
-    m.collision_u = ws.collision_u;
-    m.collision_id = ws.collision_id;
-    m.valid = ws.valid;
+    if (!c.metrics_ok) return GateResult::unavailable("structure aggregate incomplete");
     std::string why;
-    if (pow_v4::V4StructureRejects(m, why) || ws.near_pin_count >= pow_v4::PIN_REJECT_COUNT) {
+    if (pow_v4::V4StructureRejects(c.sm, why) || ws.near_pin_count >= pow_v4::PIN_REJECT_COUNT) {
         // The text the verifier logs (v4_structure.enforce).
         const uint64_t at = pow_v4::PIN_REJECT_COUNT;
         return GateResult::reject("proof v4: near-pinned window rejected: N = " +
@@ -288,17 +340,43 @@ GateResult gate_flat_region(Ctx& c) {
 // an ungrinded R practically never meets; withholding that band is the
 // miner's existing policy (the float estimate in poi.cpp drops the same band
 // whenever its upper-bound estimate is already below 70 bits).
+//
+// From TensorCash v1.2.3 ruleset 5 (candidate height >= 31400 on tensor-main)
+// the verifier promotes a window that WOULD be free (B_cred >= 70) to
+// AdmissionRequired when it has more than PIN_FREE_COUNT (128) near-pins
+// (pow_v4::V4Ruleset5Tier). The miner produces no admission grind, so such a
+// window is a near-certain RED at the verifier — we withhold it exactly as we
+// withhold the sub-70-bit band. The decision is taken from the SAME
+// StructureMetrics and the candidate's OWN height (c.w.height), never the tip.
 GateResult gate_credit_tier(Ctx& c) {
-    uint64_t units = 0;
-    for (uint64_t u : c.ws.credit_units) units += u;
-    const auto tier = pow_v3::tier_for_b_cred_units(units);
+    const uint64_t units = c.cred_units_sum;
     char bits[32];
     std::snprintf(bits, sizeof(bits), "%.2f", static_cast<double>(units) / static_cast<double>(pow_v3::BCRED_R));
+    const bool r5 = ruleset5_active(c.w.height);
+    // At ruleset 5 the one tier decision is V4Ruleset5Tier over the complete
+    // structure; before it, the v1.2.2 credit-only tier. V4Ruleset5Tier reads
+    // the structure, so only call it with a valid bundle (otherwise it fails
+    // closed to Invalid, which would reject a window the near-pin gate already
+    // judged — stay on the credit-only tier when metrics are incomplete).
+    const auto tier = (r5 && c.metrics_ok)
+        ? pow_v4::V4Ruleset5Tier(units, c.sm)
+        : pow_v3::tier_for_b_cred_units(units);
     if (tier == pow_v3::Tier::Invalid)
         return GateResult::reject(std::string("v3 proof below B_FLOOR (B_cred ") + bits + " bits)");
-    if (tier == pow_v3::Tier::AdmissionRequired)
+    if (tier == pow_v3::Tier::AdmissionRequired) {
+        // Distinguish the NEW ruleset-5 free-window-with-near-pins case (the
+        // miner policy withhold the §3B gate adds) from the historical
+        // sub-70-bit admission band, so the caller counts them apart.
+        if (r5 && c.metrics_ok && units >= pow_v3::B_FREE_UNITS) {
+            GateResult g = GateResult::reject(
+                "ruleset 5: free window with N=" + std::to_string(c.sm.near_pin_count) +
+                " > 128 near-pins needs admission (A below the priced Argon target); withheld by miner policy");
+            g.ruleset5_tier_withheld = true;
+            return g;
+        }
         return GateResult::reject(std::string("admission tier: B_cred ") + bits +
                                   " bits below B_FREE (70); withheld by miner policy");
+    }
     return GateResult::pass();
 }
 
@@ -347,7 +425,7 @@ constexpr Step kPipeline[] = {
 }  // namespace
 
 bool available() { return true; }
-const char* rules_version() { return "tensorcash v1.2.2 (48d1344)"; }
+const char* rules_version() { return "tensorcash v1.2.3 (48806ff)"; }
 
 uint32_t implemented_gates() {
     uint32_t m = 0;
@@ -458,6 +536,18 @@ Verdict evaluate_window(const Window& w, uint32_t gate_mask) noexcept {
             v.reason = "kernel returned an incomplete window";
             return v;
         }
+        // One structure/credit bundle for every gate, plus the ruleset-5
+        // measurement (filled in every mode, even when the gate is masked off
+        // or the miner is in shadow, so a run can quantify §4 R2/R3).
+        build_metrics(c);
+        v.ruleset5 = ruleset5_active(c.w.height);
+        if (c.metrics_ok) {
+            v.near_pin_count = c.sm.near_pin_count;
+            const auto p4 = pow_v4::V4TotalPrice(c.cm, c.sm);
+            const auto p5 = pow_v4::V4Ruleset5TotalPrice(c.cm, c.sm);
+            v.price_r4_p = p4.P;   // Q = PRICE_Q (1000); 0 = fail-closed sentinel
+            v.price_r5_p = p5.P;
+        }
         for (const auto& s : kPipeline) {
             if (!(gate_mask & gate_bit(s.gate))) continue;
             GateResult r = s.fn(c);
@@ -465,6 +555,7 @@ Verdict evaluate_window(const Window& w, uint32_t gate_mask) noexcept {
                 v.outcome = Outcome::Reject;
                 v.gate = s.gate;
                 v.reason = std::move(r.reason);
+                v.ruleset5_tier_withheld = r.ruleset5_tier_withheld;
                 return v;
             }
             if (r.outcome == Outcome::Unavailable) {
@@ -486,7 +577,7 @@ Verdict evaluate_window(const Window& w, uint32_t gate_mask) noexcept {
     }
 }
 
-Verdict evaluate(const uint8_t* data, size_t n, uint32_t gate_mask) noexcept {
+Verdict evaluate(const uint8_t* data, size_t n, uint32_t gate_mask, uint64_t height) noexcept {
     const auto t0 = std::chrono::steady_clock::now();
     Window w;
     std::string why;
@@ -497,6 +588,7 @@ Verdict evaluate(const uint8_t* data, size_t n, uint32_t gate_mask) noexcept {
         v.hash_hex = w.hash_hex;
         v.is_solution = w.is_solution;
     } else {
+        w.height = height;   // the candidate (job) height, not carried in the bytes
         v = evaluate_window(w, gate_mask);
     }
     v.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -529,7 +621,7 @@ Verdict evaluate_window(const Window& w, uint32_t) noexcept {
     return v;
 }
 
-Verdict evaluate(const uint8_t*, size_t, uint32_t) noexcept {
+Verdict evaluate(const uint8_t*, size_t, uint32_t, uint64_t) noexcept {
     Verdict v;
     v.reason = "precheck unavailable in this build";
     return v;

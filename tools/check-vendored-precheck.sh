@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Verify that vendor/tensorcash-v1.2.2/ is byte-identical to the upstream
-# files recorded in its UPSTREAM.txt (TensorCash v1.2.2, commit 48d1344).
+# Verify that vendor/tensorcash-v1.2.3/ is byte-identical to the upstream
+# files recorded in its UPSTREAM.txt (TensorCash v1.2.3, commit 48806ff).
 # Exit status is non-zero on any missing or edited file.
 set -euo pipefail
-cd "$(dirname "$0")/../vendor/tensorcash-v1.2.2"
+cd "$(dirname "$0")/../vendor/tensorcash-v1.2.3"
 sed -n '/^[0-9a-f]\{64\}  /p' UPSTREAM.txt > /tmp/meow-vendored-precheck.$$.sha256
 trap 'rm -f /tmp/meow-vendored-precheck.$$.sha256' EXIT
 n=$(wc -l < /tmp/meow-vendored-precheck.$$.sha256)
@@ -13,4 +13,4 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
     shasum -a 256 --quiet -c /tmp/meow-vendored-precheck.$$.sha256
 fi
-echo "check-vendored-precheck: $n files match TensorCash v1.2.2"
+echo "check-vendored-precheck: $n files match TensorCash v1.2.3"

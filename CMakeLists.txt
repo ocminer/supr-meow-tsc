@@ -231,10 +231,10 @@ endif()
 set_target_properties(meow_vdf PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
-# TensorCash v1.2.2 consensus predicates (vendor/tensorcash-v1.2.2), compiled
+# TensorCash v1.2.3 consensus predicates (vendor/tensorcash-v1.2.3), compiled
 # UNMODIFIED for the pre-submit check. These are the verifier's own sources:
 # canonical credit kernel, near-pin count, candidate band, anti-parrot gate,
-# prompt scaffold and flat region. See vendor/tensorcash-v1.2.2/UPSTREAM.txt.
+# prompt scaffold and flat region. See vendor/tensorcash-v1.2.3/UPSTREAM.txt.
 #
 # * Upstream's evaluation contract (build_credit_v4_lib.sh): -O2
 #   -ffp-contract=off -fno-fast-math on EVERY translation unit, C++20 for the
@@ -254,15 +254,15 @@ if(MSVC)
 else()
   set(MEOW_PRECHECK_DEFAULT_ON ON)
 endif()
-option(MEOW_PRECHECK "Build the pre-submit consensus pre-check (TensorCash v1.2.2 rules)" ${MEOW_PRECHECK_DEFAULT_ON})
+option(MEOW_PRECHECK "Build the pre-submit consensus pre-check (TensorCash v1.2.3 rules)" ${MEOW_PRECHECK_DEFAULT_ON})
 if(MEOW_PRECHECK AND MSVC)
   message(WARNING "MEOW_PRECHECK needs unsigned __int128, which MSVC does not provide; disabled")
   set(MEOW_PRECHECK OFF CACHE BOOL "" FORCE)
 endif()
-set(MEOW_TC122_DIR "${CMAKE_SOURCE_DIR}/vendor/tensorcash-v1.2.2/shared-utils/pow-utils")
-set(MEOW_TC122_RENAME
+set(MEOW_TC123_DIR "${CMAKE_SOURCE_DIR}/vendor/tensorcash-v1.2.3/shared-utils/pow-utils")
+set(MEOW_TC123_RENAME
   pow_v3=tcpc_pow_v3 pow_v4=tcpc_pow_v4 credit_v4=tcpc_credit_v4 gumbel=tcpc_gumbel)
-set(MEOW_TC122_FP_FLAGS -O2 -ffp-contract=off -fno-fast-math)
+set(MEOW_TC123_FP_FLAGS -O2 -ffp-contract=off -fno-fast-math)
 if(MEOW_PRECHECK)
   if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|arm64|ARM64)$")
     message(FATAL_ERROR "MEOW_PRECHECK: the canonical credit kernel supports x86-64 and AArch64 only; configure with -DMEOW_PRECHECK=OFF")
@@ -280,33 +280,33 @@ if(MEOW_PRECHECK)
     message(FATAL_ERROR "MEOW_PRECHECK: Boost.Multiprecision headers not found (header-only; "
                         "install libboost-dev), or configure with -DMEOW_PRECHECK=OFF")
   endif()
-  add_library(meow_tc122 STATIC
-    ${MEOW_TC122_DIR}/credit_v4.cpp
-    ${MEOW_TC122_DIR}/pow_v3.cpp
-    ${MEOW_TC122_DIR}/pow_v4.cpp
-    ${MEOW_TC122_DIR}/gumbel_sampler.cpp
-    ${MEOW_TC122_DIR}/bcred_table_r1024.cpp
-    ${MEOW_TC122_DIR}/term_table_r1024.cpp
-    ${MEOW_TC122_DIR}/flat_region.cpp
-    ${MEOW_TC122_DIR}/sunset_abi.cpp
-    ${MEOW_TC122_DIR}/coremath/exp.c
-    ${MEOW_TC122_DIR}/coremath/log.c)
-  set_target_properties(meow_tc122 PROPERTIES
+  add_library(meow_tc123 STATIC
+    ${MEOW_TC123_DIR}/credit_v4.cpp
+    ${MEOW_TC123_DIR}/pow_v3.cpp
+    ${MEOW_TC123_DIR}/pow_v4.cpp
+    ${MEOW_TC123_DIR}/gumbel_sampler.cpp
+    ${MEOW_TC123_DIR}/bcred_table_r1024.cpp
+    ${MEOW_TC123_DIR}/term_table_r1024.cpp
+    ${MEOW_TC123_DIR}/flat_region.cpp
+    ${MEOW_TC123_DIR}/sunset_abi.cpp
+    ${MEOW_TC123_DIR}/coremath/exp.c
+    ${MEOW_TC123_DIR}/coremath/log.c)
+  set_target_properties(meow_tc123 PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF
     C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS ON
     POSITION_INDEPENDENT_CODE ON)
   # Appended after CMAKE_<LANG>_FLAGS_<CONFIG>, so -O2 wins over Release -O3.
-  target_compile_options(meow_tc122 PRIVATE ${MEOW_TC122_FP_FLAGS})
-  target_compile_definitions(meow_tc122 PRIVATE ${MEOW_TC122_RENAME})
-  target_include_directories(meow_tc122 PRIVATE
-    ${MEOW_TC122_DIR} ${MEOW_TC122_DIR}/bcore_compat ${MEOW_BOOST_INCLUDE_DIR})
+  target_compile_options(meow_tc123 PRIVATE ${MEOW_TC123_FP_FLAGS})
+  target_compile_definitions(meow_tc123 PRIVATE ${MEOW_TC123_RENAME})
+  target_include_directories(meow_tc123 PRIVATE
+    ${MEOW_TC123_DIR} ${MEOW_TC123_DIR}/bcore_compat ${MEOW_BOOST_INCLUDE_DIR})
   # pow_v3.cpp's other helpers need SHA-256; Argon2 is deliberately not
   # compiled in (POW_V3_HAVE_ARGON2 unset), as in upstream's recipe.
-  target_link_libraries(meow_tc122 PRIVATE OpenSSL::Crypto)
+  target_link_libraries(meow_tc123 PRIVATE OpenSSL::Crypto)
 endif()
 
 # Pre-submit check (src/precheck.cpp). Compiled with the same pinned flags and
-# namespace renames as meow_tc122 because it instantiates upstream header-only
+# namespace renames as meow_tc123 because it instantiates upstream header-only
 # rules; the renames stay PRIVATE so the miner's own sources never see them.
 # Without MEOW_PRECHECK the same file builds as a stub that reports itself
 # unavailable and the miner submits every proof (v0.7.0 behaviour).
@@ -321,11 +321,11 @@ target_include_directories(meow_precheck PRIVATE ${MEOW_FB_GEN} ${FLATBUFFERS_IN
 set_target_properties(meow_precheck PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(MEOW_PRECHECK)
   set_target_properties(meow_precheck PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
-  target_compile_options(meow_precheck PRIVATE ${MEOW_TC122_FP_FLAGS})
-  target_compile_definitions(meow_precheck PRIVATE MEOW_PRECHECK_ENABLED ${MEOW_TC122_RENAME})
+  target_compile_options(meow_precheck PRIVATE ${MEOW_TC123_FP_FLAGS})
+  target_compile_definitions(meow_precheck PRIVATE MEOW_PRECHECK_ENABLED ${MEOW_TC123_RENAME})
   target_include_directories(meow_precheck PRIVATE
-    ${MEOW_TC122_DIR} ${MEOW_TC122_DIR}/bcore_compat ${MEOW_BOOST_INCLUDE_DIR})
-  target_link_libraries(meow_precheck PRIVATE meow_tc122)
+    ${MEOW_TC123_DIR} ${MEOW_TC123_DIR}/bcore_compat ${MEOW_BOOST_INCLUDE_DIR})
+  target_link_libraries(meow_precheck PRIVATE meow_tc123)
 endif()
 
 add_executable(supr-meow-tsc
@@ -397,17 +397,17 @@ if(MEOW_BUILD_TESTS)
     add_executable(meow-precheck-test tests/precheck_test.cpp)
     add_dependencies(meow-precheck-test meow_fbgen)
     set_target_properties(meow-precheck-test PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
-    target_compile_options(meow-precheck-test PRIVATE ${MEOW_TC122_FP_FLAGS})
-    target_compile_definitions(meow-precheck-test PRIVATE ${MEOW_TC122_RENAME})
+    target_compile_options(meow-precheck-test PRIVATE ${MEOW_TC123_FP_FLAGS})
+    target_compile_definitions(meow-precheck-test PRIVATE ${MEOW_TC123_RENAME})
     target_include_directories(meow-precheck-test PRIVATE src vendor ${MEOW_FB_GEN} ${FLATBUFFERS_INCLUDE_DIR}
-      ${MEOW_TC122_DIR} ${MEOW_TC122_DIR}/bcore_compat ${MEOW_BOOST_INCLUDE_DIR})
-    target_link_libraries(meow-precheck-test PRIVATE meow_precheck meow_tc122)
+      ${MEOW_TC123_DIR} ${MEOW_TC123_DIR}/bcore_compat ${MEOW_BOOST_INCLUDE_DIR})
+    target_link_libraries(meow-precheck-test PRIVATE meow_precheck meow_tc123)
     set(MEOW_AP_VECTORS ${CMAKE_BINARY_DIR}/antiparrot_mainnet.bin)
     add_test(NAME precheck-render-vectors COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_SOURCE_DIR}/tests/render_antiparrot_vectors.py
-      ${MEOW_TC122_DIR}/tests/vectors/antiparrot_mainnet ${MEOW_AP_VECTORS})
+      ${MEOW_TC123_DIR}/tests/vectors/antiparrot_mainnet ${MEOW_AP_VECTORS})
     set_tests_properties(precheck-render-vectors PROPERTIES FIXTURES_SETUP ap_vectors)
-    add_test(NAME precheck-vectors COMMAND meow-precheck-test ${MEOW_TC122_DIR}/tests/vectors ${MEOW_AP_VECTORS})
+    add_test(NAME precheck-vectors COMMAND meow-precheck-test ${MEOW_TC123_DIR}/tests/vectors ${MEOW_AP_VECTORS})
     set_tests_properties(precheck-vectors PROPERTIES FIXTURES_REQUIRED ap_vectors)
     add_test(NAME precheck-vendored-hashes COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check-vendored-precheck.sh)
   endif()

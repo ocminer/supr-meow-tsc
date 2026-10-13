@@ -14,6 +14,7 @@ COPY tools/             /src/tools/
 COPY vendor/nlohmann/   /src/vendor/nlohmann/
 COPY vendor/tensorcash/ /src/vendor/tensorcash/
 COPY vendor/tensorcash-v1.2.2/ /src/vendor/tensorcash-v1.2.2/
+COPY vendor/tensorcash-v1.2.3/ /src/vendor/tensorcash-v1.2.3/
 
 ARG LLAMA_MAX_SEQ=512
 ARG LLAMA_REPO=https://github.com/ocminer/llama.cpp
@@ -57,7 +58,7 @@ COPY --from=build /src/build/supr-meow-tsc      /app/
 COPY --from=build /src/build/bin/*.so*          /app/lib/
 COPY tools/q8-profile.sh                      /app/q8-profile.sh
 COPY docker/entrypoint.sh                       /app/entrypoint.sh
-COPY RELEASE-v0.7.2.md                         /app/README.md
+COPY RELEASE-v0.7.3.md                         /app/README.md
 COPY LICENSE NOTICE                           /app/
 COPY --from=build /src/vendor/llama.cpp/LICENSE /app/licenses/llama-LICENSE
 COPY vendor/tensorcash/shared-utils/chiavdf/LICENSE /app/licenses/chiavdf-LICENSE

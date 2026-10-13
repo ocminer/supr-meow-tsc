@@ -42,7 +42,7 @@ extern "C" bool pow_gpu_bind_device(int cuda_ordinal);
 
 namespace {
 
-const char* kVersion = "0.7.2";
+const char* kVersion = "0.7.3";
 
 #ifndef MEOW_PRECHECK_DEFAULT_MODE
 #define MEOW_PRECHECK_DEFAULT_MODE "on"
@@ -56,6 +56,13 @@ struct PrecheckCounters {
     std::atomic<uint64_t> checked{0}, passed{0}, unavailable{0}, rejected{0};
     std::atomic<uint64_t> dropped{0}, blocks_withheld{0}, us_total{0};
     std::atomic<uint64_t> by_gate[meow::precheck::kGateCount];
+    // TensorCash v1.2.3 ruleset-5 measurement (§4 R2/R3). `r5_windows` are
+    // proofs judged at a ruleset-5 candidate height; `r5_tier_withheld` are
+    // the NEW free-window-with->128-near-pins admission withholds (the shares
+    // ruleset 5 costs, saved from a RED); `r5_price_raised` are windows whose
+    // ruleset-5 priced target is stricter than ruleset 4 (the yield-drop
+    // proxy). All count in shadow mode too, before activation.
+    std::atomic<uint64_t> r5_windows{0}, r5_tier_withheld{0}, r5_price_raised{0};
 };
 PrecheckCounters g_pc;
 
@@ -1114,11 +1121,17 @@ int main(int argc, char** argv) {
                 if (pc_mode != meow::precheck::Mode::Off) {
                     meow::precheck::Verdict v;
                     if (ps.sh->proof_raw)
-                        v = meow::precheck::evaluate(ps.sh->proof_raw->data(), ps.sh->proof_raw->size(), pc_gates);
+                        v = meow::precheck::evaluate(ps.sh->proof_raw->data(), ps.sh->proof_raw->size(), pc_gates, ps.sh->height);
                     else
                         v.reason = "raw proof bytes missing";
                     g_pc.checked++;
                     g_pc.us_total += static_cast<uint64_t>(v.ms * 1000.0);
+                    // Ruleset-5 measurement, independent of the verdict (§4 R2/R3).
+                    if (v.ruleset5) {
+                        g_pc.r5_windows++;
+                        if (v.ruleset5_tier_withheld) g_pc.r5_tier_withheld++;
+                        if (v.price_r4_p && v.price_r5_p && v.price_r5_p > v.price_r4_p) g_pc.r5_price_raised++;
+                    }
                     if (v.outcome == meow::precheck::Outcome::Reject) {
                         const bool drop = pc_mode == meow::precheck::Mode::On;
                         g_pc.rejected++;
@@ -1192,6 +1205,7 @@ int main(int argc, char** argv) {
                     p.normalizer       = m.normalizer;
                     p.job_id           = j.job_id;
                     p.request_id       = j.request_id;
+                    p.height           = j.height;         // candidate height → precheck ruleset-5 gate
                     p.pool_vdf         = j.pool_vdf;        // §19, empty = prove locally
                     p.pool_vdf_tick    = j.pool_vdf_tick;
                     p.self_vdf_tick    = o.vdf_tick;        // only used if pool_vdf is empty
@@ -1417,6 +1431,9 @@ int main(int argc, char** argv) {
                 for (int gi = 0; gi < meow::precheck::kGateCount; ++gi)
                     bg[meow::precheck::gate_name(static_cast<meow::precheck::Gate>(gi))] = g_pc.by_gate[gi].load();
                 pc["by_gate"]   = std::move(bg);
+                pc["ruleset5_windows"]        = g_pc.r5_windows.load();
+                pc["ruleset5_tier_withheld"]  = g_pc.r5_tier_withheld.load();
+                pc["ruleset5_price_raised"]   = g_pc.r5_price_raised.load();
                 const uint64_t nck = g_pc.checked.load();
                 pc["avg_ms"]    = nck ? double(g_pc.us_total.load()) / 1000.0 / double(nck) : 0.0;
                 j["precheck"] = std::move(pc);
@@ -1502,6 +1519,15 @@ int main(int argc, char** argv) {
                             gates.empty() ? "" : " (", gates.c_str(), gates.empty() ? "" : ")",
                             (unsigned long long)g_pc.unavailable.load(),
                             nck ? double(g_pc.us_total.load()) / 1000.0 / double(nck) : 0.0);
+                // Ruleset-5 (v1.2.3, height >= 31400) measurement, once any
+                // ruleset-5 job has been judged.
+                const uint64_t r5w = g_pc.r5_windows.load();
+                if (r5w) {
+                    const char* verb = pc_mode == meow::precheck::Mode::On ? "withheld" : "would withhold";
+                    std::printf("   ruleset-5: %llu windows judged, %llu %s (free, N>128), %llu priced stricter than ruleset 4\n",
+                                (unsigned long long)r5w, (unsigned long long)g_pc.r5_tier_withheld.load(),
+                                verb, (unsigned long long)g_pc.r5_price_raised.load());
+                }
             }
             std::printf("%s================================================================================%s\n", C_C(), C_0());
             std::fflush(stdout);

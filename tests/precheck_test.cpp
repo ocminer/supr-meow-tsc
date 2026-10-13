@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -407,6 +408,68 @@ int main(int argc, char** argv) {
         v = pc::evaluate_window(pinned_window(0), mask({pc::Gate::CreditTier}));
         CHECK(v.outcome == pc::Outcome::Pass, "256 coin-flip rows (256 bits) clear the credit tier");
         std::cout << "ok: near-pin, order, strict, credit tier\n";
+    }
+
+    // ---- ruleset 5 (v1.2.3) height-aware admission tier -----------------
+    // A free window (B_cred >= 70 bits) with N near-pins in [129, 174] is
+    // promoted to AdmissionRequired at candidate height >= 31400 and withheld;
+    // at 31399 the same window is unchanged. N <= 128 is never promoted; the
+    // decision is taken by the candidate's OWN height. pinned_window(n) gives
+    // exactly n near-pinned rows and (256-n) coin-flip rows (~1 bit each), so
+    // for n in {129,140,150} the credit is comfortably above B_FREE.
+    {
+        const uint32_t tier = mask({pc::Gate::CreditTier});
+        const uint64_t R4 = 31399, R5 = 31400;   // tensor-main ruleset-5 boundary
+        for (uint32_t n : {129u, 140u, 150u}) {
+            pc::Window w4 = pinned_window(n); w4.height = R4;
+            auto v4 = pc::evaluate_window(w4, tier);
+            // r4: the window is free (this also proves B_cred >= 70 bits).
+            CHECK(v4.outcome == pc::Outcome::Pass && !v4.ruleset5 && !v4.ruleset5_tier_withheld,
+                  "ruleset4 free: N=" + std::to_string(n) + " passes (" + v4.reason + ")");
+            CHECK(v4.near_pin_count == n, "near_pin_count measured: N=" + std::to_string(n));
+            pc::Window w5 = pinned_window(n); w5.height = R5;
+            auto v5 = pc::evaluate_window(w5, tier);
+            CHECK(v5.outcome == pc::Outcome::Reject && v5.gate == pc::Gate::CreditTier &&
+                  v5.ruleset5 && v5.ruleset5_tier_withheld &&
+                  v5.reason.find("ruleset 5") != std::string::npos &&
+                  v5.reason.find("N=" + std::to_string(n)) != std::string::npos,
+                  "ruleset5 withholds free N=" + std::to_string(n) + ": " + v5.reason);
+            // The ruleset-5 priced target is never looser than ruleset 4 for a
+            // near-pinned window (pin excess is doubled).
+            CHECK(v5.price_r4_p && v5.price_r5_p && v5.price_r5_p >= v5.price_r4_p,
+                  "ruleset5 price >= ruleset4 for N=" + std::to_string(n));
+        }
+        // N == 128 is at the free limit: never promoted, at either height.
+        pc::Window w128 = pinned_window(128); w128.height = R5;
+        auto v128 = pc::evaluate_window(w128, tier);
+        CHECK(v128.outcome == pc::Outcome::Pass && v128.ruleset5 && !v128.ruleset5_tier_withheld,
+              "ruleset5 does not withhold N=128: " + v128.reason);
+        // Boundary: one job's output judged at 31399 vs 31400.
+        pc::Window a = pinned_window(140); a.height = R4;
+        pc::Window b = pinned_window(140); b.height = R5;
+        CHECK(pc::evaluate_window(a, tier).outcome == pc::Outcome::Pass &&
+              pc::evaluate_window(b, tier).outcome == pc::Outcome::Reject,
+              "boundary: 31399 submits, 31400 withholds the same window");
+        // Unknown height (0) keeps pre-ruleset-5 behaviour.
+        pc::Window z = pinned_window(140); z.height = 0;
+        CHECK(pc::evaluate_window(z, tier).outcome == pc::Outcome::Pass,
+              "height 0 (unknown) keeps ruleset-4 behaviour");
+        // Env override can move the boundary for a rehearsal. Ruleset 5 needs
+        // height >= max(detector, sunset), so a rehearsal lowers both — exactly
+        // as the upstream miner's own gate reads them.
+        setenv("MINING_DETECTOR_POLICY_HEIGHT", "100", 1);
+        setenv("MINING_V3_SUNSET_HEIGHT", "50", 1);
+        pc::Window e = pinned_window(140); e.height = 200;
+        auto ve = pc::evaluate_window(e, tier);
+        CHECK(ve.outcome == pc::Outcome::Reject && ve.ruleset5_tier_withheld,
+              "env override (both heights) activates ruleset 5 early");
+        // Lowering only the detector height is not enough while sunset stays high.
+        unsetenv("MINING_V3_SUNSET_HEIGHT");
+        pc::Window e2 = pinned_window(140); e2.height = 200;
+        CHECK(pc::evaluate_window(e2, tier).outcome == pc::Outcome::Pass,
+              "detector override alone does not activate ruleset 5 below sunset");
+        unsetenv("MINING_DETECTOR_POLICY_HEIGHT");
+        std::cout << "ok: ruleset-5 height-aware admission tier\n";
     }
 
     // ---- FlatBuffer path, fail-open -------------------------------------

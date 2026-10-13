@@ -1,0 +1,60 @@
+{
+ "source": "bcore f82aea3b34 QuickVerifier legacy v3 step path (DedupeKeepMax -> VerifySampleStep -> ComputeCDF) + ComputeAntiParrotMetrics / anti_parrot_reject_reason, via a research-only test_bitcoin driver, 2026-09-13; rows from TensorCash mainnet blocks",
+ "proofs": [
+  {
+   "height": 23851,
+   "reason": "anti-parrot-state",
+   "braw": 711795,
+   "bcap": 215067,
+   "hard_run": 0,
+   "maxrs_q32": 20464020147,
+   "reuse_cache_q32": 58554587890,
+   "n_states_eff_u": 1,
+   "n_states_eff_id": 1
+  },
+  {
+   "height": 23961,
+   "reason": "anti-parrot-hardrun",
+   "braw": 74806,
+   "bcap": 23515,
+   "hard_run": 92,
+   "maxrs_q32": 949305183945,
+   "reuse_cache_q32": 1002998991095,
+   "n_states_eff_u": 8,
+   "n_states_eff_id": 4
+  },
+  {
+   "height": 23969,
+   "reason": "anti-parrot-state",
+   "braw": 437584,
+   "bcap": 154762,
+   "hard_run": 10,
+   "maxrs_q32": 187004212370,
+   "reuse_cache_q32": 126085681068,
+   "n_states_eff_u": 9,
+   "n_states_eff_id": 4
+  },
+  {
+   "height": 24150,
+   "reason": "",
+   "braw": 134644,
+   "bcap": 68622,
+   "hard_run": 29,
+   "maxrs_q32": 149507751257,
+   "reuse_cache_q32": 261549279247,
+   "n_states_eff_u": 44,
+   "n_states_eff_id": 38
+  },
+  {
+   "height": 24155,
+   "reason": "",
+   "braw": 222304,
+   "bcap": 76614,
+   "hard_run": 14,
+   "maxrs_q32": 258808337615,
+   "reuse_cache_q32": 228442670049,
+   "n_states_eff_u": 19,
+   "n_states_eff_id": 9
+  }
+ ]
+}
