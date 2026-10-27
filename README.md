@@ -4,17 +4,23 @@ A GPU miner for TensorCash (TSC), with Linux, native Windows, HiveOS, MMPOS, Sim
 Docker packages. Supports independent GPUs and shared-model mining across
 matching GPU pairs.
 
-See [v0.7.1 release notes](RELEASE-v0.7.1.md) for downloads and
+See [v0.7.4 release notes](RELEASE-v0.7.4.md) for downloads and
 upgrade instructions, and [hardware compatibility](docs/COMPATIBILITY.md) for
 requirements.
 
-Version **0.7.3** emits proof v4 (unchanged from 0.7.0) and checks every proof
+> **HiveOS / MMPOS / SMOS: works on older images since 0.7.4.** v0.7.3 and earlier
+> Linux packages needed glibc 2.34 and stopped with `version 'GLIBC_2.34' not found`
+> on Ubuntu 20.04-based rigs. From 0.7.4 the package runs on **Ubuntu 20.04 up to the
+> latest release**; the model downloads and verifies itself on first start.
+> Just update the custom miner to 0.7.4.
+
+Version **0.7.4** emits proof v4 (unchanged from 0.7.0) and checks every proof
 with the TensorCash **v1.2.3** window rules before submitting it, so proofs the
 verifier would reject are not sent (`--precheck`, see the release notes). This
 is the release for **TensorCash v1.2.3 (ruleset 5, mainnet height 31,400)**: it
 withholds near-pinned free windows that the network now requires an admission
 proof for, judged by each job's own height. Update before height 31,400.
-Use the standard Q8/F16 profile so the pool receives `supr-meow-tsc/0.7.3`.
+Use the standard Q8/F16 profile so the pool receives `supr-meow-tsc/0.7.4`.
 
 ## Quick start
 
@@ -44,7 +50,7 @@ See [operation notes](docs/OPERATIONS.md) for sharing a rig with other workloads
 
 ## Native Windows
 
-Download and extract `supr-meow-tsc-0.7.3-windows-x86_64.zip`, edit `start.cmd`
+Download and extract `supr-meow-tsc-0.7.4-windows-x86_64.zip`, edit `start.cmd`
 with your wallet, and run it. This is a native executable built in GitHub CI;
 WSL and Docker are not required. See [Windows instructions](windows/README.txt).
 The first launch downloads the same verified Q8 model used by Linux.
@@ -71,15 +77,16 @@ cmake --build build --target supr-meow-tsc -j
 Build the container or the portable mining-OS package:
 
 ```sh
-docker build -f docker/Dockerfile -t supr-meow-tsc:0.7.3 .
-bash tools/build-hiveos-package.sh 0.7.3
+docker build -f docker/Dockerfile -t supr-meow-tsc:0.7.4 .
+bash tools/build-hiveos-package.sh 0.7.4
 ```
 
-The portable package is built against Ubuntu 22.04 for compatibility with
-mining distributions. Do not substitute a binary built against a newer glibc.
+The portable package is built against Ubuntu 20.04 (glibc 2.31) so it runs on
+every current mining distribution. Do not substitute a binary built against a
+newer glibc.
 
 The [TSC Stratum specification](docs/STRATUM-TSC.md) documents pool integration.
-The older vLLM backend remains in `vllm-miner/` for compatibility; the v0.7.3
+The older vLLM backend remains in `vllm-miner/` for compatibility; the v0.7.4
 packages and image above are the current release path.
 
 The [Windows CI workflow](.github/workflows/windows.yml) builds with MSVC and CUDA,

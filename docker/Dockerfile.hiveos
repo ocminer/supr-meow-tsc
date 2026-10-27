@@ -1,13 +1,27 @@
-FROM nvidia/cuda:12.8.0-devel-ubuntu22.04 AS build
+# Built on Ubuntu 20.04 (glibc 2.31) so the package starts on every current
+# HiveOS / MMPOS / SMOS image: binaries built on 22.04 need GLIBC_2.34 and fail
+# on 20.04-based rigs. Everything not in the base image is bundled in lib/.
+FROM nvidia/cuda:12.8.0-devel-ubuntu20.04 AS build
 
 ARG CUDA_ARCHS="80;86;89;90;120"
 ARG JOBS=
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake git patch ca-certificates \
+        build-essential gcc-10 g++-10 git patch ca-certificates curl \
         libssl-dev libzmq3-dev libargon2-dev libgmp-dev \
-        flatbuffers-compiler libflatbuffers-dev libboost-dev python3 \
+        libboost-dev python3 python3-pip \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100 \
+         --slave /usr/bin/g++ g++ /usr/bin/g++-10 \
+    && python3 -m pip install --no-cache-dir "cmake==3.31.6" \
     && rm -rf /var/lib/apt/lists/*
+
+# FlatBuffers from source: focal ships 1.11, too old for the regenerated schemas.
+# 23.5.26 is the version the upstream generated headers were produced with.
+RUN git clone --depth 1 --branch v23.5.26 https://github.com/google/flatbuffers /tmp/flatbuffers \
+    && cmake -S /tmp/flatbuffers -B /tmp/flatbuffers/build -DCMAKE_BUILD_TYPE=Release \
+         -DFLATBUFFERS_BUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && cmake --build /tmp/flatbuffers/build -j"$(nproc)" --target install \
+    && rm -rf /tmp/flatbuffers
 
 RUN git clone --depth 1 --branch v4.10.0 https://github.com/zeromq/cppzmq /tmp/cppzmq \
     && cp /tmp/cppzmq/zmq.hpp /tmp/cppzmq/zmq_addon.hpp /usr/include/ \
@@ -61,7 +75,7 @@ RUN mkdir -p /deps \
     done \
  && ls /deps | tr '\n' ' '
 
-FROM ubuntu:22.04 AS package
+FROM ubuntu:20.04 AS package
 ARG PKG_VERSION=0.0.0
 WORKDIR /out
 COPY --from=build /src/build/supr-meow-tsc       /out/supr-meow-tsc/supr-meow-tsc
@@ -71,7 +85,7 @@ COPY mmpos/mmpos-run.sh                          /out/supr-meow-tsc/
 COPY smos/smos-run.sh                            /out/supr-meow-tsc/
 COPY tools/q8-profile.sh                         /out/supr-meow-tsc/
 COPY tools/meow-common.sh                        /out/supr-meow-tsc/
-COPY RELEASE-v0.7.3.md                          /out/supr-meow-tsc/README.md
+COPY RELEASE-v0.7.4.md                          /out/supr-meow-tsc/README.md
 COPY LICENSE NOTICE                            /out/supr-meow-tsc/
 COPY --from=build /src/vendor/llama.cpp/LICENSE  /out/supr-meow-tsc/licenses/llama-LICENSE
 COPY vendor/tensorcash/shared-utils/chiavdf/LICENSE /out/supr-meow-tsc/licenses/chiavdf-LICENSE

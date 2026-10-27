@@ -26,17 +26,17 @@ if [[ -z $MODEL_PATH ]]; then
       # from some hosts, which is 12 hours for this file. Written straight to
       # offsets so peak disk is one copy, not two.
       SIZE=$(curl -fsSLI "$MODEL_URL" | awk 'tolower($1)=="content-length:"{print $2}' | tr -d '\r' | tail -1)
-      if [[ -n $SIZE && $SIZE -gt 0 ]]; then
+      if [[ -n $SIZE && $SIZE -gt 1048576 ]]; then
         truncate -s "$SIZE" "$MODEL_PATH.part" 2>/dev/null || fallocate -l "$SIZE" "$MODEL_PATH.part"
         N=8; chunk=$(( (SIZE + N - 1) / N ))
         for i in $(seq 0 $((N-1))); do
           lo=$(( i * chunk )); hi=$(( lo + chunk - 1 )); [[ $hi -ge $SIZE ]] && hi=$((SIZE-1))
-          curl -fsS --retry 5 --retry-delay 3 -r "${lo}-${hi}" "$MODEL_URL" \
+          curl -fsSL --retry 5 --retry-delay 3 -r "${lo}-${hi}" "$MODEL_URL" \
             | dd of="$MODEL_PATH.part" bs=4M seek="$lo" oflag=seek_bytes conv=notrunc status=none &
         done
         wait
       else
-        curl -fL --retry 5 --no-progress-meter -o "$MODEL_PATH.part" "$MODEL_URL" || exit 1
+        curl -fL --retry 5 -sS -o "$MODEL_PATH.part" "$MODEL_URL" || exit 1
       fi
       mv "$MODEL_PATH.part" "$MODEL_PATH"
     fi

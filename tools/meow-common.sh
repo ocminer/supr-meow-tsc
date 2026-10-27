@@ -32,7 +32,7 @@ if [[ -z ${MODEL_PATH:-} ]]; then
         done
         wait
       else
-        curl -fL --retry 5 --no-progress-meter -o "$MODEL_PATH.part" "$MODEL_URL" || exit 1
+        curl -fL --retry 5 -sS -o "$MODEL_PATH.part" "$MODEL_URL" || exit 1
       fi
       mv "$MODEL_PATH.part" "$MODEL_PATH"
     fi

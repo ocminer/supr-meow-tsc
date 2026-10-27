@@ -3,6 +3,11 @@
 Use Linux x86-64 and an NVIDIA Ampere or newer GPU with a compatible driver.
 Turing and older GPUs, AMD, Intel and Apple GPUs are not supported by this release.
 
+Operating system: the Linux / HiveOS / MMPOS / SMOS package (0.7.4 and newer)
+runs on Ubuntu 20.04 or newer (glibc 2.31+) and bundles its own CUDA 12.8 and
+other libraries; it needs an NVIDIA driver with CUDA 12.8 support (R570+).
+Windows 10/11 x64 uses the native Windows package.
+
 - Single-card mining: at least 12 GB of GPU memory; additional memory can
   improve performance. RTX 5090 32 GB was tested for this release.
 - Shared-model mining: matching pairs with at least 8 GB on each card.
